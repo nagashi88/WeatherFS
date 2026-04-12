@@ -86,13 +86,18 @@ class MarketDriftTracker:
         """
         ts_str = timestamp.isoformat()
         with get_session() as session:
+            # Idempotent write: keep one entry per trade_id even if the process
+            # restarts or the recorder is called more than once.
             session.execute(
                 text(
                     """
                     INSERT INTO drift_records
                         (trade_id, entry_price, model_prob, entry_ts, price_snapshots)
-                    VALUES
-                        (:trade_id, :entry_price, :model_prob, :entry_ts, :snapshots)
+                    SELECT
+                        :trade_id, :entry_price, :model_prob, :entry_ts, :snapshots
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM drift_records WHERE trade_id = :trade_id
+                    )
                     """
                 ),
                 {

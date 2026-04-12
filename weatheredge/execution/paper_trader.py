@@ -73,6 +73,7 @@ class PaperTrader:
         self._engine = None
         self.open_orders: list[dict] = []      # Unfilled limit orders
         self.open_positions: list[dict] = []   # Filled positions awaiting resolution
+        self.last_limit_fills: list[dict] = []  # Filled positions from latest check_limit_fills()
         self.trade_history: list[dict] = []
         self.daily_pnl: dict[str, float] = {}  # date_str -> pnl
 
@@ -322,6 +323,7 @@ class PaperTrader:
         Returns the number of orders filled.
         """
         filled_count = 0
+        self.last_limit_fills = []
         still_pending = []
 
         for o in self.open_orders:
@@ -389,6 +391,7 @@ class PaperTrader:
             trade["db_id"] = db_id
 
             self.open_positions.append(trade)
+            self.last_limit_fills.append(trade)
             filled_count += 1
             log.info(
                 "check_limit_fills: filled %s %s at %.4f",

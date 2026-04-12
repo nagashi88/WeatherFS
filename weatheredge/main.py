@@ -23,7 +23,7 @@ from pathlib import Path
 import aiohttp
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from weatheredge.config import Settings, MODULES
+from weatheredge.config import Settings, MODULES, BURST_EDGE_DISCOUNT, BURST_WINDOW_MINUTES
 from weatheredge.data.actuals import fetch_daily_max_actual, store_actual_temperatures
 from weatheredge.data.market import MarketScanner, RESOLUTION_SOURCES
 from weatheredge.data.noaa import fetch_noaa_forecast, store_noaa_forecast
@@ -55,6 +55,7 @@ from weatheredge.learning.weight_updater import ModelWeightUpdater
 from weatheredge.learning.agent_weight_updater import AgentWeightUpdater
 from weatheredge.learning.rmse_updater import RMSEUpdater
 from weatheredge.learning.error_analysis import ErrorAnalyzer
+from weatheredge.market_drift_tracker import MarketDriftTracker
 from weatheredge.intelligence.wallet_profiler import WalletCollector, WalletProfiler, WalletQueryEngine
 from weatheredge.intelligence.edge_decay_monitor import EdgeDecayMonitor
 from weatheredge.intelligence.competitor_tracker import CompetitorTracker
@@ -247,6 +248,8 @@ class AppState:
         self._shutdown_event = threading.Event()  # BugFix L1: thread-safe shutdown flag
         self.shutting_down: bool = False  # kept for backwards compat, prefer _shutdown_event
         self.settings: Settings = Settings()
+        self._base_conservative_min_edge: float = float(self.settings.conservative_min_edge)
+        self._base_aggressive_min_edge: float = float(self.settings.aggressive_min_edge)
         self.risk_manager: RiskManager = RiskManager(self.settings)
         self.paper_trader: PaperTrader = PaperTrader(
             initial_bankroll=self.settings.initial_bankroll
@@ -281,6 +284,8 @@ class AppState:
         # Phase 5: Edge enhancements
         self.conditions_tracker: CurrentConditionsTracker = CurrentConditionsTracker()
         self.model_run_detector: ModelRunDetector | None = None
+        self.market_drift_tracker: MarketDriftTracker | None = None
+        self._burst_mode_until: datetime | None = None
         # Phase 6: TimesFM integration
         self.timesfm_forecaster: TimesFMForecaster | None = None
         # Runtime cache: market_id → enriched metadata from scanning pipeline
@@ -297,6 +302,126 @@ def get_state() -> AppState:
     if _state is None:
         raise RuntimeError("AppState not initialised — call init_app() first")
     return _state
+
+
+def _is_burst_mode_active(state: AppState, now: datetime | None = None) -> bool:
+    """Return True when Phase 2 burst mode window is currently active."""
+    if not MODULES.get("burst_mode", False):
+        return False
+    if state._burst_mode_until is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return current <= state._burst_mode_until
+
+
+def _arm_burst_mode_window(state: AppState, event_count: int, now: datetime | None = None) -> None:
+    """Arm/extend the burst-mode window after model-run detections."""
+    if not MODULES.get("burst_mode", False):
+        return
+    current = now or datetime.now(timezone.utc)
+    new_until = current + timedelta(minutes=BURST_WINDOW_MINUTES)
+    if state._burst_mode_until is None or new_until > state._burst_mode_until:
+        state._burst_mode_until = new_until
+    remaining = max((state._burst_mode_until - current).total_seconds() / 60.0, 0.0)
+    log.info(
+        "Phase 2 burst mode armed: events=%d window=%dm active_for=%.1fm until=%s",
+        event_count,
+        BURST_WINDOW_MINUTES,
+        remaining,
+        state._burst_mode_until.isoformat(timespec="seconds"),
+    )
+
+
+def _phase2_effective_thresholds(state: AppState) -> tuple[float, float, float]:
+    """Return effective strategy thresholds for this cycle.
+
+    Returns:
+        (conservative_min_edge, aggressive_min_edge, qualitative_edge_threshold)
+    """
+    conservative = float(state._base_conservative_min_edge)
+    aggressive = float(state._base_aggressive_min_edge)
+    qualitative = 0.05
+
+    if _is_burst_mode_active(state):
+        discount = max(0.0, float(BURST_EDGE_DISCOUNT))
+        conservative = max(0.0, conservative - discount)
+        aggressive = max(0.0, aggressive - discount)
+        qualitative = max(0.0, qualitative - (discount * 0.5))
+
+    return conservative, aggressive, qualitative
+
+
+def _record_phase2_drift_entry(state: AppState, trade: dict | None, source: str) -> None:
+    """Record drift entry for a newly filled trade when tracking is enabled."""
+    if state.market_drift_tracker is None or not MODULES.get("market_drift_tracking", False):
+        return
+    if not isinstance(trade, dict):
+        return
+
+    trade_id = trade.get("db_id")
+    entry_price = trade.get("price")
+    model_probability = trade.get("model_probability")
+    if trade_id is None or entry_price is None or model_probability is None:
+        return
+
+    created_at = trade.get("created_at")
+    if isinstance(created_at, datetime):
+        ts = created_at if created_at.tzinfo is not None else created_at.replace(tzinfo=timezone.utc)
+    else:
+        ts = datetime.now(timezone.utc)
+
+    try:
+        state.market_drift_tracker.record_entry(
+            trade_id=int(trade_id),
+            entry_price=float(entry_price),
+            model_prob=float(model_probability),
+            timestamp=ts,
+        )
+    except Exception as exc:
+        log.debug(
+            "Phase 2 drift entry skip: trade_id=%s source=%s err=%s",
+            trade_id,
+            source,
+            exc,
+        )
+
+
+def _record_phase2_drift_snapshots(state: AppState, opportunities: dict[str, MarketOpportunity]) -> None:
+    """Append drift snapshots for all currently open positions."""
+    if state.market_drift_tracker is None or not MODULES.get("market_drift_tracking", False):
+        return
+    now = datetime.now(timezone.utc)
+    snapshots = 0
+    for pos in state.paper_trader.open_positions:
+        if not isinstance(pos, dict):
+            continue
+        trade_id = pos.get("db_id")
+        market_id = pos.get("market_id")
+        if trade_id is None or not market_id:
+            continue
+        opp = opportunities.get(str(market_id))
+        if opp is None:
+            continue
+        try:
+            state.market_drift_tracker.snapshot_price(
+                trade_id=int(trade_id),
+                current_price=float(opp.market_price),
+                timestamp=now,
+            )
+            snapshots += 1
+        except Exception as exc:
+            log.debug("Phase 2 drift snapshot skip: trade_id=%s err=%s", trade_id, exc)
+    if snapshots > 0:
+        log.debug("Phase 2 drift snapshots appended: %d", snapshots)
+
+
+def _bootstrap_phase2_drift_entries(state: AppState) -> None:
+    """Ensure open trades have baseline drift entry rows (idempotent)."""
+    if state.market_drift_tracker is None or not MODULES.get("market_drift_tracking", False):
+        return
+    for pos in state.paper_trader.open_positions:
+        _record_phase2_drift_entry(state, pos, source="startup_open_position")
+    log.info("Phase 2 drift bootstrap completed for %d open positions", len(state.paper_trader.open_positions))
 
 
 # ---------------------------------------------------------------------------
@@ -622,8 +747,27 @@ def _run_decision_cycle(state: AppState) -> None:
         len(market_prices), len(forecasts), len(state.market_metadata),
     )
 
-    # Minimum edge to qualify for LLM qualitative analysis (saves API calls)
-    LLM_EDGE_THRESHOLD = 0.05
+    # Phase 2 runtime threshold adaptation during burst window.
+    if not _is_burst_mode_active(state):
+        state._base_conservative_min_edge = float(state.settings.conservative_min_edge)
+        state._base_aggressive_min_edge = float(state.settings.aggressive_min_edge)
+
+    cons_edge, agg_edge, LLM_EDGE_THRESHOLD = _phase2_effective_thresholds(state)
+    state.settings.conservative_min_edge = cons_edge
+    state.settings.aggressive_min_edge = agg_edge
+    burst_active = _is_burst_mode_active(state)
+    if burst_active:
+        remaining_minutes = max(
+            (state._burst_mode_until - datetime.now(timezone.utc)).total_seconds() / 60.0,
+            0.0,
+        ) if state._burst_mode_until else 0.0
+        log.info(
+            "Phase 2 burst active: %.1fm remaining, conservative_min_edge=%.3f aggressive_min_edge=%.3f llm_edge_threshold=%.3f",
+            remaining_minutes,
+            cons_edge,
+            agg_edge,
+            LLM_EDGE_THRESHOLD,
+        )
 
     # H2 fix: Collect opportunities by city for aggressive laddering
     _opps_by_city: dict[str, list[MarketOpportunity]] = {}
@@ -894,6 +1038,8 @@ def _run_decision_cycle(state: AppState) -> None:
         limit_fills = state.paper_trader.check_limit_fills(current_prices)
         if limit_fills > 0:
             log.info("run_decision_loop: %d limit orders filled this cycle", limit_fills)
+            for filled_trade in state.paper_trader.last_limit_fills:
+                _record_phase2_drift_entry(state, filled_trade, source="limit_fill")
 
     trades_placed = 0
     for trade_order in trade_orders:
@@ -947,6 +1093,12 @@ def _run_decision_cycle(state: AppState) -> None:
                             "fill_monitor.record_fill failed for %s: %s",
                             trade_order.market_id, exc,
                         )
+                if result.get("filled"):
+                    _record_phase2_drift_entry(
+                        state,
+                        result.get("trade"),
+                        source="market_fill",
+                    )
             else:
                 log.warning(
                     "run_decision_loop: order rejected for %s: %s",
@@ -958,6 +1110,9 @@ def _run_decision_cycle(state: AppState) -> None:
                 "run_decision_loop: error executing trade for %s: %s",
                 trade_order.market_id, exc, exc_info=True,
             )
+
+    # Phase 2: append per-cycle price snapshots for active open positions.
+    _record_phase2_drift_snapshots(state, opportunities)
 
     # --- Exit check: evaluate all open positions for exit signals ---
     try:
@@ -2597,6 +2752,7 @@ def check_model_runs() -> None:
     try:
         events = _run_async_safely(_check_model_runs_async(state))
         if events:
+            _arm_burst_mode_window(state, event_count=len(events))
             log.info(
                 "check_model_runs: %d new run events detected — triggering decision cycle",
                 len(events),
@@ -2685,6 +2841,17 @@ def main() -> None:
     log.info(
         "Phase 2 components ready — PortfolioManager, FillMonitor, CrossPlatformArbitrage"
     )
+
+    # Phase 2: market drift tracking (enabled only in phase_2+)
+    if MODULES.get("market_drift_tracking", False):
+        try:
+            state.market_drift_tracker = MarketDriftTracker()
+            _bootstrap_phase2_drift_entries(state)
+            log.info("Phase 2: market drift tracking enabled")
+        except Exception as exc:
+            log.warning("Phase 2: market drift tracker init failed: %s", exc)
+    else:
+        log.info("Phase 2: market drift tracking disabled")
 
     # Init Phase 3 self-learning components now that DB is ready
     try:

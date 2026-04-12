@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, patch
 
 import weatheredge.config as cfg
 
@@ -41,3 +43,65 @@ def test_phase_matrix_alias_resolution():
     assert resolve_profile_name("phase1") == "phase_1"
     assert resolve_profile_name("phase2") == "phase_2"
     assert resolve_profile_name("phase_2") == "phase_2"
+
+
+def test_phase2_effective_thresholds_burst_on():
+    from weatheredge.main import AppState, _phase2_effective_thresholds
+    from weatheredge.config import BURST_EDGE_DISCOUNT
+
+    original_modules = dict(cfg.MODULES)
+    try:
+        cfg.MODULES["burst_mode"] = True
+        state = AppState()
+        state._burst_mode_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+        conservative, aggressive, qualitative = _phase2_effective_thresholds(state)
+
+        assert abs(conservative - max(0.0, state._base_conservative_min_edge - BURST_EDGE_DISCOUNT)) < 1e-9
+        assert abs(aggressive - max(0.0, state._base_aggressive_min_edge - BURST_EDGE_DISCOUNT)) < 1e-9
+        assert abs(qualitative - max(0.0, 0.05 - (BURST_EDGE_DISCOUNT * 0.5))) < 1e-9
+    finally:
+        cfg.MODULES.clear()
+        cfg.MODULES.update(original_modules)
+
+
+def test_phase2_effective_thresholds_burst_off():
+    from weatheredge.main import AppState, _phase2_effective_thresholds
+
+    original_modules = dict(cfg.MODULES)
+    try:
+        cfg.MODULES["burst_mode"] = True
+        state = AppState()
+        state._burst_mode_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+        conservative, aggressive, qualitative = _phase2_effective_thresholds(state)
+
+        assert abs(conservative - state._base_conservative_min_edge) < 1e-9
+        assert abs(aggressive - state._base_aggressive_min_edge) < 1e-9
+        assert abs(qualitative - 0.05) < 1e-9
+    finally:
+        cfg.MODULES.clear()
+        cfg.MODULES.update(original_modules)
+
+
+def test_check_model_runs_arms_burst_window_when_enabled():
+    from weatheredge import main as main_module
+
+    original_modules = dict(cfg.MODULES)
+    try:
+        cfg.MODULES["burst_mode"] = True
+        state = main_module.init_app()
+        state.model_run_detector = MagicMock()
+
+        with patch.object(
+            main_module,
+            "_check_model_runs_async",
+            new=AsyncMock(return_value=["event"]),
+        ), patch.object(main_module, "run_decision_loop") as mock_loop:
+            main_module.check_model_runs()
+
+        assert state._burst_mode_until is not None
+        mock_loop.assert_called_once()
+    finally:
+        cfg.MODULES.clear()
+        cfg.MODULES.update(original_modules)
