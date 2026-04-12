@@ -1,0 +1,32 @@
+{
+  "phase": "phase_1",
+  "activated_at": "2026-04-12T11:05:54.427337+00:00",
+  "modules": {
+    "agent_mean_reversion": false,
+    "agent_voting": false,
+    "agent_qualitative": false,
+    "timesfm": false,
+    "student_t_fallback": true,
+    "vpin": false,
+    "exit_pnl_stoploss": false,
+    "exit_edge_flip": true,
+    "exit_time_decay": true,
+    "exit_ev_based": true,
+    "dynamic_model_weights": false,
+    "dynamic_agent_weights": false,
+    "weekly_error_analysis": true,
+    "cross_platform_arb": false,
+    "limit_orders": true,
+    "burst_mode": false,
+    "market_drift_tracking": false,
+    "bias_correction": true,
+    "rmse_floor_dynamic": true,
+    "reliability_tracking": true,
+    "shrinkage_rmse": false,
+    "seasonal_agent_weights": false,
+    "meta_calibrator": false,
+    "orderbook_logging": true,
+    "temporal_guard": true,
+    "volume_filter": true
+  }
+}

@@ -1,0 +1,20 @@
+[
+  {
+    "address": "0xAAA",
+    "profile_text": "Aggressive weather arb bot.",
+    "stats": {
+      "total_trades": 200,
+      "win_rate": 0.7,
+      "sharpe_ratio": 3.1
+    }
+  },
+  {
+    "address": "0xBBB",
+    "profile_text": "Conservative manual trader.",
+    "stats": {
+      "total_trades": 80,
+      "win_rate": 0.55,
+      "sharpe_ratio": 1.5
+    }
+  }
+]

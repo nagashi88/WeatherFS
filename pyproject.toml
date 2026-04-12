@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weatheredge"
+version = "0.1.0"
+description = "Autonomous weather prediction market trading bot"
+requires-python = ">=3.11"
+dependencies = [
+    "scipy>=1.11",
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "apscheduler>=3.10",
+    "aiohttp>=3.9",
+    "openai>=1.0",
+    "pmxt>=2.20",
+    "python-telegram-bot>=21.0",
+    "sqlalchemy>=2.0",
+    "timesfm[torch]>=1.3.0",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests that hit real external APIs (deselect with '-m \"not slow\"')",
+    "live_api: marks tests that require live network/API access (disabled by default; enable with RUN_LIVE_TESTS=1 or --run-live-tests)",
+    "L0: smoke tests (imports, DB, config, scheduler)",
+    "L1: unit tests (math correctness)",
+    "L2: integration tests (real APIs, network required)",
+    "L3: end-to-end tests (full decision cycle with mocks)",
+    "L4: validation tests (live data sanity checks)",
+]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["weatheredge*"]

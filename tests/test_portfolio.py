@@ -1,0 +1,350 @@
+"""Tests for PortfolioManager weighted voting (Addendum Gap 7a)."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from weatheredge.agents.base import MarketOpportunity, Signal
+from weatheredge.agents.portfolio_manager import PortfolioManager
+from weatheredge.agents.risk_manager import RiskManager
+from weatheredge.config import Settings
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def make_settings(**overrides) -> Settings:
+    """Build a Settings instance with test-friendly defaults (no .env required)."""
+    defaults = dict(
+        polymarket_private_key="",
+        polymarket_proxy_address="",
+        kalshi_api_key="",
+        kalshi_private_key="",
+        anthropic_api_key="",
+        telegram_bot_token="",
+        telegram_chat_id="",
+        kelly_fraction=0.15,
+        max_open_positions=20,
+        max_single_market_exposure=0.08,
+        target_volatility=0.10,
+        max_leverage=2.0,
+        min_allocation=0.20,
+        vpin_danger_threshold=0.70,
+        current_risk_tier=100,
+        initial_bankroll=1000.0,
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def make_opportunity(market_id: str = "MKT-1", city: str = "NYC") -> MarketOpportunity:
+    return MarketOpportunity(
+        market_id=market_id,
+        platform="polymarket",
+        city=city,
+        station="KNYC",
+        threshold=75.0,
+        direction="above",
+        market_price=0.45,
+        model_probability=0.65,
+        net_edge=0.18,
+    )
+
+
+def make_pm(rm: MagicMock | None = None) -> PortfolioManager:
+    settings = make_settings()
+    if rm is None:
+        rm = MagicMock()
+        rm.pre_trade_check.return_value = {"blocked": False}
+        rm.calculate_position_size.return_value = 50.0
+    return PortfolioManager(settings, rm)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+def test_weighted_voting_above_threshold():
+    """Conservative=no_trade, others vote buy_yes → weighted=0.66 > 0.50 → order generated.
+
+    Conservative (0.30) * 0.0 (no_trade excluded) = 0.00
+    Aggressive   (0.30) * 1.0 = 0.30
+    MeanReversion(0.20) * 1.0 = 0.20
+    Qualitative  (0.20) * 0.8 = 0.16
+    Total = 0.66
+    """
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-1", side="no_trade",  confidence=1.0, agent_name="Conservative"),
+        Signal(market_id="MKT-1", side="buy_yes",   confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-1", side="buy_yes",   confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-1", side="buy_yes",   confidence=0.8, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-1")
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-1": signals},
+        opportunities={"MKT-1": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].market_id == "MKT-1"
+    assert orders[0].side == "buy_yes"
+    assert orders[0].amount == 50.0
+
+
+def test_weighted_voting_below_threshold():
+    """Only Conservative=buy_yes(0.5) → weighted=0.25*0.5=0.125 < 0.20 → no order."""
+    rm = MagicMock()
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-2", side="buy_yes", confidence=0.5, agent_name="Conservative"),
+    ]
+    opp = make_opportunity("MKT-2")
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-2": signals},
+        opportunities={"MKT-2": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+
+
+def test_risk_veto_blocks_trade():
+    """Weighted score above threshold but risk_manager blocks → no order."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": True, "reason": "daily loss limit"}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-3", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-3", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-3", side="buy_yes", confidence=1.0, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-3")
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-3": signals},
+        opportunities={"MKT-3": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == []
+
+
+def test_vpin_reduces_size():
+    """risk_manager returns reduce_size=True → order amount is halved."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False, "reduce_size": True}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-4", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-4", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-4", side="buy_yes", confidence=1.0, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-4")
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-4": signals},
+        opportunities={"MKT-4": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].amount == pytest.approx(25.0)
+
+
+def test_empty_signals():
+    """No signals at all → empty list returned."""
+    pm = make_pm()
+
+    orders = pm.aggregate_signals(
+        signals_by_market={},
+        opportunities={},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == []
+
+
+def test_multiple_markets():
+    """Signals for 2 markets both above threshold → up to 2 orders."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 40.0
+    pm = make_pm(rm)
+
+    # Both markets have Aggressive + MeanReversion + Qualitative voting → 0.70 each
+    def voting_signals(mid: str) -> list[Signal]:
+        return [
+            Signal(market_id=mid, side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+            Signal(market_id=mid, side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+            Signal(market_id=mid, side="buy_yes", confidence=1.0, agent_name="Qualitative"),
+        ]
+
+    opp_a = make_opportunity("MKT-A", city="NYC")
+    opp_b = make_opportunity("MKT-B", city="Chicago")
+
+    orders = pm.aggregate_signals(
+        signals_by_market={
+            "MKT-A": voting_signals("MKT-A"),
+            "MKT-B": voting_signals("MKT-B"),
+        },
+        opportunities={"MKT-A": opp_a, "MKT-B": opp_b},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 2
+    market_ids = {o.market_id for o in orders}
+    assert "MKT-A" in market_ids
+    assert "MKT-B" in market_ids
+
+
+def test_risk_check_uses_cost_and_total_capital_base():
+    """pre_trade_check should receive dollar cost (not contracts) and cash+open-cost capital."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 80.0
+    pm = make_pm(rm)
+
+    market_id = "MKT-NO"
+    opp = make_opportunity(market_id=market_id, city="NYC")
+    opp.market_price = 0.80
+    opp.model_probability = 0.20  # Favors buy_no
+
+    signals = [
+        Signal(market_id=market_id, side="buy_no", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id=market_id, side="buy_no", confidence=1.0, agent_name="SellNO"),
+    ]
+
+    orders = pm.aggregate_signals(
+        signals_by_market={market_id: signals},
+        opportunities={market_id: opp},
+        bankroll=1000.0,
+        open_positions=[{"cost": 120.0, "city": "NYC", "status": "open"}],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    rm.pre_trade_check.assert_called_once()
+    call_kwargs = rm.pre_trade_check.call_args.kwargs
+    # buy_no cost = (1 - yes_price) * contracts = 0.2 * 80 = 16
+    assert call_kwargs["proposed_size"] == pytest.approx(16.0)
+    # bankroll passed to risk checks should include open position cost
+    assert call_kwargs["bankroll"] == pytest.approx(1120.0)
+
+
+def test_max_open_positions_respected_with_multiple_orders_same_cycle():
+    """Accepted orders in the same cycle must consume projected open slots."""
+    settings = make_settings(max_open_positions=1)
+    rm = RiskManager(settings)
+    pm = PortfolioManager(settings, rm)
+
+    def voting_signals(mid: str) -> list[Signal]:
+        return [
+            Signal(market_id=mid, side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+            Signal(market_id=mid, side="buy_yes", confidence=1.0, agent_name="SellNO"),
+        ]
+
+    opp_a = make_opportunity("MKT-A", city="NYC")
+    opp_b = make_opportunity("MKT-B", city="Chicago")
+
+    orders = pm.aggregate_signals(
+        signals_by_market={
+            "MKT-A": voting_signals("MKT-A"),
+            "MKT-B": voting_signals("MKT-B"),
+        },
+        opportunities={"MKT-A": opp_a, "MKT-B": opp_b},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+
+
+def test_candidates_prioritized_by_score_when_slots_are_limited():
+    """When only one slot is available, highest-score candidate should be selected first."""
+    settings = make_settings(max_open_positions=1)
+    rm = RiskManager(settings)
+    pm = PortfolioManager(settings, rm)
+
+    low_score_market = "MKT-LOW"
+    high_score_market = "MKT-HIGH"
+
+    low_signals = [
+        Signal(market_id=low_score_market, side="buy_no", confidence=0.60, agent_name="SellNO"),  # 0.15
+        Signal(market_id=low_score_market, side="buy_no", confidence=0.90, agent_name="Qualitative"),  # 0.135
+        Signal(market_id=low_score_market, side="buy_no", confidence=0.30, agent_name="Aggressive"),  # 0.075
+    ]  # total 0.36
+
+    high_signals = [
+        Signal(market_id=high_score_market, side="buy_yes", confidence=1.00, agent_name="Conservative"),  # 0.30
+        Signal(market_id=high_score_market, side="buy_yes", confidence=1.00, agent_name="Aggressive"),    # 0.25
+        Signal(market_id=high_score_market, side="buy_yes", confidence=1.00, agent_name="Qualitative"),   # 0.15
+    ]  # total 0.70
+
+    opp_low = make_opportunity(market_id=low_score_market, city="NYC")
+    opp_low.market_price = 0.70
+    opp_low.model_probability = 0.10
+    opp_low.net_edge = -0.60
+    opp_low.net_edge_no = 0.57
+
+    opp_high = make_opportunity(market_id=high_score_market, city="Chicago")
+    opp_high.market_price = 0.20
+    opp_high.model_probability = 0.85
+    opp_high.net_edge = 0.62
+    opp_high.net_edge_no = -0.65
+
+    orders = pm.aggregate_signals(
+        signals_by_market={
+            low_score_market: low_signals,   # Intentionally first insertion order
+            high_score_market: high_signals,
+        },
+        opportunities={
+            low_score_market: opp_low,
+            high_score_market: opp_high,
+        },
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].market_id == high_score_market
+    assert orders[0].side == "buy_yes"
