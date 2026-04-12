@@ -178,16 +178,11 @@ def get_current_phase() -> str:
     return "phase_0"
 
 
-def activate_phase(phase_name: str) -> dict[str, bool]:
-    """Activate a phase by merging module configs up to that phase.
-
-    Phases are cumulative: phase_2 includes all of phase_0 + phase_1 + phase_2.
-    Returns the final MODULES dict.
-    """
+def _merged_modules_for_phase(phase_name: str) -> dict[str, bool]:
+    """Return cumulative module config for a phase without mutating globals."""
     if phase_name not in PHASE_CONFIGS:
         raise ValueError(f"Unknown phase: {phase_name}. Choose from: {list(PHASE_CONFIGS.keys())}")
 
-    # Start from phase_0 base, then layer on each subsequent phase
     target_idx = PHASE_ORDER.index(phase_name)
     merged: dict[str, bool] = {}
 
@@ -200,6 +195,16 @@ def activate_phase(phase_name: str) -> dict[str, bool]:
         else:
             # Subsequent phases only override specific keys
             merged.update(phase_modules)
+    return merged
+
+
+def activate_phase(phase_name: str, persist: bool = True) -> dict[str, bool]:
+    """Activate a phase by applying cumulative modules to cfg.MODULES.
+
+    Phases are cumulative: phase_2 includes all of phase_0 + phase_1 + phase_2.
+    Returns the final MODULES dict.
+    """
+    merged = _merged_modules_for_phase(phase_name)
 
     # Apply to global MODULES
     changes: list[str] = []
@@ -209,14 +214,20 @@ def activate_phase(phase_name: str) -> dict[str, bool]:
             changes.append(f"  {key}: {old} -> {value}")
         cfg.MODULES[key] = value
 
-    # Persist
-    PHASE_FILE.write_text(json.dumps({
-        "phase": phase_name,
-        "activated_at": datetime.now(timezone.utc).isoformat(),
-        "modules": dict(cfg.MODULES),
-    }, indent=2))
+    if persist:
+        # Persist
+        PHASE_FILE.write_text(json.dumps({
+            "phase": phase_name,
+            "activated_at": datetime.now(timezone.utc).isoformat(),
+            "modules": dict(cfg.MODULES),
+        }, indent=2))
 
-    log.info("Phase activated: %s (%s)", phase_name, PHASE_CONFIGS[phase_name]["name"])
+    log.info(
+        "Phase activated: %s (%s) [persist=%s]",
+        phase_name,
+        PHASE_CONFIGS[phase_name]["name"],
+        persist,
+    )
     if changes:
         log.info("Module changes:\n%s", "\n".join(changes))
     else:
@@ -227,19 +238,10 @@ def activate_phase(phase_name: str) -> dict[str, bool]:
 
 def get_phase_modules(phase_name: str) -> dict[str, bool]:
     """Get the merged module config for a phase without activating it."""
-    if phase_name not in PHASE_CONFIGS:
+    try:
+        return _merged_modules_for_phase(phase_name)
+    except ValueError:
         return {}
-
-    target_idx = PHASE_ORDER.index(phase_name)
-    merged: dict[str, bool] = {}
-    for i in range(target_idx + 1):
-        p = PHASE_ORDER[i]
-        phase_modules = PHASE_CONFIGS[p]["modules"]
-        if i == 0:
-            merged = dict(phase_modules)
-        else:
-            merged.update(phase_modules)
-    return merged
 
 
 def get_gate_status(phase_name: str) -> dict:

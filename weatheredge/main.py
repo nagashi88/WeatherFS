@@ -70,6 +70,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _LOG_DIR = _PROJECT_ROOT / "logs"
 _LOG_FILE = _LOG_DIR / "weatheredge.log"
 _LOG_FILE_ENV_VAR = "WEATHEREDGE_LOG_FILE"
+_PHASE_ENV_VAR = "WEATHEREDGE_PHASE"
 _LOG_FORMAT = "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
 
 
@@ -159,6 +160,24 @@ def setup_logging() -> None:
     logging.getLogger("weatheredge.telegram").setLevel(logging.INFO)
 
     log.info("Logging initialised — file: %s", log_file)
+
+
+def _apply_runtime_phase_override() -> str | None:
+    """Apply phase from WEATHEREDGE_PHASE to MODULES for this process only.
+
+    This keeps per-process phase isolation for parallel paper runs.
+    """
+    phase_name = (os.getenv(_PHASE_ENV_VAR) or "").strip()
+    if not phase_name:
+        return None
+    from weatheredge.phase_config import activate_phase
+    activate_phase(phase_name, persist=False)
+    log.info(
+        "Runtime phase override active: %s=%s (no current_phase.json write)",
+        _PHASE_ENV_VAR,
+        phase_name,
+    )
+    return phase_name
 
 
 # ---------------------------------------------------------------------------
@@ -2635,6 +2654,7 @@ def main() -> None:
     """
     setup_logging()
     log.info("WeatherEdge starting up")
+    _apply_runtime_phase_override()
 
     state = init_app()
     settings = state.settings
