@@ -72,6 +72,7 @@ _LOG_DIR = _PROJECT_ROOT / "logs"
 _LOG_FILE = _LOG_DIR / "weatheredge.log"
 _LOG_FILE_ENV_VAR = "WEATHEREDGE_LOG_FILE"
 _PHASE_ENV_VAR = "WEATHEREDGE_PHASE"
+_ORDER_MODE_ENV_VAR = "WEATHEREDGE_ORDER_MODE"
 _LOG_FORMAT = "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
 
 
@@ -179,6 +180,37 @@ def _apply_runtime_phase_override() -> str | None:
         phase_name,
     )
     return phase_name
+
+
+def _apply_runtime_order_mode_override() -> str | None:
+    """Apply order-mode override from WEATHEREDGE_ORDER_MODE.
+
+    Supported values:
+    - market: disable limit orders (market fills)
+    - limit: enable limit orders
+    """
+    mode = (os.getenv(_ORDER_MODE_ENV_VAR) or "").strip().lower()
+    if not mode:
+        return None
+    if mode == "market":
+        MODULES["limit_orders"] = False
+    elif mode == "limit":
+        MODULES["limit_orders"] = True
+    else:
+        log.warning(
+            "Runtime order mode override ignored: %s=%s (valid: market|limit)",
+            _ORDER_MODE_ENV_VAR,
+            mode,
+        )
+        return None
+
+    log.info(
+        "Runtime order mode override active: %s=%s -> limit_orders=%s",
+        _ORDER_MODE_ENV_VAR,
+        mode,
+        MODULES.get("limit_orders"),
+    )
+    return mode
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +454,41 @@ def _bootstrap_phase2_drift_entries(state: AppState) -> None:
     for pos in state.paper_trader.open_positions:
         _record_phase2_drift_entry(state, pos, source="startup_open_position")
     log.info("Phase 2 drift bootstrap completed for %d open positions", len(state.paper_trader.open_positions))
+
+
+def _startup_bootstrap_cycle(run_decision_loop_once: bool = True) -> None:
+    """Prime DB state immediately at startup before waiting for interval jobs.
+
+    Runs market and forecast fetch once so phase-matrix profiles do not remain
+    empty until the first scheduler tick. Optionally runs one decision cycle.
+    """
+    steps = [
+        ("fetch_market_data", fetch_market_data),
+        ("fetch_forecast_data", fetch_forecast_data),
+    ]
+    if run_decision_loop_once:
+        steps.append(("run_decision_loop", run_decision_loop))
+
+    log.info(
+        "Startup bootstrap: running immediate steps (%s)",
+        ", ".join(name for name, _ in steps),
+    )
+    for name, fn in steps:
+        started = time.time()
+        try:
+            fn()
+            log.info(
+                "Startup bootstrap: %s completed in %.2fs",
+                name,
+                max(time.time() - started, 0.0),
+            )
+        except Exception as exc:
+            log.warning(
+                "Startup bootstrap: %s failed: %s",
+                name,
+                exc,
+                exc_info=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2811,6 +2878,7 @@ def main() -> None:
     setup_logging()
     log.info("WeatherEdge starting up")
     _apply_runtime_phase_override()
+    _apply_runtime_order_mode_override()
 
     state = init_app()
     settings = state.settings
@@ -2952,6 +3020,10 @@ def main() -> None:
             state.timesfm_forecaster = None
     else:
         log.info("Phase 6: TimesFM disabled in config")
+
+    # Startup bootstrap: fetch market/forecast immediately so profiles do not
+    # wait for the first 5m/15m scheduler intervals.
+    _startup_bootstrap_cycle(run_decision_loop_once=True)
 
     # Register signal handlers for graceful shutdown (Gap 14)
     signal.signal(signal.SIGTERM, _handle_shutdown)

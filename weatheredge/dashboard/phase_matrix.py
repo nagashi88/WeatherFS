@@ -6,6 +6,7 @@ Profiles currently supported:
 
 Each profile runs in an isolated process with:
 - WEATHEREDGE_PHASE set per process
+- WEATHEREDGE_ORDER_MODE set to limit for A/B comparability
 - Dedicated DB file (WEATHEREDGE_DB_PATH)
 - Dedicated log file (WEATHEREDGE_LOG_FILE)
 """
@@ -34,6 +35,7 @@ PHASE_PROFILE_ALIASES = {
     "phase1": "phase_1",
     "phase2": "phase_2",
 }
+PHASE_MATRIX_ORDER_MODE = "limit"
 
 _CLOSED_STATUSES = (
     "won",
@@ -362,6 +364,7 @@ def _build_env(profile: str, paths: ProfilePaths) -> dict[str, str]:
     env["WEATHEREDGE_DB_PATH"] = str(paths.db_file)
     env["WEATHEREDGE_LOG_FILE"] = str(paths.log_file)
     env["WEATHEREDGE_PHASE"] = profile
+    env["WEATHEREDGE_ORDER_MODE"] = PHASE_MATRIX_ORDER_MODE
     return env
 
 

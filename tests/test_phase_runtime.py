@@ -37,12 +37,37 @@ def test_runtime_phase_override_uses_env_without_persist(monkeypatch):
     mock_activate.assert_called_once_with("phase_1", persist=False)
 
 
+def test_runtime_order_mode_override_market(monkeypatch):
+    from weatheredge.main import _apply_runtime_order_mode_override
+
+    original_modules = dict(cfg.MODULES)
+    try:
+        cfg.MODULES["limit_orders"] = True
+        monkeypatch.setenv("WEATHEREDGE_ORDER_MODE", "market")
+        result = _apply_runtime_order_mode_override()
+        assert result == "market"
+        assert cfg.MODULES["limit_orders"] is False
+    finally:
+        cfg.MODULES.clear()
+        cfg.MODULES.update(original_modules)
+
+
 def test_phase_matrix_alias_resolution():
     from weatheredge.dashboard.phase_matrix import resolve_profile_name
 
     assert resolve_profile_name("phase1") == "phase_1"
     assert resolve_profile_name("phase2") == "phase_2"
     assert resolve_profile_name("phase_2") == "phase_2"
+
+
+def test_phase_matrix_build_env_sets_limit_order_mode():
+    from weatheredge.dashboard.phase_matrix import _build_env, profile_paths
+
+    paths = profile_paths("phase_1")
+    env = _build_env("phase_1", paths)
+
+    assert env["WEATHEREDGE_PHASE"] == "phase_1"
+    assert env["WEATHEREDGE_ORDER_MODE"] == "limit"
 
 
 def test_phase2_effective_thresholds_burst_on():
@@ -105,3 +130,37 @@ def test_check_model_runs_arms_burst_window_when_enabled():
     finally:
         cfg.MODULES.clear()
         cfg.MODULES.update(original_modules)
+
+
+def test_startup_bootstrap_runs_immediate_steps_in_order():
+    from weatheredge import main as main_module
+
+    calls: list[str] = []
+
+    with (
+        patch.object(main_module, "fetch_market_data", side_effect=lambda: calls.append("market")),
+        patch.object(main_module, "fetch_forecast_data", side_effect=lambda: calls.append("forecast")),
+        patch.object(main_module, "run_decision_loop", side_effect=lambda: calls.append("decision")),
+    ):
+        main_module._startup_bootstrap_cycle(run_decision_loop_once=True)
+
+    assert calls == ["market", "forecast", "decision"]
+
+
+def test_startup_bootstrap_continues_when_one_step_fails():
+    from weatheredge import main as main_module
+
+    calls: list[str] = []
+
+    def _fail_market() -> None:
+        calls.append("market")
+        raise RuntimeError("boom")
+
+    with (
+        patch.object(main_module, "fetch_market_data", side_effect=_fail_market),
+        patch.object(main_module, "fetch_forecast_data", side_effect=lambda: calls.append("forecast")),
+        patch.object(main_module, "run_decision_loop", side_effect=lambda: calls.append("decision")),
+    ):
+        main_module._startup_bootstrap_cycle(run_decision_loop_once=True)
+
+    assert calls == ["market", "forecast", "decision"]
