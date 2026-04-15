@@ -389,3 +389,53 @@ class TestPositionTracker:
         tracker.remove_position("m1")
         assert all(p["market_id"] != "m1" for p in tracker._positions)
         assert len(tracker._positions) == 1
+
+
+# ---------------------------------------------------------------------------
+# Re-entry guard (daily entry limit)
+# ---------------------------------------------------------------------------
+
+
+class TestDailyEntryLimit:
+    def _order(self, market_id: str) -> Order:
+        return Order(market_id=market_id, side="buy_yes", price=0.30, amount=10.0)
+
+    def test_first_entry_allowed(self):
+        """First entry on a market is always allowed."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        assert trader.has_reached_daily_entry_limit("m1") is False
+
+    def test_second_entry_allowed(self):
+        """Second entry is still within the default limit of 2."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(self._order("m1"))
+        assert trader.has_reached_daily_entry_limit("m1") is False
+
+    def test_third_entry_blocked(self):
+        """Third entry on the same market in the same day is blocked."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(self._order("m1"))
+        trader.place_order(self._order("m1"))
+        assert trader.has_reached_daily_entry_limit("m1") is True
+
+    def test_different_markets_independent(self):
+        """Entry limit on m1 does not affect m2."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(self._order("m1"))
+        trader.place_order(self._order("m1"))
+        assert trader.has_reached_daily_entry_limit("m2") is False
+
+    def test_custom_max_entries(self):
+        """max_entries parameter is respected."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(self._order("m1"))
+        assert trader.has_reached_daily_entry_limit("m1", max_entries=1) is True
+        assert trader.has_reached_daily_entry_limit("m1", max_entries=2) is False
+
+    def test_int_and_str_market_id_treated_same(self):
+        """Market IDs '1953479' and 1953479 count against the same limit."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(Order(market_id="1953479", side="buy_no", price=0.70, amount=5.0))
+        trader.place_order(Order(market_id=1953479, side="buy_no", price=0.68, amount=5.0))
+        assert trader.has_reached_daily_entry_limit("1953479") is True
+        assert trader.has_reached_daily_entry_limit(1953479) is True

@@ -76,6 +76,8 @@ class PaperTrader:
         self.last_limit_fills: list[dict] = []  # Filled positions from latest check_limit_fills()
         self.trade_history: list[dict] = []
         self.daily_pnl: dict[str, float] = {}  # date_str -> pnl
+        # Re-entry guard: market_id -> {date_str -> entry_count}
+        self._daily_entries: dict[str, dict[str, int]] = {}
 
     # ------------------------------------------------------------------
     # DB persistence
@@ -131,6 +133,24 @@ class PaperTrader:
 
         # Reconstruct bankroll: initial + net resolved P&L - open position costs
         self.bankroll = self.initial_bankroll + resolved_pnl_total - open_cost_total
+
+        # Restore daily entry counters for today from open positions + trade history
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for t in list(self.open_positions) + list(self.trade_history):
+            created = t.get("created_at")
+            if created is None:
+                continue
+            if isinstance(created, str):
+                try:
+                    created = datetime.fromisoformat(created)
+                except ValueError:
+                    continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created.strftime("%Y-%m-%d") == today:
+                key = self._market_id_key(t.get("market_id"))
+                bucket = self._daily_entries.setdefault(key, {})
+                bucket[today] = bucket.get(today, 0) + 1
 
         log.info(
             "PaperTrader loaded from DB: %d open positions, %d resolved, bankroll=$%.2f",
@@ -312,6 +332,7 @@ class PaperTrader:
         trade["db_id"] = db_id
 
         self.open_positions.append(trade)
+        self._record_daily_entry(market_id)
         return {"filled": True, "trade": trade}
 
     def check_limit_fills(self, current_prices: dict[str, float]) -> int:
@@ -392,6 +413,7 @@ class PaperTrader:
 
             self.open_positions.append(trade)
             self.last_limit_fills.append(trade)
+            self._record_daily_entry(market_id)
             filled_count += 1
             log.info(
                 "check_limit_fills: filled %s %s at %.4f",
@@ -491,6 +513,28 @@ class PaperTrader:
         ) or any(
             self._market_id_key(o.get("market_id")) == target_market_id
             for o in self.open_orders
+        )
+
+    def has_reached_daily_entry_limit(self, market_id: str, max_entries: int = 2) -> bool:
+        """Return True if we have already entered this market max_entries times today.
+
+        Prevents re-entry traps where the bot repeatedly enters and gets stopped
+        out on the same market within a single day (e.g. 1953479 pattern: 4 entries,
+        all edge_stop, cumulative -1.03).
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = self._market_id_key(market_id)
+        return self._daily_entries.get(key, {}).get(today, 0) >= max_entries
+
+    def _record_daily_entry(self, market_id: str) -> None:
+        """Increment the daily entry counter for a market."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = self._market_id_key(market_id)
+        bucket = self._daily_entries.setdefault(key, {})
+        bucket[today] = bucket.get(today, 0) + 1
+        log.debug(
+            "daily_entry_count: market=%s date=%s count=%d",
+            key, today, bucket[today],
         )
 
     # ------------------------------------------------------------------

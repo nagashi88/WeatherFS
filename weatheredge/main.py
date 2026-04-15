@@ -882,6 +882,15 @@ def _run_decision_cycle(state: AppState) -> None:
             position_skipped += 1
             continue
 
+        # Re-entry guard: skip if we already entered this market 2+ times today
+        if state.paper_trader.has_reached_daily_entry_limit(market_id):
+            log.debug(
+                "re_entry_guard: skipping %s — daily entry limit reached",
+                market_id,
+            )
+            position_skipped += 1
+            continue
+
         # Collect raw dicts for arb scan
         # Extract date from cached metadata if available
         _meta = state.market_metadata.get(market_id, {})
