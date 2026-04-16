@@ -1865,8 +1865,16 @@ def _build_opportunity(
     # BugFix P0-1: When blended probability hits the floor exactly (clamped),
     # the model has no differentiation signal. Use gaussian_prob as a better
     # point estimate — it varies by market and prevents Kelly over-betting.
+    #
+    # BugFix P0-4: Skip floor escape on bucket markets. On bucket markets,
+    # bucket_probability at the floor is the CORRECT answer (forecast far from
+    # bucket range), while gaussian_prob at the midpoint answers a different
+    # question (P above midpoint). Replacing a correct ~0 with P(above midpoint)
+    # creates phantom confidence on buy_yes trades that lose the entire stake
+    # when the actual temp lands outside the narrow bucket.
     from weatheredge.probability.gaussian import PROB_FLOOR as _PROB_FLOOR
-    if probability == _PROB_FLOOR and gaussian_prob > _PROB_FLOOR:
+    _is_bucket = bucket_low is not None and bucket_high is not None
+    if not _is_bucket and probability == _PROB_FLOOR and gaussian_prob > _PROB_FLOOR:
         log.debug(
             "_build_opportunity: blended hit floor for %s, upgrading model_prob %.3f → %.3f (gaussian)",
             market_id, probability, gaussian_prob,
