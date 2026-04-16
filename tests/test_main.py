@@ -2972,3 +2972,155 @@ class TestMainEntrypointExceptions:
                                 main_module.main()  # must not raise
 
         assert state.shutting_down is True
+
+
+# ---------------------------------------------------------------------------
+# BugFix P0-5: METAR reality check on bucket markets
+# ---------------------------------------------------------------------------
+
+
+class TestBucketMetarOverride:
+    """Bucket markets must respect observed METAR daily-high — buy_no on a bucket
+    the temperature has already entered or passed is a known loss pattern.
+    """
+
+    @staticmethod
+    def _make_state_with_tracker(daily_high_f, market_date):
+        state = _make_app_state()
+        state.conditions_tracker = MagicMock()
+        state.conditions_tracker.metar_probability_override.return_value = None
+
+        if daily_high_f is not None:
+            tracker = MagicMock()
+            tracker.daily_high_f = daily_high_f
+            tracker.date = market_date
+            state.conditions_tracker.get_tracker.return_value = tracker
+        else:
+            state.conditions_tracker.get_tracker.return_value = None
+        return state
+
+    @staticmethod
+    def _bucket_market_metadata(market_id, station, date, low, high):
+        mock_parsed = MagicMock()
+        mock_parsed.threshold = (low + high) / 2.0
+        mock_parsed.direction = "above"
+        mock_parsed.market_type = "daily_high"
+        mock_parsed.date = date
+        mock_parsed.threshold_low = low
+        mock_parsed.threshold_high = high
+        return {
+            "resolution_source": {"station": station, "type": "daily_high"},
+            "platform": "polymarket",
+            "parsed": mock_parsed,
+        }
+
+    @staticmethod
+    def _forecasts(station, temp):
+        return {
+            station: {
+                "temperature_forecast": temp,
+                "ecmwf_temp": None,
+                "hrrr_temp": None,
+                "ensemble_members": None,
+                "model": "gfs",
+                "forecast_timestamp": datetime.now(timezone.utc),
+            }
+        }
+
+    def test_metar_in_bucket_lifts_probability_to_yes_baseline(self):
+        """Observed daily_high inside the bucket → bucket is on track to resolve YES."""
+        market_date = "2026-04-16"
+        state = self._make_state_with_tracker(daily_high_f=86.5, market_date=market_date)
+        market_id = "bucket_in_range"
+        state.market_metadata[market_id] = self._bucket_market_metadata(
+            market_id, "KNYC", market_date, low=86.0, high=87.0,
+        )
+
+        # Forecast says max ~89°F → bucket_probability ≈ floor (0.10) without override.
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.5}, self._forecasts("KNYC", 89.0),
+            )
+
+        assert opp is not None
+        assert opp.model_probability >= 0.85, (
+            f"METAR-in-bucket override should lift prob to >=0.85, got {opp.model_probability}"
+        )
+
+    def test_metar_above_bucket_caps_probability_low(self):
+        """Observed daily_high already above bucket_high → daily max stays/climbs above → NO."""
+        market_date = "2026-04-16"
+        state = self._make_state_with_tracker(daily_high_f=92.0, market_date=market_date)
+        market_id = "bucket_exceeded"
+        state.market_metadata[market_id] = self._bucket_market_metadata(
+            market_id, "KNYC", market_date, low=86.0, high=87.0,
+        )
+
+        # yes_price 0.30 keeps |market - prob(0.05)| = 0.25 below the 0.40 unrealistic-edge cap
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.30}, self._forecasts("KNYC", 86.0),
+            )
+
+        assert opp is not None
+        assert opp.model_probability <= 0.05, (
+            f"METAR-exceeds-bucket should cap prob to <=0.05, got {opp.model_probability}"
+        )
+
+    def test_metar_below_bucket_does_not_override(self):
+        """Observed daily_high below bucket_low → temp could still rise → no override."""
+        market_date = "2026-04-16"
+        state = self._make_state_with_tracker(daily_high_f=70.0, market_date=market_date)
+        market_id = "bucket_below"
+        state.market_metadata[market_id] = self._bucket_market_metadata(
+            market_id, "KNYC", market_date, low=86.0, high=87.0,
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.5}, self._forecasts("KNYC", 89.0),
+            )
+
+        assert opp is not None
+        # Bucket_probability with forecast 89, bucket [86,87], rmse default ≈ 2.5 → ~floor.
+        # Should remain at floor (0.10), not be lifted by METAR (which is below bucket).
+        assert opp.model_probability < 0.20, (
+            f"No-METAR-override should keep low prob, got {opp.model_probability}"
+        )
+
+    def test_metar_for_different_date_does_not_override(self):
+        """Tracker date != market_date → stale tracker, no override applied."""
+        market_date = "2026-04-16"
+        state = self._make_state_with_tracker(daily_high_f=86.5, market_date="2026-04-15")
+        market_id = "bucket_wrong_date"
+        state.market_metadata[market_id] = self._bucket_market_metadata(
+            market_id, "KNYC", market_date, low=86.0, high=87.0,
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.5}, self._forecasts("KNYC", 89.0),
+            )
+
+        assert opp is not None
+        # Tracker is for 04-15 but market is 04-16 → no override applied.
+        assert opp.model_probability < 0.20, (
+            f"Wrong-date tracker must not override, got {opp.model_probability}"
+        )
+
+    def test_no_tracker_keeps_normal_bucket_probability(self):
+        """No conditions_tracker data → bucket_probability used as-is."""
+        market_date = "2026-04-16"
+        state = self._make_state_with_tracker(daily_high_f=None, market_date=market_date)
+        market_id = "bucket_no_tracker"
+        state.market_metadata[market_id] = self._bucket_market_metadata(
+            market_id, "KNYC", market_date, low=86.0, high=87.0,
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.5}, self._forecasts("KNYC", 89.0),
+            )
+
+        assert opp is not None
+        assert opp.model_probability < 0.20  # floor — no METAR data to override

@@ -27,6 +27,7 @@ class TradeOrder:
     gaussian_prob: float | None = None
     ensemble_prob: float | None = None
     blended_prob: float | None = None
+    raw_model_prob: float | None = None  # Pre-clamp blended; None = not available (legacy/fallback)
     order_type: str = "market"
 
 @dataclass
@@ -55,3 +56,4 @@ class MarketOpportunity:
     timesfm_prob: float | None = None  # TimesFM quantile-based probability
     timesfm_error_adj: float | None = None  # TimesFM NWP error correction (degrees)
     volume: float | None = None  # Market volume for slippage modeling (US-205)
+    raw_model_prob: float | None = None  # Pre-clamp blended (audit only, not used for decisions)

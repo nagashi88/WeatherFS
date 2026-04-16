@@ -1138,6 +1138,7 @@ def _run_decision_cycle(state: AppState) -> None:
                 gaussian_prob=trade_order.gaussian_prob,
                 ensemble_prob=trade_order.ensemble_prob,
                 blended_prob=trade_order.blended_prob,
+                raw_model_prob=trade_order.raw_model_prob,
                 order_type=trade_order.order_type,
             )
             result = state.paper_trader.place_order(order)
@@ -1768,6 +1769,45 @@ def _build_opportunity(
                 "_build_opportunity: bucket market %s — P(%.0f<=T<=%.0f)=%.3f",
                 market_id, bucket_low, bucket_high, probability,
             )
+
+            # BugFix P0-5: METAR reality check on bucket markets.
+            # Without this, the bot computes bucket_probability from a stale forecast
+            # mean that ignores the temperature already observed today, then enters
+            # buy_no on buckets the temperature has already entered or passed.
+            # If observed daily_high already lies in [bucket_low, bucket_high], the
+            # bucket is on track to resolve YES (unless temp climbs out). If it
+            # already exceeds bucket_high, the bucket will resolve NO.
+            if (
+                state.conditions_tracker is not None
+                and market_date is not None
+                and market_type == "daily_high"
+            ):
+                tracker = state.conditions_tracker.get_tracker(station)
+                if (
+                    tracker is not None
+                    and tracker.date == market_date
+                    and tracker.daily_high_f > -900.0
+                ):
+                    metar_high = tracker.daily_high_f
+                    if bucket_low <= metar_high <= bucket_high:
+                        # Already inside the bucket — strong YES baseline.
+                        adjusted = max(probability, 0.85)
+                        log.info(
+                            "BUCKET METAR override %s: observed daily high %.1f in [%.0f,%.0f] → prob %.2f→%.2f",
+                            market_id, metar_high, bucket_low, bucket_high,
+                            probability, adjusted,
+                        )
+                        probability = adjusted
+                        model_used = "metar_bucket_in_range"
+                    elif metar_high > bucket_high:
+                        # Already past the bucket — daily max can only stay or climb.
+                        adjusted = min(probability, 0.05)
+                        log.info(
+                            "BUCKET METAR override %s: observed daily high %.1f > bucket_high %.0f → prob %.2f→%.2f",
+                            market_id, metar_high, bucket_high, probability, adjusted,
+                        )
+                        probability = adjusted
+                        model_used = "metar_bucket_exceeded"
         except Exception as exc:
             log.warning("_build_opportunity: bucket_probability failed for %s: %s", market_id, exc)
             return None
@@ -1912,6 +1952,14 @@ def _build_opportunity(
         threshold, direction, lead_time_hours,
     )
 
+    # Surface pre-clamp blended for audit (None on bucket/fallback paths where
+    # blend_details is absent — preserves nullable semantics).
+    raw_model_prob = None
+    try:
+        raw_model_prob = blend_details.get("raw_blended")  # type: ignore[name-defined]
+    except (NameError, AttributeError):
+        pass
+
     return MarketOpportunity(
         market_id=market_id,
         platform=platform,
@@ -1932,6 +1980,7 @@ def _build_opportunity(
         gaussian_prob=gaussian_prob,
         ensemble_prob=ensemble_prob,
         blended_prob=probability,
+        raw_model_prob=raw_model_prob,
         timesfm_prob=_timesfm_prob,
         timesfm_error_adj=_timesfm_error_adj,
         bucket_low=bucket_low,

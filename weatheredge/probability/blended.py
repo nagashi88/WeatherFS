@@ -124,31 +124,37 @@ def blended_probability(
     # Calculate individual model probabilities
     # GFS ensemble
     gfs_prob: float | None = None
+    gfs_prob_raw: float | None = None
     if ensemble_temps and len(ensemble_temps) >= 20:
         # Apply error correction to ensemble members too
         if timesfm_error_adj != 0.0:
             ensemble_temps = [t + timesfm_error_adj for t in ensemble_temps]
         gfs_prob = ensemble_probability(ensemble_temps, threshold, direction)
+        gfs_prob_raw = ensemble_probability(ensemble_temps, threshold, direction, clamp=False)
         details["gfs_ensemble_prob"] = round(gfs_prob, 4)
         details["gfs_ensemble_members"] = len(ensemble_temps)
 
     # ECMWF (Gaussian with ECMWF forecast temp)
     ecmwf_prob: float | None = None
+    ecmwf_prob_raw: float | None = None
     if ecmwf_forecast_temp is not None:
         # L-IMP-3: ECMWF has ~10% lower error than GFS for daily-max; conservative tightening.
         ecmwf_rmse = rmse * 0.90
         ecmwf_prob = gaussian_probability(ecmwf_forecast_temp, threshold, ecmwf_rmse, direction)
+        ecmwf_prob_raw = gaussian_probability(ecmwf_forecast_temp, threshold, ecmwf_rmse, direction, clamp=False)
         details["ecmwf_prob"] = round(ecmwf_prob, 4)
         details["ecmwf_temp"] = ecmwf_forecast_temp
 
     # HRRR (Gaussian with HRRR forecast temp, tighter RMSE since higher resolution)
     hrrr_prob: float | None = None
+    hrrr_prob_raw: float | None = None
     if hrrr_forecast_temp is not None and is_us_station:
         # HRRR at 3km resolution has lower RMSE than GFS at 25km, but for daily-max
         # temperature the advantage shrinks — use conservative 15% tightening.
         # Phase 0 evidence: 0.70 multiplier produced overconfident P→0 outputs (Brier 0.50).
         hrrr_rmse = rmse * 0.85
         hrrr_prob = gaussian_probability(hrrr_forecast_temp, threshold, hrrr_rmse, direction)
+        hrrr_prob_raw = gaussian_probability(hrrr_forecast_temp, threshold, hrrr_rmse, direction, clamp=False)
         details["hrrr_prob"] = round(hrrr_prob, 4)
         details["hrrr_temp"] = hrrr_forecast_temp
         details["hrrr_rmse"] = round(hrrr_rmse, 2)
@@ -193,27 +199,34 @@ def blended_probability(
     details["weights"] = weights
 
     # Build weighted blend from available models
+    # raw_* track the same blend on UNCLAMPED sub-probabilities for audit/diagnostics.
     weighted_sum = 0.0
+    raw_weighted_sum = 0.0
     total_weight = 0.0
 
     if gfs_prob is not None and weights.get("gfs_ensemble", 0) > 0:
         w = weights["gfs_ensemble"]
         weighted_sum += gfs_prob * w
+        raw_weighted_sum += (gfs_prob_raw if gfs_prob_raw is not None else gfs_prob) * w
         total_weight += w
 
     if ecmwf_prob is not None and weights.get("ecmwf", 0) > 0:
         w = weights["ecmwf"]
         weighted_sum += ecmwf_prob * w
+        raw_weighted_sum += (ecmwf_prob_raw if ecmwf_prob_raw is not None else ecmwf_prob) * w
         total_weight += w
 
     if hrrr_prob is not None and weights.get("hrrr", 0) > 0:
         w = weights["hrrr"]
         weighted_sum += hrrr_prob * w
+        raw_weighted_sum += (hrrr_prob_raw if hrrr_prob_raw is not None else hrrr_prob) * w
         total_weight += w
 
     if timesfm_prob_val is not None and weights.get("timesfm", 0) > 0:
         w = weights["timesfm"]
         weighted_sum += timesfm_prob_val * w
+        # TimesFM probability comes pre-shaped from upstream, no separate raw available.
+        raw_weighted_sum += timesfm_prob_val * w
         total_weight += w
 
     # Fallback: if no model data at all, use GFS point forecast with Gaussian
@@ -226,11 +239,13 @@ def blended_probability(
         details["fallback"] = "no_data"
         return 0.50, "no_data", details
 
-    # Normalize and clamp to [0.05, 0.95] safety floor/ceiling
+    # Normalize and clamp to [PROB_FLOOR, PROB_CEIL] safety floor/ceiling
     from weatheredge.probability.gaussian import _clamp_prob
     blended = _clamp_prob(weighted_sum / total_weight)
+    raw_blended = raw_weighted_sum / total_weight  # un-clamped, for audit only
     details["raw_weighted_sum"] = round(weighted_sum, 4)
     details["total_weight"] = round(total_weight, 4)
+    details["raw_blended"] = round(raw_blended, 6)
     details["blended_probability"] = round(blended, 4)
 
     # Determine model label

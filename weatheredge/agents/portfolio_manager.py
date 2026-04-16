@@ -229,6 +229,7 @@ class PortfolioManager:
                 gaussian_prob=opp.gaussian_prob if opp else None,
                 ensemble_prob=opp.ensemble_prob if opp else None,
                 blended_prob=opp.blended_prob if opp else None,
+                raw_model_prob=opp.raw_model_prob if opp else None,
             )
             orders.append(order)
 

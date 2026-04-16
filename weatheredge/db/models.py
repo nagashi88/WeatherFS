@@ -117,6 +117,7 @@ class Trade(Base):
     gaussian_prob: Mapped[float | None] = mapped_column(Float)
     ensemble_prob: Mapped[float | None] = mapped_column(Float)
     blended_prob: Mapped[float | None] = mapped_column(Float)
+    raw_model_prob: Mapped[float | None] = mapped_column(Float)  # Pre-clamp blended (audit floor effect)
     station: Mapped[str | None] = mapped_column(Text)
     market_date: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, default="open")  # see docstring above

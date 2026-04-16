@@ -713,8 +713,9 @@ class TestProbabilityCalculations:
         ) as mock_ens, patch(
             "weatheredge.probability.blended.gaussian_probability"
         ) as mock_gauss:
-            mock_ens.return_value = 0.70        # GFS ensemble
-            mock_gauss.side_effect = [0.80, 0.90]  # ECMWF call first, HRRR call second
+            mock_ens.return_value = 0.70        # GFS ensemble (called 2x: clamped + raw)
+            # Each gaussian model is called twice (clamped + raw); same value preserves blend math.
+            mock_gauss.side_effect = [0.80, 0.80, 0.90, 0.90]  # ECMWF x2, HRRR x2
 
             prob, model, details = blended_probability(
                 threshold=70.0,
@@ -743,7 +744,7 @@ class TestProbabilityCalculations:
             "weatheredge.probability.blended.gaussian_probability"
         ) as mock_gauss:
             mock_ens.return_value = 0.70
-            mock_gauss.side_effect = [0.80, 0.90]  # ECMWF, HRRR
+            mock_gauss.side_effect = [0.80, 0.80, 0.90, 0.90]  # ECMWF x2 (clamped+raw), HRRR x2
 
             prob, _, _ = blended_probability(
                 threshold=70.0,
@@ -769,7 +770,7 @@ class TestProbabilityCalculations:
             "weatheredge.probability.blended.gaussian_probability"
         ) as mock_gauss:
             mock_ens.return_value = 0.70
-            mock_gauss.side_effect = [0.80, 0.90]  # ECMWF, HRRR
+            mock_gauss.side_effect = [0.80, 0.80, 0.90, 0.90]  # ECMWF x2 (clamped+raw), HRRR x2
 
             prob, _, _ = blended_probability(
                 threshold=70.0,
@@ -973,8 +974,8 @@ class TestProbabilityCalculations:
         # Capture what rmse was passed to gaussian_probability for HRRR
         captured_calls = []
 
-        def capture_gauss(forecast_temp, threshold, rmse, direction="above"):
-            captured_calls.append({"forecast": forecast_temp, "rmse": rmse})
+        def capture_gauss(forecast_temp, threshold, rmse, direction="above", clamp=True):
+            captured_calls.append({"forecast": forecast_temp, "rmse": rmse, "clamp": clamp})
             from scipy.stats import norm
             return 1 - norm.cdf(threshold, loc=forecast_temp, scale=rmse)
 
@@ -992,11 +993,13 @@ class TestProbabilityCalculations:
                 hrrr_forecast_temp=73.0,
             )
 
-        # Should have 2 calls: ECMWF (rmse=4.0*0.90=3.6) then HRRR (rmse=4.0*0.85=3.4)
-        # L-IMP-3: ECMWF uses 0.90x RMSE, HRRR uses 0.85x
-        assert len(captured_calls) == 2
-        ecmwf_call = captured_calls[0]
-        hrrr_call = captured_calls[1]
+        # Each model is invoked twice: clamped + un-clamped (raw_model_prob audit).
+        # L-IMP-3: ECMWF uses 0.90x RMSE, HRRR uses 0.85x — RMSE invariant across both calls.
+        assert len(captured_calls) == 4
+        primary_calls = [c for c in captured_calls if c["clamp"]]
+        assert len(primary_calls) == 2
+        ecmwf_call = primary_calls[0]
+        hrrr_call = primary_calls[1]
         assert abs(ecmwf_call["rmse"] - 3.6) < 1e-9, "ECMWF should use rmse*0.90"
         assert abs(hrrr_call["rmse"] - 3.4) < 1e-9, (
             f"HRRR should use rmse*0.85=3.4, got {hrrr_call['rmse']}"

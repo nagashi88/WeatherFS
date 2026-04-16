@@ -40,6 +40,7 @@ class Order:
     gaussian_prob: float | None = None
     ensemble_prob: float | None = None
     blended_prob: float | None = None
+    raw_model_prob: float | None = None  # Pre-clamp blended (audit only)
     order_type: str = "market"
     forecast_timestamp: datetime | None = None
     market_price_timestamp: datetime | None = None
@@ -178,6 +179,7 @@ class PaperTrader:
             "agent_name": t.agent_name,
             "model_probability": t.model_probability,
             "edge_at_entry": t.edge_at_entry,
+            "raw_model_prob": t.raw_model_prob,
             "city": "",
             "station": t.station or "",
             "market_date": t.market_date or "",
@@ -211,6 +213,7 @@ class PaperTrader:
                 gaussian_prob=trade_dict.get("gaussian_prob"),
                 ensemble_prob=trade_dict.get("ensemble_prob"),
                 blended_prob=trade_dict.get("blended_prob"),
+                raw_model_prob=trade_dict.get("raw_model_prob"),
                 status="open",
             )
             session.add(db_trade)
@@ -284,6 +287,7 @@ class PaperTrader:
                 "gaussian_prob": order.gaussian_prob,
                 "ensemble_prob": order.ensemble_prob,
                 "blended_prob": order.blended_prob,
+                "raw_model_prob": order.raw_model_prob,
                 "status": "pending",
                 "created_at": datetime.now(timezone.utc),
                 "pnl": None,
@@ -396,6 +400,7 @@ class PaperTrader:
                 "gaussian_prob": o.get("gaussian_prob"),
                 "ensemble_prob": o.get("ensemble_prob"),
                 "blended_prob": o.get("blended_prob"),
+                "raw_model_prob": o.get("raw_model_prob"),
                 "status": "open",
                 "created_at": datetime.now(timezone.utc),
                 "pnl": None,
