@@ -2984,6 +2984,10 @@ class TestBucketMetarOverride:
     the temperature has already entered or passed is a known loss pattern.
     """
 
+    # All "today" tests use the same fixed date; station_local_today_str is
+    # monkey-patched to return it, so tests are deterministic and tz-independent.
+    TODAY = "2026-04-16"
+
     @staticmethod
     def _make_state_with_tracker(daily_high_f, market_date):
         state = _make_app_state()
@@ -3029,15 +3033,14 @@ class TestBucketMetarOverride:
 
     def test_metar_in_bucket_lifts_probability_to_yes_baseline(self):
         """Observed daily_high inside the bucket → bucket is on track to resolve YES."""
-        market_date = "2026-04-16"
-        state = self._make_state_with_tracker(daily_high_f=86.5, market_date=market_date)
+        state = self._make_state_with_tracker(daily_high_f=86.5, market_date=self.TODAY)
         market_id = "bucket_in_range"
         state.market_metadata[market_id] = self._bucket_market_metadata(
-            market_id, "KNYC", market_date, low=86.0, high=87.0,
+            market_id, "KNYC", self.TODAY, low=86.0, high=87.0,
         )
 
         # Forecast says max ~89°F → bucket_probability ≈ floor (0.10) without override.
-        with _patch_state(state):
+        with _patch_state(state), patch.object(main_module, "station_local_today_str", return_value=self.TODAY):
             opp = main_module._build_opportunity(
                 market_id, {"yes_price": 0.5}, self._forecasts("KNYC", 89.0),
             )
@@ -3049,15 +3052,14 @@ class TestBucketMetarOverride:
 
     def test_metar_above_bucket_caps_probability_low(self):
         """Observed daily_high already above bucket_high → daily max stays/climbs above → NO."""
-        market_date = "2026-04-16"
-        state = self._make_state_with_tracker(daily_high_f=92.0, market_date=market_date)
+        state = self._make_state_with_tracker(daily_high_f=92.0, market_date=self.TODAY)
         market_id = "bucket_exceeded"
         state.market_metadata[market_id] = self._bucket_market_metadata(
-            market_id, "KNYC", market_date, low=86.0, high=87.0,
+            market_id, "KNYC", self.TODAY, low=86.0, high=87.0,
         )
 
         # yes_price 0.30 keeps |market - prob(0.05)| = 0.25 below the 0.40 unrealistic-edge cap
-        with _patch_state(state):
+        with _patch_state(state), patch.object(main_module, "station_local_today_str", return_value=self.TODAY):
             opp = main_module._build_opportunity(
                 market_id, {"yes_price": 0.30}, self._forecasts("KNYC", 86.0),
             )
@@ -3069,14 +3071,13 @@ class TestBucketMetarOverride:
 
     def test_metar_below_bucket_does_not_override(self):
         """Observed daily_high below bucket_low → temp could still rise → no override."""
-        market_date = "2026-04-16"
-        state = self._make_state_with_tracker(daily_high_f=70.0, market_date=market_date)
+        state = self._make_state_with_tracker(daily_high_f=70.0, market_date=self.TODAY)
         market_id = "bucket_below"
         state.market_metadata[market_id] = self._bucket_market_metadata(
-            market_id, "KNYC", market_date, low=86.0, high=87.0,
+            market_id, "KNYC", self.TODAY, low=86.0, high=87.0,
         )
 
-        with _patch_state(state):
+        with _patch_state(state), patch.object(main_module, "station_local_today_str", return_value=self.TODAY):
             opp = main_module._build_opportunity(
                 market_id, {"yes_price": 0.5}, self._forecasts("KNYC", 89.0),
             )
@@ -3088,11 +3089,12 @@ class TestBucketMetarOverride:
             f"No-METAR-override should keep low prob, got {opp.model_probability}"
         )
 
-    def test_metar_for_different_date_does_not_override(self):
-        """Tracker date != market_date → stale tracker, no override applied."""
-        market_date = "2026-04-16"
-        state = self._make_state_with_tracker(daily_high_f=86.5, market_date="2026-04-15")
-        market_id = "bucket_wrong_date"
+    def test_metar_for_non_today_market_does_not_override(self):
+        """market_date != station-local today → no override (future/past markets)."""
+        # Pick a date far from any plausible "today" so the test is robust.
+        market_date = "2030-01-01"
+        state = self._make_state_with_tracker(daily_high_f=86.5, market_date=market_date)
+        market_id = "bucket_not_today"
         state.market_metadata[market_id] = self._bucket_market_metadata(
             market_id, "KNYC", market_date, low=86.0, high=87.0,
         )
@@ -3103,21 +3105,20 @@ class TestBucketMetarOverride:
             )
 
         assert opp is not None
-        # Tracker is for 04-15 but market is 04-16 → no override applied.
+        # Market is for a future date — METAR of "today" says nothing about it → no override.
         assert opp.model_probability < 0.20, (
-            f"Wrong-date tracker must not override, got {opp.model_probability}"
+            f"Non-today market must not override, got {opp.model_probability}"
         )
 
     def test_no_tracker_keeps_normal_bucket_probability(self):
         """No conditions_tracker data → bucket_probability used as-is."""
-        market_date = "2026-04-16"
-        state = self._make_state_with_tracker(daily_high_f=None, market_date=market_date)
+        state = self._make_state_with_tracker(daily_high_f=None, market_date=self.TODAY)
         market_id = "bucket_no_tracker"
         state.market_metadata[market_id] = self._bucket_market_metadata(
-            market_id, "KNYC", market_date, low=86.0, high=87.0,
+            market_id, "KNYC", self.TODAY, low=86.0, high=87.0,
         )
 
-        with _patch_state(state):
+        with _patch_state(state), patch.object(main_module, "station_local_today_str", return_value=self.TODAY):
             opp = main_module._build_opportunity(
                 market_id, {"yes_price": 0.5}, self._forecasts("KNYC", 89.0),
             )

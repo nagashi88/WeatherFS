@@ -32,6 +32,25 @@ def station_timezone_name(station: str) -> str | None:
     return _STATION_TIMEZONES.get((station or "").upper())
 
 
+def station_local_today_str(
+    station: str,
+    now_utc: datetime | None = None,
+) -> str:
+    """Return the current date in the station's local timezone as YYYY-MM-DD.
+
+    Falls back to the UTC date when the station's timezone is unknown.
+    Used to align market_date (station-local) with live observations whose
+    wall-clock labeling differs from UTC during the overnight window.
+    """
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    tz_name = station_timezone_name(station)
+    if tz_name is None:
+        return now.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    return now.astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+
+
 def market_close_time_utc(market_date: str, station: str) -> datetime | None:
     """Return UTC timestamp for local end-of-day (23:59) market close."""
     tz_name = station_timezone_name(station)

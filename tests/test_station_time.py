@@ -7,7 +7,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from weatheredge.data.station_time import hours_until_market_close, market_close_time_utc
+from weatheredge.data.station_time import (
+    hours_until_market_close,
+    market_close_time_utc,
+    station_local_today_str,
+)
 from weatheredge.execution.exit_manager import ExitManager
 
 
@@ -24,6 +28,22 @@ def test_hours_until_market_close_stays_positive_after_utc_midnight():
 
     assert hours_left is not None
     assert hours_left == pytest.approx(5.9833, rel=1e-3)
+
+
+def test_station_local_today_str_uses_local_date_across_utc_midnight():
+    """After UTC midnight, station-local date can still be the previous day."""
+    # 02:00 UTC = 19:00 PDT previous day for KLAX.
+    now_utc = datetime(2026, 4, 17, 2, 0, tzinfo=timezone.utc)
+    assert station_local_today_str("KLAX", now_utc=now_utc) == "2026-04-16"
+
+    # 01:00 UTC = 21:00 EDT previous day for KNYC.
+    assert station_local_today_str("KNYC", now_utc=now_utc.replace(hour=1)) == "2026-04-16"
+
+
+def test_station_local_today_str_falls_back_to_utc_for_unknown_station():
+    """Unknown station code → fall back to UTC date without raising."""
+    now_utc = datetime(2026, 4, 17, 1, 0, tzinfo=timezone.utc)
+    assert station_local_today_str("KZZZ", now_utc=now_utc) == "2026-04-17"
 
 
 def test_exit_manager_lead_time_uses_station_local_close_helper():

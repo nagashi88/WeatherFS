@@ -37,7 +37,7 @@ from weatheredge.execution.cross_platform import CrossPlatformArbitrage
 from weatheredge.probability.edge import calculate_net_edge
 from weatheredge.probability.engine import calculate_probability, calculate_blended_probability
 from weatheredge.data.metar import CurrentConditionsTracker
-from weatheredge.data.station_time import hours_until_market_close
+from weatheredge.data.station_time import hours_until_market_close, station_local_today_str
 from weatheredge.data.model_run_detector import ModelRunDetector, ModelRunEvent
 from weatheredge.data.market_parser import US_STATIONS
 from weatheredge.agents.base import MarketOpportunity, Signal
@@ -1777,15 +1777,19 @@ def _build_opportunity(
             # If observed daily_high already lies in [bucket_low, bucket_high], the
             # bucket is on track to resolve YES (unless temp climbs out). If it
             # already exceeds bucket_high, the bucket will resolve NO.
+            # tracker.date is UTC-stamped and disagrees with the station-local
+            # market_date across the UTC-midnight window; gate on station-local
+            # today instead so the override fires during evening UTC hours when
+            # the daily-high is most likely already realized.
             if (
                 state.conditions_tracker is not None
                 and market_date is not None
                 and market_type == "daily_high"
+                and market_date == station_local_today_str(station)
             ):
                 tracker = state.conditions_tracker.get_tracker(station)
                 if (
                     tracker is not None
-                    and tracker.date == market_date
                     and tracker.daily_high_f > -900.0
                 ):
                     metar_high = tracker.daily_high_f
