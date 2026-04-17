@@ -3141,13 +3141,16 @@ class TestBucketMetarOverride:
 
 
 class TestBucketPhantomEdgeGuard:
-    """When bucket_probability clamps near-zero raw to PROB_FLOOR (0.10), an
-    apparent buy_yes edge appears against yes_price ~0.02-0.08. The true
-    probability is below the yes_price → the edge is synthetic. This guard
-    returns None rather than let the strategy bet on fake alpha.
+    """Originally tested a dedicated phantom-edge guard for bucket markets where
+    bucket_probability clamps near-zero raw to PROB_FLOOR (0.10). CCG-bug-audit-2
+    showed the guard was unreachable dead code — the upstream `yes_price < 0.10`
+    price filter already rejects every market that could trigger it. The guard
+    has been removed; the upstream price filter is now the single source of
+    truth for phantom buy_yes protection on bucket markets.
 
-    Profitability impact: these are full-stake losers — contract never resolves
-    YES (forecast miles off bucket) and the premium paid is pure loss.
+    These tests survive as regression checks on the upstream filter + raw
+    audit propagation — they exercise the same input shapes the phantom guard
+    was meant to catch.
     """
 
     TODAY = "2030-05-01"  # far future → no METAR override interference
@@ -3193,11 +3196,14 @@ class TestBucketPhantomEdgeGuard:
         }
 
     def test_phantom_buy_yes_edge_skipped(self):
-        """raw<floor and yes_price between raw and floor → skip (synthetic edge)."""
+        """yes_price < 0.10 is rejected by the upstream price filter — the same
+        condition the removed phantom-guard would have caught. Forecast 50°F vs
+        bucket [86,87] would have produced raw~0, clamped=0.10, an apparent
+        0.06 buy_yes edge against yes_price=0.04 — but the upstream filter cuts
+        the opportunity before any phantom edge can be computed.
+        """
         state = self._state_no_metar()
         market_id = "phantom_yes"
-        # Forecast 50°F, bucket [86,87] → raw ~0, clamped=0.10.
-        # yes_price 0.04: clamp (0.10) - yes (0.04) = phantom 0.06 buy_yes edge.
         state.market_metadata[market_id] = self._bucket_meta(
             market_id, low=86.0, high=87.0, date=self.TODAY,
         )
@@ -3207,7 +3213,7 @@ class TestBucketPhantomEdgeGuard:
                 market_id, {"yes_price": 0.04}, self._forecast(50.0),
             )
 
-        assert opp is None, "phantom buy_yes edge must be skipped"
+        assert opp is None, "yes_price < 0.10 must be rejected upstream"
 
     def test_legitimate_yes_edge_above_floor_not_skipped(self):
         """Raw above floor → genuine signal, not phantom, must survive."""
@@ -3227,9 +3233,10 @@ class TestBucketPhantomEdgeGuard:
         assert opp.raw_model_prob is not None and opp.raw_model_prob > 0.10
 
     def test_yes_price_above_floor_not_phantom(self):
-        """raw<floor but yes_price >= clamped → no phantom edge; normal skip via
-        strategy (or pass-through). Here yes_price 0.15 > clamped 0.10, so the
-        'phantom' direction is actually buy_no, not buy_yes → guard must NOT trip.
+        """yes_price=0.15 passes the upstream 0.10 floor; raw<floor with low
+        forecast leaves the model wanting buy_no (clamped 0.10 < yes_price 0.15).
+        The opportunity must be built and passed downstream — the strategy
+        layer (not _build_opportunity) decides whether to trade.
         """
         state = self._state_no_metar()
         market_id = "no_phantom"
@@ -3242,7 +3249,7 @@ class TestBucketPhantomEdgeGuard:
                 market_id, {"yes_price": 0.15}, self._forecast(50.0),
             )
 
-        assert opp is not None, "guard should only fire on true buy_yes phantom"
+        assert opp is not None, "yes_price >= 0.10 must build the opportunity"
 
     def test_raw_model_prob_populated_on_bucket_path(self):
         """BUG #1: raw_model_prob must be set on bucket opportunities for audit."""

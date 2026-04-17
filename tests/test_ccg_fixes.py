@@ -80,46 +80,60 @@ def _make_settings(**overrides) -> Settings:
 # ===========================================================================
 
 class TestAggressiveSortByEdge:
+    """The Aggressive ladder picks the top-2 adjacent neighbours by edge. These
+    tests must construct REAL bucket markets with shared boundaries — without
+    bucket_low/bucket_high the ladder branch returns the center signal only and
+    the sort never runs (CCG-bug-audit-2 #6: previous tests passed vacuously).
+    """
+
     def test_sorts_by_net_edge_not_probability(self):
-        """Buckets with high probability but negative edge should be ranked lower."""
+        """Among adjacent buckets, the one with higher edge on the side
+        `_emit_signal` actually picks should be ranked first.
+        """
         settings = _make_settings()
-        primary = _make_opp(market_id="primary", net_edge=0.12, net_edge_no=0.0)
-
-        # High prob but negative edge (overpriced)
+        # Center bucket [70,75], two adjacent boundary-sharing neighbours.
+        primary = _make_opp(
+            market_id="primary", bucket_low=70.0, bucket_high=75.0,
+            net_edge=0.12, net_edge_no=0.0,
+        )
+        # Adjacent low [65,70] — high prob, but BUY_NO is the model side
+        # (model_probability < market_price) and net_edge_no is the SMALLER edge.
         bucket_bad = _make_opp(
-            market_id="bad-bucket",
-            model_probability=0.92,
-            market_price=0.95,
-            net_edge=-0.045,
-            net_edge_no=0.015,
+            market_id="bad-bucket", bucket_low=65.0, bucket_high=70.0,
+            model_probability=0.40, market_price=0.55,
+            net_edge=-0.165, net_edge_no=0.135,
         )
-        # Lower prob but great edge
+        # Adjacent high [75,80] — model side is BUY_YES with the highest edge.
         bucket_good = _make_opp(
-            market_id="good-bucket",
-            model_probability=0.60,
-            market_price=0.40,
-            net_edge=0.185,
-            net_edge_no=-0.185,
+            market_id="good-bucket", bucket_low=75.0, bucket_high=80.0,
+            model_probability=0.60, market_price=0.40,
+            net_edge=0.185, net_edge_no=-0.185,
         )
-
-        signals = aggressive_strategy(primary, [bucket_bad, bucket_good], settings)
-        # The good bucket should appear first (higher edge) if any signals are generated
-        if len(signals) >= 2:
-            # First signal should be from the higher-edge bucket
-            good_idx = next((i for i, s in enumerate(signals) if s.market_id == "good-bucket"), None)
-            bad_idx = next((i for i, s in enumerate(signals) if s.market_id == "bad-bucket"), None)
-            if good_idx is not None and bad_idx is not None:
-                assert good_idx < bad_idx, "Should prioritize by edge, not probability"
+        signals = aggressive_strategy(
+            primary, [bucket_bad, bucket_good], settings,
+        )
+        # Center + 2 adjacent = exactly 3 signals when both neighbours pass the
+        # edge gate. The good-bucket (higher signal-side edge) should come
+        # before the bad-bucket in the adjacent ordering.
+        non_center = [s for s in signals if s.reasoning.startswith("Ladder adjacent")]
+        assert len(non_center) == 2
+        good_idx = next(i for i, s in enumerate(non_center) if s.market_id == "good-bucket")
+        bad_idx = next(i for i, s in enumerate(non_center) if s.market_id == "bad-bucket")
+        assert good_idx < bad_idx, "Should prioritize by signal-side edge"
 
     def test_filters_out_negative_edge_buckets(self):
-        """Buckets below aggressive_min_edge should be filtered out."""
+        """A boundary-adjacent bucket whose effective edge is below
+        aggressive_min_edge must NOT receive a signal.
+        """
         settings = _make_settings(aggressive_min_edge=0.08)
-        primary = _make_opp(net_edge=0.12)
-
+        primary = _make_opp(
+            market_id="primary", bucket_low=70.0, bucket_high=75.0, net_edge=0.12,
+        )
+        # Adjacent neighbour with effective edge below the gate (0.05 < 0.08).
         bucket_below_min = _make_opp(
-            market_id="low-edge",
-            net_edge=0.05,
-            net_edge_no=0.02,
+            market_id="low-edge", bucket_low=75.0, bucket_high=80.0,
+            model_probability=0.55, market_price=0.50,
+            net_edge=0.05, net_edge_no=0.02,
         )
         signals = aggressive_strategy(primary, [bucket_below_min], settings)
         low_edge_signals = [s for s in signals if s.market_id == "low-edge"]

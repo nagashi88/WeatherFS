@@ -1931,26 +1931,11 @@ def _build_opportunity(
         log.warning("_build_opportunity: edge calc failed for %s: %s", market_id, exc)
         return None
 
-    # BugFix P0-6: Phantom-edge guard on clamped bucket markets.
-    # When bucket_probability clamps a near-zero raw to PROB_FLOOR (0.10), an
-    # apparent buy_yes edge appears against yes_price ~0.02-0.08 that is entirely
-    # synthetic — the true model probability is below the yes_price. Skip rather
-    # than let the strategy pick the phantom side.
-    # Exclude METAR-overridden buckets: when observed daily_high already sits
-    # inside the bucket (or past it), the probability lift is observational, not
-    # floor-induced — that edge is real and must not be treated as phantom.
-    if _raw_bucket_prob is not None and not str(model_used).startswith("metar_bucket"):
-        from weatheredge.probability.gaussian import PROB_FLOOR as _PF
-        if (
-            _raw_bucket_prob < _PF
-            and probability > yes_price
-            and _raw_bucket_prob < yes_price
-        ):
-            log.info(
-                "phantom_bucket_edge: skipping %s — raw=%.3f clamped=%.3f yes=%.3f (floor-induced buy_yes phantom)",
-                market_id, _raw_bucket_prob, probability, yes_price,
-            )
-            return None
+    # CCG-bug-4 (audit-2): the previous P0-6 phantom-edge guard required
+    # `probability > yes_price` while probability was clamped to PROB_FLOOR
+    # (0.10) — but the upstream price filter at line ~1660 already rejects
+    # yes_price < 0.10, so the guard was unreachable dead code. Phantom buy_yes
+    # protection now lives entirely in that upstream price filter.
 
     # FIX 2: Hard cap — gross edge >40% means our model is almost certainly wrong, not the market.
     # Tightened from 50% → 40% (Phase 0 evidence: 3 out of 4 losses had gross_edge 28-41%).

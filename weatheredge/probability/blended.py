@@ -23,6 +23,7 @@ correction (the highest-alpha integration).
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from weatheredge.probability.gaussian import gaussian_probability
@@ -208,25 +209,39 @@ def blended_probability(
     # A1: Blend on RAW (unclamped) sub-probabilities — clamping each component
     # before blending collapsed distinct tails to identical PROB_FLOOR values
     # and destroyed ranking. Single final clamp on the blended result below.
-    if gfs_prob is not None and weights.get("gfs_ensemble", 0) > 0:
-        w = weights["gfs_ensemble"]
+    # CCG-bug-2 (audit-2): drop non-finite sub-probabilities before adding —
+    # otherwise NaN propagates into weighted_sum and _clamp_prob silently turns
+    # it into PROB_CEIL (0.95), promoting a single bad model input into
+    # near-certainty for the whole blend.
+    if (
+        gfs_prob is not None
+        and weights.get("gfs_ensemble", 0) > 0
+    ):
         gfs_for_blend = gfs_prob_raw if gfs_prob_raw is not None else gfs_prob
-        weighted_sum += gfs_for_blend * w
-        total_weight += w
+        if math.isfinite(gfs_for_blend):
+            w = weights["gfs_ensemble"]
+            weighted_sum += gfs_for_blend * w
+            total_weight += w
 
     if ecmwf_prob is not None and weights.get("ecmwf", 0) > 0:
-        w = weights["ecmwf"]
         ecmwf_for_blend = ecmwf_prob_raw if ecmwf_prob_raw is not None else ecmwf_prob
-        weighted_sum += ecmwf_for_blend * w
-        total_weight += w
+        if math.isfinite(ecmwf_for_blend):
+            w = weights["ecmwf"]
+            weighted_sum += ecmwf_for_blend * w
+            total_weight += w
 
     if hrrr_prob is not None and weights.get("hrrr", 0) > 0:
-        w = weights["hrrr"]
         hrrr_for_blend = hrrr_prob_raw if hrrr_prob_raw is not None else hrrr_prob
-        weighted_sum += hrrr_for_blend * w
-        total_weight += w
+        if math.isfinite(hrrr_for_blend):
+            w = weights["hrrr"]
+            weighted_sum += hrrr_for_blend * w
+            total_weight += w
 
-    if timesfm_prob_val is not None and weights.get("timesfm", 0) > 0:
+    if (
+        timesfm_prob_val is not None
+        and weights.get("timesfm", 0) > 0
+        and math.isfinite(timesfm_prob_val)
+    ):
         w = weights["timesfm"]
         weighted_sum += timesfm_prob_val * w
         # TimesFM probability comes pre-shaped from upstream, no separate raw available.

@@ -47,7 +47,11 @@ class PortfolioManager:
     }
     TRADE_THRESHOLD: float = 0.25  # Option A €100 bankroll: lowered from 0.35 — Phase 1 rmse_floor suppresses multi-agent consensus, allow single strong-edge vote
     MIN_DISTINCT_AGENTS: int = 2  # A2: require >=2 distinct non-no_trade agents on the MAJORITY side
-    CONVICTION_THRESHOLD: float = 0.45  # CCG-bug-1: single-agent override — a sole majority-side vote may pass when its weighted score >= this
+    # CCG-bug-1 (audit-2): single-agent override threshold MUST be reachable.
+    # Max single-agent weighted score = max(AGENT_WEIGHTS) = 0.30 (Conservative).
+    # Setting threshold = 0.30 lets Conservative's full-confidence vote bypass
+    # the distinct-agent gate; lower-weight agents still need a partner.
+    CONVICTION_THRESHOLD: float = 0.30
 
     def __init__(self, settings: Settings, risk_manager: RiskManager) -> None:
         self.settings = settings
@@ -110,6 +114,18 @@ class PortfolioManager:
                 (score for side, score in side_scores.items() if side != majority_side),
                 default=0.0,
             )
+            # CCG-bug-1 (audit-2): when buy_yes and buy_no scores tie, max() picks
+            # arbitrarily (dict-insertion order). Skip rather than trade an
+            # ambiguous side — there's no clear majority to act on.
+            if (
+                len(side_scores) >= 2
+                and abs(majority_side_score - minority_side_score) < 1e-9
+            ):
+                log.info(
+                    "Voting: market=%s skipped — side_scores tied at %.4f (no clear majority)",
+                    market_id, majority_side_score,
+                )
+                continue
             majority_distinct = len(side_distinct_agents.get(majority_side, set()))
             weighted_score = sum(side_scores.values())
 

@@ -707,45 +707,76 @@ class TestPaperTraderEdgeCases:
         assert len(trader.open_positions) == 1
         assert trader.open_positions[0]["db_id"] is None
 
-    def test_load_from_db_invalid_created_at_string_ignored(self):
-        """A corrupt created_at string is silently dropped (line 148-151)."""
+    def test_load_from_db_corrupt_inmem_created_at_string_ignored(self):
+        """The defensive ``isinstance(created, str)`` branch in
+        ``_load_from_db`` only fires for corrupted/legacy in-memory state — DB
+        ``created_at`` is a typed ``DateTime`` column, so a real row never
+        produces a string here. We exercise the branch via direct injection;
+        the test asserts the parser silently skips rather than crashing.
+        """
         from weatheredge.db.database import init_db, make_engine
         eng = make_engine("sqlite:///:memory:")
         init_db(engine=eng)
         trader = PaperTrader(initial_bankroll=1000.0)
-        # Inject a fake in-memory trade with invalid created_at to reach the
-        # parsing-exception branch without inserting a bad row in DB.
         trader._engine = eng
         trader.open_positions.append({
             "market_id": "corrupt", "market_date": None,
             "created_at": "not-an-iso-date", "cost": 0.0,
         })
-        # Re-invoke the load helper directly (avoids double-entry from connect_db).
         trader._daily_entries.clear()
-        # Walk the restoration loop — open_positions/trade_history are already set.
-        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        # Simulate the loop by running connect_db on the engine now that the
-        # corrupt record is in memory. connect_db re-runs _load_from_db which
-        # reads persisted trades (none) but still walks the in-memory state.
         trader.connect_db(eng)
-        # Corrupt row is not counted under any date — defensive skip.
         assert trader._daily_entries.get("corrupt", {}) == {}
 
-    def test_load_from_db_none_created_and_no_market_date_skipped(self):
-        """Row with both market_date=None and created_at=None is skipped (line 160)."""
+    def test_load_from_db_real_row_with_null_dates_skipped(self):
+        """End-to-end via DB: a persisted Trade with NULL ``created_at`` AND
+        NULL ``market_date`` must produce no counter entry. Exercises the
+        real DB-load path (not just in-memory walking). We use a raw SQL UPDATE
+        because the ORM column default would otherwise auto-fill ``created_at``
+        with ``datetime.now()`` even when the constructor receives ``None``.
+        """
+        from sqlalchemy import text
+        from sqlalchemy.orm import Session
         from weatheredge.db.database import init_db, make_engine
+        from weatheredge.db.models import Trade
         eng = make_engine("sqlite:///:memory:")
         init_db(engine=eng)
+        with Session(eng) as session:
+            session.add(Trade(
+                market_id="nodate", platform="polymarket", side="buy_yes",
+                price=0.30, amount=10.0, cost=3.0, mode="paper", status="open",
+                market_date=None,
+            ))
+            session.commit()
+            session.execute(text(
+                "UPDATE trades SET created_at = NULL, market_date = NULL "
+                "WHERE market_id = 'nodate'"
+            ))
+            session.commit()
         trader = PaperTrader(initial_bankroll=1000.0)
-        trader._engine = eng
-        trader.open_positions.append({
-            "market_id": "nodate", "market_date": None,
-            "created_at": None, "cost": 0.0,
-        })
-        trader._daily_entries.clear()
         trader.connect_db(eng)
-        # No market_day → skipped, no counter entry.
         assert trader._daily_entries.get("nodate", {}) == {}
+
+    def test_load_from_db_real_row_with_market_date_increments_counter(self):
+        """End-to-end via DB: a persisted open Trade with a populated
+        ``market_date`` must show up in the daily-entry counter under that
+        market_date — confirming the DB-load path (not the in-memory walk)
+        feeds the re-entry guard correctly.
+        """
+        from sqlalchemy.orm import Session
+        from weatheredge.db.database import init_db, make_engine
+        from weatheredge.db.models import Trade
+        eng = make_engine("sqlite:///:memory:")
+        init_db(engine=eng)
+        with Session(eng) as session:
+            session.add(Trade(
+                market_id="m99", platform="polymarket", side="buy_yes",
+                price=0.30, amount=10.0, cost=3.0, mode="paper", status="open",
+                market_date="2026-04-16",
+            ))
+            session.commit()
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.connect_db(eng)
+        assert trader._daily_entries.get("m99", {}).get("2026-04-16") == 1
 
 
 # ---------------------------------------------------------------------------

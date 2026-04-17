@@ -67,10 +67,15 @@ def aggressive_strategy(
 
     # CCG-bug-7: pick the highest-edge adjacent neighbours, not the first 2 in
     # iteration order, so ladder quality doesn't depend on dict ordering.
-    same_contract_buckets.sort(
-        key=lambda nb: max(nb.net_edge, getattr(nb, "net_edge_no", 0.0)),
-        reverse=True,
-    )
+    # CCG-bug-5 (audit-2): rank by the SAME edge that `_emit_signal` will use —
+    # the side `_emit_signal` picks (`buy_yes` if model_probability > market_price
+    # else `buy_no`). Using `max(net_edge, net_edge_no)` could prioritize a
+    # neighbor whose best-edge side is the opposite of the side actually emitted.
+    def _signal_side_edge(nb: MarketOpportunity) -> float:
+        side = "buy_yes" if nb.model_probability > nb.market_price else "buy_no"
+        return nb.net_edge if side == "buy_yes" else getattr(nb, "net_edge_no", 0.0)
+
+    same_contract_buckets.sort(key=_signal_side_edge, reverse=True)
 
     # Strict adjacency: neighbor shares a boundary with the center bucket.
     adjacent: list[MarketOpportunity] = []

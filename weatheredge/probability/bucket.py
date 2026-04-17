@@ -1,3 +1,5 @@
+import math
+
 from scipy.stats import t as student_t
 
 from weatheredge.probability.gaussian import PROB_FLOOR, PROB_CEIL, STUDENT_T_DF, _clamp_prob
@@ -22,6 +24,19 @@ def bucket_probability(
     true probability, so the floor creates fake "buy_yes" edge against market
     prices a few cents above 0).
     """
+    # CCG-bug-3 (audit-2): reject non-finite inputs before reaching student_t.cdf
+    # — otherwise NaN propagates and max/min silently turn it into 1.0, which
+    # the clamp then promotes to PROB_CEIL (0.95). Returning PROB_FLOOR for the
+    # clamped path matches the "no information" convention; raw audit returns NaN
+    # so the caller can detect the failed inputs.
+    if not (
+        math.isfinite(forecast_temp)
+        and math.isfinite(bucket_low)
+        and math.isfinite(bucket_high)
+        and math.isfinite(rmse)
+    ):
+        return PROB_FLOOR if clamp else float("nan")
+
     # BugFix H6: Guard against RMSE=0
     if rmse <= 0:
         rmse = 3.0
