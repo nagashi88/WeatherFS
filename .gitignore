@@ -2,6 +2,7 @@
 weatheredge.db
 logs/
 runs/
+backups/
 __pycache__/
 *.pyc
 *.pyo

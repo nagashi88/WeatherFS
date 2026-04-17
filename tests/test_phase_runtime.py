@@ -52,24 +52,6 @@ def test_runtime_order_mode_override_market(monkeypatch):
         cfg.MODULES.update(original_modules)
 
 
-def test_phase_matrix_alias_resolution():
-    from weatheredge.dashboard.phase_matrix import resolve_profile_name
-
-    assert resolve_profile_name("phase1") == "phase_1"
-    assert resolve_profile_name("phase2") == "phase_2"
-    assert resolve_profile_name("phase_2") == "phase_2"
-
-
-def test_phase_matrix_build_env_sets_limit_order_mode():
-    from weatheredge.dashboard.phase_matrix import _build_env, profile_paths
-
-    paths = profile_paths("phase_1")
-    env = _build_env("phase_1", paths)
-
-    assert env["WEATHEREDGE_PHASE"] == "phase_1"
-    assert env["WEATHEREDGE_ORDER_MODE"] == "limit"
-
-
 def test_phase2_effective_thresholds_burst_on():
     from weatheredge.main import AppState, _phase2_effective_thresholds
     from weatheredge.config import BURST_EDGE_DISCOUNT

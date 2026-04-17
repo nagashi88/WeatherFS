@@ -128,7 +128,9 @@ class TestBilateralEdge:
 class TestKellySizingBuyNo:
 
     def setup_method(self):
-        self.settings = make_settings()
+        # Pin max_cost_per_trade_fraction so Kelly math below is deterministic
+        # regardless of future default tuning.
+        self.settings = make_settings(max_cost_per_trade_fraction=0.015)
         self.rm = RiskManager(self.settings)
 
     def test_buy_no_returns_positive_size(self):

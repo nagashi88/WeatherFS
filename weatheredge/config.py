@@ -159,7 +159,7 @@ class Settings(BaseSettings):
     min_trade_cost: float = 1.0  # €100 bankroll Option 2: floor €1/trade to meet Polymarket minimum
     max_single_platform_exposure: float = 0.60
     max_single_date_exposure: float = 0.25  # Max 25% bankroll on a single resolution date
-    max_single_region_exposure: float = 0.30  # Max 30% bankroll on a single geographic region
+    max_single_region_exposure: float = 0.25  # Max 25% bankroll on a single geographic region (Gemini P2: tightened from 0.30 to limit weather-front correlation when 2 cities in the same region trigger together)
 
     # Tiered risk (Addendum Gap 8)
     current_risk_tier: int = 100
@@ -213,6 +213,7 @@ class Settings(BaseSettings):
 
     # Thresholds
     conservative_min_edge: float = 0.20
+    conservative_same_day_edge_bonus: float = 0.05  # CCG-bug-5: extra edge required when lead_time_days == 0 (predatory spreads, thin books)
     aggressive_min_edge: float = 0.08
 
     # Warm-up: reduce risk until model is calibrated

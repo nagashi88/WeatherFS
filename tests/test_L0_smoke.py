@@ -59,8 +59,8 @@ class TestL0Smoke:
         # Ignore local .env so defaults remain deterministic in CI/local runs.
         s = Settings(_env_file=None)
         assert s.execution_mode == "paper"
-        assert s.initial_bankroll == 1000.0
-        assert s.kelly_fraction == 0.08  # PRD v3.1: reduced from 0.15
+        assert s.initial_bankroll == 100.0  # Option 2: €100 starter bankroll
+        assert s.kelly_fraction == 0.15  # €100 Option A: semi-aggressive
 
     def test_scheduler_starts_and_stops(self):
         """APScheduler can start, add a job, and shut down cleanly."""

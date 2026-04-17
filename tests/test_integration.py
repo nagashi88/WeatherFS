@@ -94,6 +94,7 @@ def _make_app_state() -> AppState:
     state.paper_trader.cancel_expired_orders.return_value = 0
     state.paper_trader.check_limit_fills.return_value = 0
     state.paper_trader.has_open_position.return_value = False
+    state.paper_trader.has_reached_daily_entry_limit.return_value = False
     state.paper_trader.place_order.return_value = {
         "filled": True,
         "trade": {"market_id": "KXHIGHNY"},
@@ -300,6 +301,8 @@ class TestDecisionLoopRunsStrategies:
         state.settings = MagicMock(spec=Settings)
         state.settings.weather_data_ttl_minutes = 120
         state.settings.min_edge_percent = 10.0
+        state.settings.conservative_min_edge = 0.20
+        state.settings.aggressive_min_edge = 0.08
         state.settings.enable_conservative_agent = False
         state.settings.enable_aggressive_agent = True
         state.settings.enable_mean_reversion_agent = False

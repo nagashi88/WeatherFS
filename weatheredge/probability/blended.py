@@ -199,34 +199,37 @@ def blended_probability(
     details["weights"] = weights
 
     # Build weighted blend from available models
-    # raw_* track the same blend on UNCLAMPED sub-probabilities for audit/diagnostics.
+    # CCG-bug-6: A1 made raw_weighted_sum identical to weighted_sum (both blend on
+    # unclamped sub-probabilities), so the dual accumulator was dead code. The
+    # raw-vs-clamped distinction is preserved by the single _clamp_prob call below.
     weighted_sum = 0.0
-    raw_weighted_sum = 0.0
     total_weight = 0.0
 
+    # A1: Blend on RAW (unclamped) sub-probabilities — clamping each component
+    # before blending collapsed distinct tails to identical PROB_FLOOR values
+    # and destroyed ranking. Single final clamp on the blended result below.
     if gfs_prob is not None and weights.get("gfs_ensemble", 0) > 0:
         w = weights["gfs_ensemble"]
-        weighted_sum += gfs_prob * w
-        raw_weighted_sum += (gfs_prob_raw if gfs_prob_raw is not None else gfs_prob) * w
+        gfs_for_blend = gfs_prob_raw if gfs_prob_raw is not None else gfs_prob
+        weighted_sum += gfs_for_blend * w
         total_weight += w
 
     if ecmwf_prob is not None and weights.get("ecmwf", 0) > 0:
         w = weights["ecmwf"]
-        weighted_sum += ecmwf_prob * w
-        raw_weighted_sum += (ecmwf_prob_raw if ecmwf_prob_raw is not None else ecmwf_prob) * w
+        ecmwf_for_blend = ecmwf_prob_raw if ecmwf_prob_raw is not None else ecmwf_prob
+        weighted_sum += ecmwf_for_blend * w
         total_weight += w
 
     if hrrr_prob is not None and weights.get("hrrr", 0) > 0:
         w = weights["hrrr"]
-        weighted_sum += hrrr_prob * w
-        raw_weighted_sum += (hrrr_prob_raw if hrrr_prob_raw is not None else hrrr_prob) * w
+        hrrr_for_blend = hrrr_prob_raw if hrrr_prob_raw is not None else hrrr_prob
+        weighted_sum += hrrr_for_blend * w
         total_weight += w
 
     if timesfm_prob_val is not None and weights.get("timesfm", 0) > 0:
         w = weights["timesfm"]
         weighted_sum += timesfm_prob_val * w
         # TimesFM probability comes pre-shaped from upstream, no separate raw available.
-        raw_weighted_sum += timesfm_prob_val * w
         total_weight += w
 
     # Fallback: if no model data at all, use GFS point forecast with Gaussian
@@ -241,9 +244,9 @@ def blended_probability(
 
     # Normalize and clamp to [PROB_FLOOR, PROB_CEIL] safety floor/ceiling
     from weatheredge.probability.gaussian import _clamp_prob
-    blended = _clamp_prob(weighted_sum / total_weight)
-    raw_blended = raw_weighted_sum / total_weight  # un-clamped, for audit only
-    details["raw_weighted_sum"] = round(weighted_sum, 4)
+    raw_blended = weighted_sum / total_weight  # un-clamped, used by C4 phantom-NO guard
+    blended = _clamp_prob(raw_blended)
+    details["weighted_sum"] = round(weighted_sum, 4)
     details["total_weight"] = round(total_weight, 4)
     details["raw_blended"] = round(raw_blended, 6)
     details["blended_probability"] = round(blended, 4)

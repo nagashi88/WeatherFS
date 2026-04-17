@@ -130,11 +130,6 @@ def _get_phase_config():
     return PHASE_CONFIGS, PHASE_ORDER, get_current_phase, get_phase_modules, get_gate_status
 
 
-def _get_phase_matrix_module():
-    from weatheredge.dashboard import phase_matrix
-    return phase_matrix
-
-
 # Structural kills — never re-enable
 STRUCTURAL_KILLS = {"agent_mean_reversion", "vpin", "exit_pnl_stoploss"}
 
@@ -184,69 +179,6 @@ with col_refresh:
 
 st.divider()
 
-# ── Phase Matrix (Paper A/B) ────────────────────────────────────────────
-
-st.subheader("Phase Matrix (Paper A/B)")
-phase_matrix = _get_phase_matrix_module()
-
-pm_col_a, pm_col_b, pm_col_c, pm_col_d, pm_col_e = st.columns(5)
-if pm_col_a.button("Start P1+P2", key="pm_start_all", use_container_width=True):
-    m1_ok, m1_msg = phase_matrix.start_profile("phase_1")
-    m2_ok, m2_msg = phase_matrix.start_profile("phase_2")
-    if m1_ok or m2_ok:
-        st.success(f"{m1_msg} | {m2_msg}")
-    else:
-        st.warning(f"{m1_msg} | {m2_msg}")
-    time.sleep(1.0)
-    st.rerun()
-if pm_col_b.button("Stop P1+P2", key="pm_stop_all", use_container_width=True):
-    m1_ok, m1_msg = phase_matrix.stop_profile("phase_1")
-    m2_ok, m2_msg = phase_matrix.stop_profile("phase_2")
-    if m1_ok or m2_ok:
-        st.success(f"{m1_msg} | {m2_msg}")
-    else:
-        st.warning(f"{m1_msg} | {m2_msg}")
-    time.sleep(1.0)
-    st.rerun()
-if pm_col_c.button("Start P1", key="pm_start_p1", use_container_width=True):
-    ok, msg = phase_matrix.start_profile("phase_1")
-    st.success(msg) if ok else st.warning(msg)
-    time.sleep(1.0)
-    st.rerun()
-if pm_col_d.button("Start P2", key="pm_start_p2", use_container_width=True):
-    ok, msg = phase_matrix.start_profile("phase_2")
-    st.success(msg) if ok else st.warning(msg)
-    time.sleep(1.0)
-    st.rerun()
-if pm_col_e.button("Refresh Matrix", key="pm_refresh", use_container_width=True):
-    st.rerun()
-
-pm_rows = []
-for profile in phase_matrix.PHASE_PROFILE_ORDER:
-    status = phase_matrix.collect_status(profile)
-    stats = status.stats
-    pm_rows.append({
-        "profile": profile,
-        "state": "RUN" if status.running else "STOP",
-        "pid": status.pid,
-        "uptime": status.uptime,
-        "trades": stats.trades,
-        "open": stats.open_positions,
-        "closed": stats.resolved_closed,
-        "wr_closed_%": round(stats.win_rate_closed, 1) if stats.win_rate_closed is not None else None,
-        "realized_pnl": round(stats.realized_pnl, 2) if stats.realized_pnl is not None else None,
-        "unrealized_pnl": round(stats.unrealized_pnl, 2) if stats.unrealized_pnl is not None else None,
-        "brier": round(stats.brier_score, 4) if stats.brier_score is not None else None,
-        "cal_records": stats.calibration_records,
-        "forecast_age_min": round(stats.forecast_age_minutes, 1) if stats.forecast_age_minutes is not None else None,
-        "price_age_min": round(stats.price_age_minutes, 1) if stats.price_age_minutes is not None else None,
-    })
-
-st.dataframe(pm_rows, use_container_width=True, hide_index=True)
-st.caption(f"Run dir: {phase_matrix.RUN_ROOT}")
-
-st.divider()
-
 # ── Sidebar: Phase Selector ─────────────────────────────────────────────
 
 st.sidebar.markdown("### Phase Selector")
@@ -267,11 +199,8 @@ for phase_key in PHASE_ORDER:
             if st.button(f"ATTIVA {phase_key.upper()}", key=f"activate_{phase_key}"):
                 from weatheredge.phase_config import activate_phase
                 activate_phase(phase_key)
-                if running:
-                    _stop_bot()
-                    time.sleep(1)
-                    _start_bot(phase_key)
-                    time.sleep(2)
+                # Bot reads current_phase.json on each cycle — no restart needed.
+                # Do NOT call _start_bot here: it would spawn a second instance on the main DB.
                 st.rerun()
         else:
             st.info("Fase attiva")

@@ -126,7 +126,7 @@ class TestPolymarketIntegration:
 
         market_id = "0xbeef_below_market"
         parsed = ParsedMarket(
-            city="miami", station="KMIA", date="2026-04-10",
+            city="miami", station="KMIA", date=_FUTURE_DATE,
             market_type="daily_high", threshold=85.0, direction="below",
         )
         state.market_metadata[market_id] = {
@@ -137,7 +137,7 @@ class TestPolymarketIntegration:
         }
 
         price_data = {"yes_price": 0.60}
-        forecast_rows = _make_forecast_rows("KMIA", gfs_temp=82.0, ecmwf_temp=81.0)
+        forecast_rows = _make_forecast_rows("KMIA", gfs_temp=82.0, ecmwf_temp=81.0, target_date=_FUTURE_DATE)
 
         with patch("weatheredge.main.get_session") as mock_sess:
             mock_db = MagicMock()

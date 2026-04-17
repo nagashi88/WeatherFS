@@ -135,23 +135,38 @@ class PaperTrader:
         # Reconstruct bankroll: initial + net resolved P&L - open position costs
         self.bankroll = self.initial_bankroll + resolved_pnl_total - open_cost_total
 
-        # Restore daily entry counters for today from open positions + trade history
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Restore daily entry counters keyed on market_date (station-local resolution
+        # date). Prevents the re-entry guard from resetting at UTC midnight when
+        # the market's local day is still active. Legacy trades without a stored
+        # market_date fall back to the created_at date.
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         for t in list(self.open_positions) + list(self.trade_history):
             created = t.get("created_at")
-            if created is None:
+            created_day: str | None = None
+            if created is not None:
+                if isinstance(created, str):
+                    try:
+                        created = datetime.fromisoformat(created)
+                    except ValueError:
+                        created = None
+                if created is not None:
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    created_day = created.strftime("%Y-%m-%d")
+            raw_md = t.get("market_date")
+            # DB _trade_to_dict coerces None → "" for market_date, so treat both
+            # as "missing" for the legacy-fallback path.
+            has_market_date = bool(raw_md)
+            market_day = raw_md if has_market_date else created_day
+            if market_day is None:
                 continue
-            if isinstance(created, str):
-                try:
-                    created = datetime.fromisoformat(created)
-                except ValueError:
-                    continue
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            if created.strftime("%Y-%m-%d") == today:
-                key = self._market_id_key(t.get("market_id"))
-                bucket = self._daily_entries.setdefault(key, {})
-                bucket[today] = bucket.get(today, 0) + 1
+            if not has_market_date and market_day != today_utc:
+                # Legacy row with no market_date that didn't happen "today UTC"
+                # → skip; counting it would inflate today's limit incorrectly.
+                continue
+            key = self._market_id_key(t.get("market_id"))
+            bucket = self._daily_entries.setdefault(key, {})
+            bucket[market_day] = bucket.get(market_day, 0) + 1
 
         log.info(
             "PaperTrader loaded from DB: %d open positions, %d resolved, bankroll=$%.2f",
@@ -336,7 +351,7 @@ class PaperTrader:
         trade["db_id"] = db_id
 
         self.open_positions.append(trade)
-        self._record_daily_entry(market_id)
+        self._record_daily_entry(market_id, market_date=order.market_date or None)
         return {"filled": True, "trade": trade}
 
     def check_limit_fills(self, current_prices: dict[str, float]) -> int:
@@ -418,7 +433,7 @@ class PaperTrader:
 
             self.open_positions.append(trade)
             self.last_limit_fills.append(trade)
-            self._record_daily_entry(market_id)
+            self._record_daily_entry(market_id, market_date=o.get("market_date") or None)
             filled_count += 1
             log.info(
                 "check_limit_fills: filled %s %s at %.4f",
@@ -497,8 +512,13 @@ class PaperTrader:
                 pos["status"] = reason
                 pos["pnl"] = pnl
                 self.bankroll += pos["cost"] + pnl  # return cost ± pnl
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                self.daily_pnl[today] = self.daily_pnl.get(today, 0) + pnl
+                # PRD M3 consistency: book early-exit P&L to the market's
+                # station-local resolution date, not UTC today. Without this, an
+                # early exit taken across UTC midnight contaminates the next
+                # day's circuit-breaker budget instead of the day the position
+                # was actually carried on.
+                day = pos.get("market_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                self.daily_pnl[day] = self.daily_pnl.get(day, 0) + pnl
                 self._update_trade_in_db(pos.get("db_id"), reason, pnl)
                 self.trade_history.append(pos)
                 self.open_positions.remove(pos)
@@ -520,26 +540,40 @@ class PaperTrader:
             for o in self.open_orders
         )
 
-    def has_reached_daily_entry_limit(self, market_id: str, max_entries: int = 2) -> bool:
+    def has_reached_daily_entry_limit(
+        self,
+        market_id: str,
+        max_entries: int = 2,
+        market_date: str | None = None,
+    ) -> bool:
         """Return True if we have already entered this market max_entries times today.
 
         Prevents re-entry traps where the bot repeatedly enters and gets stopped
         out on the same market within a single day (e.g. 1953479 pattern: 4 entries,
         all edge_stop, cumulative -1.03).
-        """
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        key = self._market_id_key(market_id)
-        return self._daily_entries.get(key, {}).get(today, 0) >= max_entries
 
-    def _record_daily_entry(self, market_id: str) -> None:
-        """Increment the daily entry counter for a market."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        When ``market_date`` (station-local YYYY-MM-DD) is provided, the counter
+        keys on that market's resolution date rather than UTC "today" — so a
+        market trading during the overnight UTC window (after UTC midnight but
+        before local midnight) still counts against the same local-day bucket.
+        """
+        day_key = market_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = self._market_id_key(market_id)
+        return self._daily_entries.get(key, {}).get(day_key, 0) >= max_entries
+
+    def _record_daily_entry(self, market_id: str, market_date: str | None = None) -> None:
+        """Increment the daily entry counter for a market keyed on market_date.
+
+        Falls back to UTC today when market_date is not supplied (legacy callers
+        without market-date context).
+        """
+        day_key = market_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         key = self._market_id_key(market_id)
         bucket = self._daily_entries.setdefault(key, {})
-        bucket[today] = bucket.get(today, 0) + 1
+        bucket[day_key] = bucket.get(day_key, 0) + 1
         log.debug(
             "daily_entry_count: market=%s date=%s count=%d",
-            key, today, bucket[today],
+            key, day_key, bucket[day_key],
         )
 
     # ------------------------------------------------------------------

@@ -11,17 +11,27 @@ def conservative_strategy(opportunity: MarketOpportunity, settings: Settings) ->
     """
     market_id = opportunity.market_id
 
-    # Only 1-day forecasts
-    if opportunity.lead_time_days != 1:
+    # C3: Allow same-day (0) and 1-day forecasts. The previous `!= 1` gate
+    # silently disabled Conservative on all same-day markets (where
+    # `int(delta_hours / 24.0) == 0`), pushing the portfolio toward
+    # Aggressive + SellNO and producing all-buy_no concentration.
+    if opportunity.lead_time_days > 1:
         return Signal(market_id=market_id, side="no_trade", confidence=0.0, agent_name="Conservative", reasoning="Lead time > 1 day")
 
     # Determine side and use the corresponding edge
     side = "buy_yes" if opportunity.model_probability > opportunity.market_price else "buy_no"
     effective_edge = opportunity.net_edge if side == "buy_yes" else opportunity.net_edge_no
 
+    # CCG-bug-5: same-day markets (lead_time_days == 0) often have predatory
+    # spreads, thinner books, and faster decay. Require an extra edge bonus
+    # before Conservative will trade them.
+    edge_gate = settings.conservative_min_edge
+    if opportunity.lead_time_days == 0:
+        edge_gate += getattr(settings, "conservative_same_day_edge_bonus", 0.05)
+
     # Check net edge (using the correct side)
-    if effective_edge < settings.conservative_min_edge:
-        return Signal(market_id=market_id, side="no_trade", confidence=0.0, agent_name="Conservative", reasoning=f"Net edge {effective_edge:.2f} < {settings.conservative_min_edge}")
+    if effective_edge < edge_gate:
+        return Signal(market_id=market_id, side="no_trade", confidence=0.0, agent_name="Conservative", reasoning=f"Net edge {effective_edge:.2f} < gate {edge_gate:.2f}")
 
     # Check model agreement (if both available)
     if opportunity.gaussian_prob is not None and opportunity.ensemble_prob is not None:

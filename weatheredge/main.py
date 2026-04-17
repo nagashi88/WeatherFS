@@ -882,14 +882,55 @@ def _run_decision_cycle(state: AppState) -> None:
             position_skipped += 1
             continue
 
-        # Re-entry guard: skip if we already entered this market 2+ times today
-        if state.paper_trader.has_reached_daily_entry_limit(market_id):
+        # Re-entry guard: skip if we already entered this market 2+ times today.
+        # Keyed on the market's station-local resolution date so the counter
+        # survives the UTC-midnight rollover within a single trading day.
+        if state.paper_trader.has_reached_daily_entry_limit(
+            market_id, market_date=opp.market_date or None,
+        ):
             log.debug(
-                "re_entry_guard: skipping %s — daily entry limit reached",
-                market_id,
+                "re_entry_guard: skipping %s — daily entry limit reached (market_date=%s)",
+                market_id, opp.market_date,
             )
             position_skipped += 1
             continue
+
+        # Adjacent-bucket correlation guard: skip bucket markets when we already
+        # hold an open position on a nearby bucket at the same station+date.
+        # Rationale: adjacent buckets are highly correlated (same underlying
+        # daily_high); concurrent entries concentrate risk on a single weather
+        # outcome. 3°F separation is wide enough to catch 1°F ladder buckets
+        # and neighboring 5°F brackets without blocking clearly distinct ranges.
+        if opp.bucket_low is not None and opp.bucket_high is not None:
+            _adjacent_skip = False
+            for _pos in state.paper_trader.open_positions:
+                if str(_pos.get("station") or "") != str(opp.station or ""):
+                    continue
+                if str(_pos.get("market_date") or "") != str(opp.market_date or ""):
+                    continue
+                _pos_meta = state.market_metadata.get(str(_pos.get("market_id", "")), {})
+                _pos_parsed = _pos_meta.get("parsed") if _pos_meta else None
+                _pos_low = getattr(_pos_parsed, "threshold_low", None) if _pos_parsed else None
+                _pos_high = getattr(_pos_parsed, "threshold_high", None) if _pos_parsed else None
+                if _pos_low is None or _pos_high is None:
+                    continue
+                if opp.bucket_low == _pos_low and opp.bucket_high == _pos_high:
+                    continue  # identical bucket is handled by has_open_position
+                _gap = min(
+                    abs(_pos_low - opp.bucket_high),
+                    abs(opp.bucket_low - _pos_high),
+                )
+                if _gap < 3.0:
+                    log.info(
+                        "adjacent_bucket_guard: skipping %s [%s,%s] — adjacent to open %s [%s,%s] gap=%.1f",
+                        market_id, opp.bucket_low, opp.bucket_high,
+                        _pos.get("market_id"), _pos_low, _pos_high, _gap,
+                    )
+                    _adjacent_skip = True
+                    break
+            if _adjacent_skip:
+                position_skipped += 1
+                continue
 
         # Collect raw dicts for arb scan
         # Extract date from cached metadata if available
@@ -1758,16 +1799,21 @@ def _build_opportunity(
     # Phase 6: TimesFM fields (set in non-bucket branch, default None for bucket markets)
     _timesfm_prob = None
     _timesfm_error_adj = None
+    # Bucket audit: raw pre-clamp probability, carried into raw_model_prob/MarketOpportunity.
+    _raw_bucket_prob: float | None = None
 
     # BugFix C6: Use bucket_probability for bucket markets instead of midpoint "above"
     if bucket_low is not None and bucket_high is not None:
         try:
             from weatheredge.probability.bucket import bucket_probability
+            _raw_bucket_prob = bucket_probability(
+                forecast_temp, bucket_low, bucket_high, rmse, clamp=False,
+            )
             probability = bucket_probability(forecast_temp, bucket_low, bucket_high, rmse)
             model_used = "bucket_gaussian"
             log.debug(
-                "_build_opportunity: bucket market %s — P(%.0f<=T<=%.0f)=%.3f",
-                market_id, bucket_low, bucket_high, probability,
+                "_build_opportunity: bucket market %s — P(%.0f<=T<=%.0f)=%.3f (raw=%.3f)",
+                market_id, bucket_low, bucket_high, probability, _raw_bucket_prob,
             )
 
             # BugFix P0-5: METAR reality check on bucket markets.
@@ -1885,6 +1931,27 @@ def _build_opportunity(
         log.warning("_build_opportunity: edge calc failed for %s: %s", market_id, exc)
         return None
 
+    # BugFix P0-6: Phantom-edge guard on clamped bucket markets.
+    # When bucket_probability clamps a near-zero raw to PROB_FLOOR (0.10), an
+    # apparent buy_yes edge appears against yes_price ~0.02-0.08 that is entirely
+    # synthetic — the true model probability is below the yes_price. Skip rather
+    # than let the strategy pick the phantom side.
+    # Exclude METAR-overridden buckets: when observed daily_high already sits
+    # inside the bucket (or past it), the probability lift is observational, not
+    # floor-induced — that edge is real and must not be treated as phantom.
+    if _raw_bucket_prob is not None and not str(model_used).startswith("metar_bucket"):
+        from weatheredge.probability.gaussian import PROB_FLOOR as _PF
+        if (
+            _raw_bucket_prob < _PF
+            and probability > yes_price
+            and _raw_bucket_prob < yes_price
+        ):
+            log.info(
+                "phantom_bucket_edge: skipping %s — raw=%.3f clamped=%.3f yes=%.3f (floor-induced buy_yes phantom)",
+                market_id, _raw_bucket_prob, probability, yes_price,
+            )
+            return None
+
     # FIX 2: Hard cap — gross edge >40% means our model is almost certainly wrong, not the market.
     # Tightened from 50% → 40% (Phase 0 evidence: 3 out of 4 losses had gross_edge 28-41%).
     _gross_edge = abs(probability - yes_price)
@@ -1956,13 +2023,32 @@ def _build_opportunity(
         threshold, direction, lead_time_hours,
     )
 
-    # Surface pre-clamp blended for audit (None on bucket/fallback paths where
-    # blend_details is absent — preserves nullable semantics).
-    raw_model_prob = None
-    try:
-        raw_model_prob = blend_details.get("raw_blended")  # type: ignore[name-defined]
-    except (NameError, AttributeError):
-        pass
+    # Surface pre-clamp probability for audit.
+    # Bucket path: raw unclamped bucket probability (BugFix P0-6 audit trail).
+    # Non-bucket path: blend_details["raw_blended"] from calculate_blended_probability.
+    raw_model_prob: float | None = None
+    if _raw_bucket_prob is not None:
+        raw_model_prob = _raw_bucket_prob
+    else:
+        try:
+            raw_model_prob = blend_details.get("raw_blended")  # type: ignore[name-defined]
+        except (NameError, AttributeError):
+            pass
+
+    # C4: Skip directional markets whose raw probability is below the floor.
+    # When raw_blended < PROB_FLOOR, the clamp manufactures a uniform 0.10
+    # posterior that looks like persistent NO edge against any market priced
+    # above 0.10 — the bot then floods buy_no on phantom signals.
+    if (
+        not _is_bucket
+        and raw_model_prob is not None
+        and raw_model_prob < _PROB_FLOOR
+    ):
+        log.info(
+            "_build_opportunity: %s skipped — raw_prob=%.4f below floor %.2f (phantom NO guard)",
+            market_id, raw_model_prob, _PROB_FLOOR,
+        )
+        return None
 
     return MarketOpportunity(
         market_id=market_id,
@@ -3090,6 +3176,12 @@ def main() -> None:
             state.timesfm_forecaster = None
     else:
         log.info("Phase 6: TimesFM disabled in config")
+
+    # Optional startup delay (WEATHEREDGE_STARTUP_DELAY_SECONDS) for staggered launches.
+    _startup_delay = int(os.environ.get("WEATHEREDGE_STARTUP_DELAY_SECONDS", "0"))
+    if _startup_delay > 0:
+        log.info("Startup delay: sleeping %ds before first forecast fetch", _startup_delay)
+        time.sleep(_startup_delay)
 
     # Startup bootstrap: fetch market/forecast immediately so profiles do not
     # wait for the first 5m/15m scheduler intervals.

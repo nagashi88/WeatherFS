@@ -155,8 +155,11 @@ class TestSimulateTrading:
             ))
 
         thresholds = bt._default_thresholds(records)
+        # Default ladder pads ±5°F around the forecast range and snaps to the
+        # 5°F grid used by market builders, so tight 70–71°F forecasts expand
+        # to [65, 80].
         assert min(thresholds) == 65
-        assert max(thresholds) == 75
+        assert max(thresholds) == 80
 
     def test_returns_trades(self):
         """Simulate should produce at least some trades on 90 days of data."""

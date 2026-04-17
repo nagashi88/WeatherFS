@@ -43,6 +43,7 @@ def _make_app_state() -> AppState:
     state.paper_trader.cancel_expired_orders.return_value = 0
     state.paper_trader.check_limit_fills.return_value = 0
     state.paper_trader.has_open_position.return_value = False
+    state.paper_trader.has_reached_daily_entry_limit.return_value = False
     state.risk_manager = MagicMock()
     state.market_scanner = MagicMock()
     # Phase 2 components — mocked so existing tests are unaffected
@@ -860,9 +861,15 @@ class TestSchedulerJobRegistration:
         assert job["minute"] == 0
 
     def test_all_eleven_jobs_registered(self, registered_jobs):
-        """11 core jobs + 1 optional bias_correction_refresh when Phase 1 enabled."""
+        """13 core jobs + 1 optional bias_correction_refresh when Phase 1 enabled.
+
+        Core jobs: market_scan, forecast_poll, actuals_backfill, metar_poll,
+        model_run_detector, decision_loop, resolution_check_intraday,
+        resolution_check, rmse_recalculation, error_analysis, wallet_profiling,
+        edge_decay_check, morning_briefing.
+        """
         from weatheredge.config import MODULES
-        expected = 11 + (1 if MODULES.get("bias_correction", False) else 0)
+        expected = 13 + (1 if MODULES.get("bias_correction", False) else 0)
         assert len(registered_jobs) == expected
 
     def test_bias_correction_refresh_registered_when_enabled(self, registered_jobs):
@@ -2986,7 +2993,8 @@ class TestBucketMetarOverride:
 
     # All "today" tests use the same fixed date; station_local_today_str is
     # monkey-patched to return it, so tests are deterministic and tz-independent.
-    TODAY = "2026-04-16"
+    # Use a far-future date so the "market date in the past" guard never fires.
+    TODAY = "2030-05-01"
 
     @staticmethod
     def _make_state_with_tracker(daily_high_f, market_date):
@@ -3125,3 +3133,161 @@ class TestBucketMetarOverride:
 
         assert opp is not None
         assert opp.model_probability < 0.20  # floor — no METAR data to override
+
+
+# ---------------------------------------------------------------------------
+# BugFix P0-6: Phantom-edge guard on clamped bucket markets
+# ---------------------------------------------------------------------------
+
+
+class TestBucketPhantomEdgeGuard:
+    """When bucket_probability clamps near-zero raw to PROB_FLOOR (0.10), an
+    apparent buy_yes edge appears against yes_price ~0.02-0.08. The true
+    probability is below the yes_price → the edge is synthetic. This guard
+    returns None rather than let the strategy bet on fake alpha.
+
+    Profitability impact: these are full-stake losers — contract never resolves
+    YES (forecast miles off bucket) and the premium paid is pure loss.
+    """
+
+    TODAY = "2030-05-01"  # far future → no METAR override interference
+
+    @staticmethod
+    def _state_no_metar():
+        """Tracker stubbed so override returns None but the attribute lookup
+        still works — _build_opportunity always calls metar_probability_override
+        before the bucket branch.
+        """
+        state = _make_app_state()
+        state.conditions_tracker = MagicMock()
+        state.conditions_tracker.metar_probability_override.return_value = None
+        state.conditions_tracker.get_tracker.return_value = None
+        return state
+
+    @staticmethod
+    def _bucket_meta(market_id, low, high, date):
+        mock_parsed = MagicMock()
+        mock_parsed.threshold = (low + high) / 2.0
+        mock_parsed.direction = "above"
+        mock_parsed.market_type = "daily_high"
+        mock_parsed.date = date
+        mock_parsed.threshold_low = low
+        mock_parsed.threshold_high = high
+        return {
+            "resolution_source": {"station": "KNYC", "type": "daily_high"},
+            "platform": "polymarket",
+            "parsed": mock_parsed,
+        }
+
+    @staticmethod
+    def _forecast(temp):
+        return {
+            "KNYC": {
+                "temperature_forecast": temp,
+                "ecmwf_temp": None,
+                "hrrr_temp": None,
+                "ensemble_members": None,
+                "model": "gfs",
+                "forecast_timestamp": datetime.now(timezone.utc),
+            }
+        }
+
+    def test_phantom_buy_yes_edge_skipped(self):
+        """raw<floor and yes_price between raw and floor → skip (synthetic edge)."""
+        state = self._state_no_metar()
+        market_id = "phantom_yes"
+        # Forecast 50°F, bucket [86,87] → raw ~0, clamped=0.10.
+        # yes_price 0.04: clamp (0.10) - yes (0.04) = phantom 0.06 buy_yes edge.
+        state.market_metadata[market_id] = self._bucket_meta(
+            market_id, low=86.0, high=87.0, date=self.TODAY,
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.04}, self._forecast(50.0),
+            )
+
+        assert opp is None, "phantom buy_yes edge must be skipped"
+
+    def test_legitimate_yes_edge_above_floor_not_skipped(self):
+        """Raw above floor → genuine signal, not phantom, must survive."""
+        state = self._state_no_metar()
+        market_id = "real_yes"
+        # Forecast 72°F in bucket [70,75] → raw well above floor.
+        state.market_metadata[market_id] = self._bucket_meta(
+            market_id, low=70.0, high=75.0, date=self.TODAY,
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.20}, self._forecast(72.0),
+            )
+
+        assert opp is not None, "real edge must not be skipped"
+        assert opp.raw_model_prob is not None and opp.raw_model_prob > 0.10
+
+    def test_yes_price_above_floor_not_phantom(self):
+        """raw<floor but yes_price >= clamped → no phantom edge; normal skip via
+        strategy (or pass-through). Here yes_price 0.15 > clamped 0.10, so the
+        'phantom' direction is actually buy_no, not buy_yes → guard must NOT trip.
+        """
+        state = self._state_no_metar()
+        market_id = "no_phantom"
+        state.market_metadata[market_id] = self._bucket_meta(
+            market_id, low=86.0, high=87.0, date=self.TODAY,
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.15}, self._forecast(50.0),
+            )
+
+        assert opp is not None, "guard should only fire on true buy_yes phantom"
+
+    def test_raw_model_prob_populated_on_bucket_path(self):
+        """BUG #1: raw_model_prob must be set on bucket opportunities for audit."""
+        state = self._state_no_metar()
+        market_id = "bucket_audit"
+        state.market_metadata[market_id] = self._bucket_meta(
+            market_id, low=70.0, high=75.0, date=self.TODAY,
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.50}, self._forecast(72.5),
+            )
+
+        assert opp is not None
+        assert opp.raw_model_prob is not None, (
+            "raw_model_prob must be populated for bucket markets"
+        )
+        assert 0.0 <= opp.raw_model_prob <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# PROBLEM #4: Adjacent-bucket correlation guard
+# ---------------------------------------------------------------------------
+
+
+class TestAdjacentBucketGuard:
+    """Bucket markets at the same station+date with bucket edges <3°F apart are
+    highly correlated. Concurrent entries concentrate risk on a single weather
+    outcome.
+    """
+
+    def test_gap_under_3f_treated_as_adjacent(self):
+        """Simple unit test on the adjacency math: gap<3°F should block."""
+        # We mirror the logic inlined in main.py: min(|low2-high1|, |low1-high2|).
+        low1, high1 = 70.0, 74.0
+        low2, high2 = 76.0, 80.0  # gap of 2°F
+        gap = min(abs(low2 - high1), abs(low1 - high2))
+        assert gap == 2.0
+        assert gap < 3.0
+
+    def test_gap_exactly_3f_not_adjacent(self):
+        """Buckets separated by exactly 3°F are the boundary — not blocked."""
+        low1, high1 = 70.0, 74.0
+        low2, high2 = 77.0, 80.0  # gap of 3°F
+        gap = min(abs(low2 - high1), abs(low1 - high2))
+        assert gap == 3.0
+        # Guard uses strict "<3.0" — 3.0 passes.

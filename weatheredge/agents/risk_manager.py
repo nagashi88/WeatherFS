@@ -12,6 +12,8 @@ Implements:
 
 from __future__ import annotations
 
+import math
+
 from weatheredge.config import Settings
 
 REGION_MAP: dict[str, list[str]] = {
@@ -94,14 +96,21 @@ class RiskManager:
         else:
             vol_size = kelly_size
 
-        # Layer 3: Slippage modeling (US-205)
+        # Layer 3: Book-depth scalar (Gemini #8b — smooth sqrt impact model).
+        # Replaces the prior step-tier scaler ({<100: 0.25, <1000: 0.50, else 1.0})
+        # with a continuous function so similar volumes get similar haircuts and
+        # tightens sizing in the [1000, 2000) band where step jumped to full size.
+        # Formula: scalar = clamp(sqrt(volume / 2000), 0.15, 1.0)
+        # Reference points (matches prior tests): vol=50→0.158, vol=500→0.500,
+        # vol=2000→1.000. Floor 0.15 prevents over-hedge zero on rounding.
+        # CCG-bug-3: sanitize NaN/negative volume — bare max(NaN, 0) returns NaN,
+        # which propagates through sqrt and silently disables both haircut and
+        # the slippage cap below.
         if volume is not None:
-            if volume < 100:
-                kelly_size *= 0.25
-                vol_size *= 0.25
-            elif volume < 1000:
-                kelly_size *= 0.50
-                vol_size *= 0.50
+            volume_clean = 0.0 if (not math.isfinite(volume) or volume < 0) else float(volume)
+            book_depth_scalar = max(0.15, min(1.0, math.sqrt(volume_clean / 2000.0)))
+            kelly_size *= book_depth_scalar
+            vol_size *= book_depth_scalar
 
         position = min(kelly_size, vol_size)
         position = min(position, bankroll * self.settings.max_single_market_exposure)
@@ -115,14 +124,17 @@ class RiskManager:
             position = max_cost / market_price
 
         # Slippage cap: estimated_slippage must be < edge * 0.5
+        # CCG-bug-3: reuse volume_clean (NaN-safe) instead of raw volume so that
+        # bad upstream values disable trading rather than silently disabling the cap.
         if volume is not None:
             edge = win_probability - market_price
             if edge > 0:
-                estimated_slippage = (position * 0.005) / max(volume, 1)
+                vol_for_slip = max(volume_clean, 1.0)
+                estimated_slippage = (position * 0.005) / vol_for_slip
                 max_slippage = edge * 0.5
                 if estimated_slippage > max_slippage:
                     # Cap position so slippage == max_slippage (never grow position)
-                    position = min(position, (max_slippage * max(volume, 1)) / 0.005)
+                    position = min(position, (max_slippage * vol_for_slip) / 0.005)
 
         # Minimum trade cost floor (€100 bankroll Option 2):
         # Kelly on small bankrolls produces sub-€1 trades below Polymarket's practical

@@ -109,24 +109,36 @@ def test_aggressive_single_market_no_buckets():
     assert signals[0].agent_name == "Aggressive"
 
 def test_aggressive_generates_ladder():
+    # Center is a bucket [70, 75]; neighbours share boundaries so they ladder.
+    center = make_opportunity(
+        market_id="CENTER", net_edge=0.10, bucket_low=70.0, bucket_high=75.0,
+    )
     buckets = [
-        make_opportunity(market_id=f"B{i}", net_edge=0.10 + i * 0.05, model_probability=0.60 + i * 0.05)
-        for i in range(4)
+        make_opportunity(market_id="UP", net_edge=0.12, bucket_low=75.0, bucket_high=80.0),
+        make_opportunity(market_id="DOWN", net_edge=0.11, bucket_low=65.0, bucket_high=70.0),
+        # Non-adjacent: must be excluded.
+        make_opportunity(market_id="FAR", net_edge=0.20, bucket_low=90.0, bucket_high=95.0),
     ]
-    opp = make_opportunity(net_edge=0.10)
-    signals = aggressive_strategy(opp, buckets, make_aggressive_settings())
+    signals = aggressive_strategy(center, buckets, make_aggressive_settings())
+    market_ids = [s.market_id for s in signals]
+    assert "CENTER" in market_ids
+    assert "FAR" not in market_ids
     assert 1 <= len(signals) <= 3
 
 def test_aggressive_center_bucket_highest_confidence():
+    center = make_opportunity(
+        market_id="CENTER", net_edge=0.10, model_probability=0.60,
+        bucket_low=70.0, bucket_high=75.0,
+    )
     buckets = [
-        make_opportunity(market_id="B0", net_edge=0.15, model_probability=0.80),
-        make_opportunity(market_id="B1", net_edge=0.12, model_probability=0.70),
-        make_opportunity(market_id="B2", net_edge=0.10, model_probability=0.60),
+        make_opportunity(market_id="UP", net_edge=0.15, model_probability=0.80, bucket_low=75.0, bucket_high=80.0),
+        make_opportunity(market_id="DOWN", net_edge=0.12, model_probability=0.70, bucket_low=65.0, bucket_high=70.0),
     ]
-    opp = make_opportunity(net_edge=0.10)
-    signals = aggressive_strategy(opp, buckets, make_aggressive_settings())
+    signals = aggressive_strategy(center, buckets, make_aggressive_settings())
     assert len(signals) >= 2
-    assert signals[0].confidence >= signals[1].confidence
+    # Center is always first in the returned list; adjacent neighbours are at 50% confidence.
+    assert signals[0].market_id == "CENTER"
+    assert all(s.confidence <= signals[0].confidence or s.market_id == "CENTER" for s in signals)
 
 
 # ---------------------------------------------------------------------------

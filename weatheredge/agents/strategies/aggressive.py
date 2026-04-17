@@ -1,18 +1,39 @@
 from weatheredge.agents.base import Signal, MarketOpportunity
 from weatheredge.config import Settings
 
+
+def _emit_signal(opp: MarketOpportunity, role: str) -> Signal | None:
+    """Build a single Aggressive signal for ``opp`` if it clears the edge gate."""
+    side = "buy_yes" if opp.model_probability > opp.market_price else "buy_no"
+    effective_edge = opp.net_edge if side == "buy_yes" else getattr(opp, "net_edge_no", 0.0)
+    if effective_edge <= 0:
+        return None
+    base_confidence = min(effective_edge / 0.20, 1.0)
+    confidence = base_confidence if role == "center" else base_confidence * 0.5
+    return Signal(
+        market_id=opp.market_id,
+        side=side,
+        confidence=confidence,
+        agent_name="Aggressive",
+        reasoning=f"Ladder {role}, edge {effective_edge:.2f}",
+    )
+
+
 def aggressive_strategy(
     opportunity: MarketOpportunity,
     bucket_markets: list[MarketOpportunity],
     settings: Settings,
 ) -> list[Signal]:
     """
-    Aggressive "Cathie Wood" strategy. Temperature laddering across adjacent buckets.
-    Buys up to 3 adjacent buckets around the forecast. Center bucket gets highest
-    confidence, adjacent get 50%.
+    Aggressive "Cathie Wood" strategy. Always emits at most one signal for the
+    center opportunity, plus up to 2 STRICTLY adjacent bucket neighbors
+    (sharing a bucket boundary). Previous behaviour ranked the entire city by
+    edge and emitted top-3 signals on neighbors only — this caused the same
+    market to receive an Aggressive vote from every other market in its city
+    during a single decision cycle (the "14 trades in 8ms" burst).
     """
-    # Check minimum edge on primary opportunity (best of YES or NO side)
-    best_edge = max(opportunity.net_edge, opportunity.net_edge_no)
+    # Edge gate on center
+    best_edge = max(opportunity.net_edge, getattr(opportunity, "net_edge_no", 0.0))
     if best_edge < settings.aggressive_min_edge:
         return []
 
@@ -20,45 +41,55 @@ def aggressive_strategy(
     if opportunity.lead_time_days > 2:
         return []
 
-    # If no bucket markets provided, generate single signal for the primary opportunity
-    if not bucket_markets:
-        side = "buy_yes" if opportunity.model_probability > opportunity.market_price else "buy_no"
-        effective_edge = opportunity.net_edge if side == "buy_yes" else opportunity.net_edge_no
-        confidence = min(effective_edge / 0.20, 1.0)
-        return [Signal(
-            market_id=opportunity.market_id,
-            side=side,
-            confidence=confidence,
-            agent_name="Aggressive",
-            reasoning=f"Single market, edge {effective_edge:.2f}"
-        )]
+    signals: list[Signal] = []
+    center_sig = _emit_signal(opportunity, role="center")
+    if center_sig is not None:
+        signals.append(center_sig)
 
-    # Sort buckets by effective net edge (highest first) — NOT by probability.
-    # A bucket with 90% prob at 92% market price has NEGATIVE edge.
-    scored = sorted(
-        bucket_markets,
-        key=lambda m: max(m.net_edge, getattr(m, "net_edge_no", 0.0)),
+    # Laddering only applies when the center IS a bucket market.
+    center_low = opportunity.bucket_low
+    center_high = opportunity.bucket_high
+    if center_low is None or center_high is None or not bucket_markets:
+        return signals
+
+    # CCG-bug-4: scope candidates to same date+station+platform — bucket_markets
+    # arrives as the full same-city list, which would let us ladder into a bucket
+    # for next week or a different reporting station. Independent contracts.
+    center_date = getattr(opportunity, "market_date", "")
+    center_station = getattr(opportunity, "station", "")
+    center_platform = getattr(opportunity, "platform", "")
+    same_contract_buckets = [
+        nb for nb in bucket_markets
+        if getattr(nb, "market_date", "") == center_date
+        and getattr(nb, "station", "") == center_station
+        and getattr(nb, "platform", "") == center_platform
+    ]
+
+    # CCG-bug-7: pick the highest-edge adjacent neighbours, not the first 2 in
+    # iteration order, so ladder quality doesn't depend on dict ordering.
+    same_contract_buckets.sort(
+        key=lambda nb: max(nb.net_edge, getattr(nb, "net_edge_no", 0.0)),
         reverse=True,
-    )[:3]
+    )
 
-    signals = []
-    for i, bucket in enumerate(scored):
-        bucket_best_edge = max(bucket.net_edge, getattr(bucket, "net_edge_no", 0.0))
-        if bucket_best_edge < settings.aggressive_min_edge:
+    # Strict adjacency: neighbor shares a boundary with the center bucket.
+    adjacent: list[MarketOpportunity] = []
+    for nb in same_contract_buckets:
+        nb_low = nb.bucket_low
+        nb_high = nb.bucket_high
+        if nb_low is None or nb_high is None:
             continue
-        # Center bucket (index 0) gets full confidence, others get 50%
-        is_center = (i == 0)
-        side = "buy_yes" if bucket.model_probability > bucket.market_price else "buy_no"
-        effective_edge = bucket.net_edge if side == "buy_yes" else getattr(bucket, "net_edge_no", 0.0)
-        base_confidence = min(effective_edge / 0.20, 1.0)
-        confidence = base_confidence if is_center else base_confidence * 0.5
+        if abs(nb_low - center_high) < 1e-6 or abs(nb_high - center_low) < 1e-6:
+            adjacent.append(nb)
+        if len(adjacent) >= 2:
+            break
 
-        signals.append(Signal(
-            market_id=bucket.market_id,
-            side=side,
-            confidence=confidence,
-            agent_name="Aggressive",
-            reasoning=f"Ladder {'center' if is_center else 'adjacent'}, edge {effective_edge:.2f}"
-        ))
+    for nb in adjacent:
+        nb_best_edge = max(nb.net_edge, getattr(nb, "net_edge_no", 0.0))
+        if nb_best_edge < settings.aggressive_min_edge:
+            continue
+        sig = _emit_signal(nb, role="adjacent")
+        if sig is not None:
+            signals.append(sig)
 
     return signals

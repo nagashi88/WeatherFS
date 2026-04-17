@@ -418,6 +418,34 @@ class TestProbabilityEdgeCases:
         prob = bucket_probability(50.0, 70.0, 75.0, 3.0)
         assert prob == 0.10  # clamped floor (PROB_FLOOR=0.10)
 
+    def test_bucket_clamp_false_returns_unclamped_low(self):
+        """clamp=False exposes raw sub-floor probability for phantom-edge detection."""
+        raw = bucket_probability(50.0, 70.0, 75.0, 3.0, clamp=False)
+        clamped = bucket_probability(50.0, 70.0, 75.0, 3.0, clamp=True)
+        assert raw < 0.10  # true probability is well below the 0.10 floor
+        assert clamped == 0.10  # still clamped by default
+        # This gap is the phantom-edge driver: clamped > yes_price > raw.
+
+    def test_bucket_clamp_false_returns_unclamped_high(self):
+        """clamp=False also exposes above-ceiling probability (buy_no diagnostic)."""
+        # Narrow bucket centered on forecast + tight rmse → probability ~= 1.
+        raw = bucket_probability(72.5, 60.0, 85.0, 1.0, clamp=False)
+        clamped = bucket_probability(72.5, 60.0, 85.0, 1.0, clamp=True)
+        assert raw > 0.95  # raw captures the true near-certainty
+        assert clamped == 0.95  # clamp caps at ceiling
+
+    def test_bucket_clamp_default_unchanged(self):
+        """Default clamp=True preserves existing call-site behavior."""
+        default = bucket_probability(72.5, 70.0, 75.0, 3.0)
+        explicit = bucket_probability(72.5, 70.0, 75.0, 3.0, clamp=True)
+        assert default == explicit
+
+    def test_bucket_clamp_false_respects_rmse_guard(self):
+        """rmse<=0 still falls back to 3.0 when clamp=False (consistency)."""
+        raw = bucket_probability(72.0, 70.0, 75.0, 0.0, clamp=False)
+        assert 0.0 <= raw <= 1.0
+        assert not np.isnan(raw)
+
     def test_gaussian_above_vs_below_symmetry(self):
         """P(above) + P(below) should sum to ~1.0."""
         p_above = gaussian_probability(72.0, 70.0, 3.0, "above")
