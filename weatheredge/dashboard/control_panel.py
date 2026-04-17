@@ -326,6 +326,148 @@ for i, phase_key in enumerate(PHASE_ORDER):
 
 st.divider()
 
+# ── Equity Curve ─────────────────────────────────────────────────────────
+
+st.subheader("Equity Curve")
+
+import altair as alt
+import pandas as pd
+
+equity_rows = _query_db(
+    f"SELECT resolved_at, pnl FROM trades "
+    f"WHERE status IN {_CLOSED} AND pnl IS NOT NULL AND resolved_at IS NOT NULL "
+    f"ORDER BY resolved_at ASC"
+)
+
+if not equity_rows:
+    st.info("Nessun trade risolto ancora — equity curve disponibile dopo la prima chiusura.")
+else:
+    df = pd.DataFrame([dict(r) for r in equity_rows])
+    df["resolved_at"] = pd.to_datetime(df["resolved_at"], errors="coerce", utc=True)
+    df = df.dropna(subset=["resolved_at"]).sort_values("resolved_at").reset_index(drop=True)
+    df["day"] = df["resolved_at"].dt.tz_convert("UTC").dt.date
+
+    initial_bankroll = 100.0
+    try:
+        from weatheredge.config import Settings
+        initial_bankroll = float(Settings().initial_bankroll)
+    except Exception:
+        pass
+
+    min_day = df["day"].min()
+    max_day = df["day"].max()
+
+    eq_col1, eq_col2, eq_col3 = st.columns([2, 1, 1])
+    with eq_col1:
+        date_range = st.date_input(
+            "Intervallo date",
+            value=(min_day, max_day),
+            min_value=min_day,
+            max_value=max_day,
+            key="equity_date_range",
+        )
+    with eq_col2:
+        granularity = st.selectbox(
+            "Granularità", ["Per trade", "Daily"], index=0, key="equity_granularity"
+        )
+    with eq_col3:
+        min_threshold = st.number_input(
+            "Soglia minima ($)",
+            value=float(initial_bankroll * 0.9),
+            step=1.0,
+            key="equity_min_threshold",
+            help="Linea di riferimento — eventi sotto soglia sono evidenziati.",
+        )
+
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        d_from, d_to = date_range
+    else:
+        d_from = d_to = date_range if not isinstance(date_range, tuple) else min_day
+
+    mask = (df["day"] >= d_from) & (df["day"] <= d_to)
+    sub = df.loc[mask].copy()
+
+    if sub.empty:
+        st.warning("Nessun trade nell'intervallo selezionato.")
+    else:
+        if granularity == "Daily":
+            daily = sub.groupby("day", as_index=False)["pnl"].sum()
+            daily["cum_pnl"] = daily["pnl"].cumsum()
+            daily["equity"] = initial_bankroll + daily["cum_pnl"]
+            daily["timestamp"] = pd.to_datetime(daily["day"])
+            plot_df = daily[["timestamp", "equity", "pnl"]].rename(columns={"pnl": "delta"})
+        else:
+            sub["cum_pnl"] = sub["pnl"].cumsum()
+            sub["equity"] = initial_bankroll + sub["cum_pnl"]
+            plot_df = sub[["resolved_at", "equity", "pnl"]].rename(
+                columns={"resolved_at": "timestamp", "pnl": "delta"}
+            )
+
+        plot_df["running_max"] = plot_df["equity"].cummax()
+        plot_df["drawdown"] = plot_df["equity"] - plot_df["running_max"]
+
+        max_idx = plot_df["equity"].idxmax()
+        min_idx = plot_df["equity"].idxmin()
+        max_dd = float(plot_df["drawdown"].min())
+        max_dd_pct = (max_dd / float(plot_df.loc[plot_df["drawdown"].idxmin(), "running_max"]) * 100.0) \
+            if plot_df.loc[plot_df["drawdown"].idxmin(), "running_max"] else 0.0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Equity finale", f"${float(plot_df['equity'].iloc[-1]):.2f}")
+        m2.metric("Max equity", f"${float(plot_df['equity'].max()):.2f}")
+        m3.metric("Min equity", f"${float(plot_df['equity'].min()):.2f}")
+        m4.metric("Max drawdown", f"${max_dd:.2f}", delta=f"{max_dd_pct:.1f}%")
+
+        line = alt.Chart(plot_df).mark_line(color="#00ccff", strokeWidth=2).encode(
+            x=alt.X("timestamp:T", title="Tempo"),
+            y=alt.Y("equity:Q", title="Equity ($)", scale=alt.Scale(zero=False)),
+            tooltip=[
+                alt.Tooltip("timestamp:T", title="Quando"),
+                alt.Tooltip("equity:Q", title="Equity", format="$.2f"),
+                alt.Tooltip("delta:Q", title="ΔP&L", format="$.2f"),
+                alt.Tooltip("drawdown:Q", title="Drawdown", format="$.2f"),
+            ],
+        )
+
+        threshold_line = alt.Chart(pd.DataFrame({"y": [float(min_threshold)]})).mark_rule(
+            color="#ffaa00", strokeDash=[6, 4]
+        ).encode(y="y:Q")
+
+        bankroll_line = alt.Chart(pd.DataFrame({"y": [initial_bankroll]})).mark_rule(
+            color="#666", strokeDash=[2, 4]
+        ).encode(y="y:Q")
+
+        markers_df = plot_df.loc[[max_idx, min_idx]].copy()
+        markers_df["label"] = ["MAX", "MIN"]
+        markers = alt.Chart(markers_df).mark_point(size=120, filled=True).encode(
+            x="timestamp:T",
+            y="equity:Q",
+            color=alt.Color(
+                "label:N",
+                scale=alt.Scale(domain=["MAX", "MIN"], range=["#00ff88", "#ff4444"]),
+                legend=alt.Legend(title="Estremi"),
+            ),
+            tooltip=["label:N", alt.Tooltip("equity:Q", format="$.2f")],
+        )
+
+        chart = (bankroll_line + threshold_line + line + markers).properties(height=320)
+        st.altair_chart(chart, use_container_width=True)
+
+        with st.expander("Drawdown nel tempo"):
+            dd_chart = alt.Chart(plot_df).mark_area(
+                color="#ff4444", opacity=0.4
+            ).encode(
+                x=alt.X("timestamp:T", title="Tempo"),
+                y=alt.Y("drawdown:Q", title="Drawdown ($)"),
+                tooltip=[
+                    alt.Tooltip("timestamp:T"),
+                    alt.Tooltip("drawdown:Q", format="$.2f"),
+                ],
+            ).properties(height=180)
+            st.altair_chart(dd_chart, use_container_width=True)
+
+st.divider()
+
 # ── P&L by Lead Time ────────────────────────────────────────────────────
 
 st.subheader("P&L by Lead Time")
