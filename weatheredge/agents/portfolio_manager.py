@@ -267,6 +267,26 @@ class PortfolioManager:
                 if correlated:
                     continue
 
+            # YES calibration guard-rail (April-2026 audit).
+            # Historical daily_high/daily_low buy_yes: n=33, mean predicted 0.556,
+            # actual 0.030 — effectively zero wins above predicted 0.50. Block
+            # high-conviction buy_yes on threshold markets (bucket_low/high None)
+            # until recalibration data proves the YES curve has shifted.
+            if (
+                getattr(self.settings, "yes_guard_rail_enabled", True)
+                and majority_side == "buy_yes"
+                and bucket_low is None
+                and bucket_high is None
+                and model_probability > getattr(self.settings, "yes_guard_rail_max_prob", 0.70)
+            ):
+                log.warning(
+                    "YES guard-rail: market=%s skipped buy_yes (model_p=%.3f > %.2f on threshold market)",
+                    market_id,
+                    model_probability,
+                    getattr(self.settings, "yes_guard_rail_max_prob", 0.70),
+                )
+                continue
+
             capital_base = equity_base
 
             preliminary_size = self.risk_manager.calculate_position_size(

@@ -222,6 +222,14 @@ class Settings(BaseSettings):
     warmup_hours: int = 72  # Shadow mode duration (log but don't trade)
     enable_warmup_shadow_mode: bool = False  # Set True in .env to enable 72h shadow warm-up
 
+    # YES-side calibration guard-rail (April-2026 calibration audit).
+    # Historical sample n=33 on daily_high/daily_low threshold markets:
+    # mean predicted P(YES)=0.556, actual win rate=0.030 → 18x miscalibration,
+    # zero wins above predicted 0.50 except one outlier. Block high-conviction
+    # buy_yes on threshold markets until the YES calibration curve improves.
+    yes_guard_rail_enabled: bool = True
+    yes_guard_rail_max_prob: float = 0.70  # Reject buy_yes on daily_high/low when model_prob exceeds this
+
     # Learning
     weight_update_interval_trades: int = 50
     agent_weight_update_interval: int = 100

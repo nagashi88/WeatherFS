@@ -500,6 +500,10 @@ class TestAgentDisagreement:
             lead_time_days=1,
             gaussian_prob=0.95,
             ensemble_prob=0.93,
+            # Bucket market so the April-2026 YES guard-rail (threshold-markets
+            # only) does not short-circuit this consensus-pipeline test.
+            bucket_low=83.0,
+            bucket_high=87.0,
         )
 
         signals = {

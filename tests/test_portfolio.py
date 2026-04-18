@@ -329,6 +329,11 @@ def test_candidates_prioritized_by_score_when_slots_are_limited():
     opp_high.model_probability = 0.85
     opp_high.net_edge = 0.62
     opp_high.net_edge_no = -0.65
+    # Bucket market so the YES guard-rail (threshold-markets only) does not fire
+    # here — this test focuses on slot-prioritisation by weighted_score, not on
+    # the April-2026 calibration audit.
+    opp_high.bucket_low = 70.0
+    opp_high.bucket_high = 75.0
 
     orders = pm.aggregate_signals(
         signals_by_market={
@@ -347,4 +352,164 @@ def test_candidates_prioritized_by_score_when_slots_are_limited():
 
     assert len(orders) == 1
     assert orders[0].market_id == high_score_market
+    assert orders[0].side == "buy_yes"
+
+
+# ---------------------------------------------------------------------------
+# YES calibration guard-rail (April-2026 audit)
+# ---------------------------------------------------------------------------
+
+def test_yes_guard_rail_blocks_high_prob_yes_on_threshold_market():
+    """buy_yes with model_prob > yes_guard_rail_max_prob on a threshold market
+    (bucket_low/high None) must be rejected — historical calibration on
+    daily_high/daily_low showed 33 YES trades with 3% actual win rate."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-Y", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-Y", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-Y", side="buy_yes", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-Y")
+    opp.model_probability = 0.95  # Above 0.70 default — mirrors the 2011167 trade
+    opp.bucket_low = None
+    opp.bucket_high = None
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-Y": signals},
+        opportunities={"MKT-Y": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == [], "YES guard-rail must block high-prob buy_yes on threshold markets"
+
+
+def test_yes_guard_rail_allows_buy_no_on_threshold_market():
+    """Guard-rail targets YES only — buy_no on same market type must pass through."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-N", side="buy_no", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-N", side="buy_no", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-N", side="buy_no", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-N")
+    opp.model_probability = 0.10
+    opp.market_price = 0.60
+    opp.net_edge = -0.52
+    opp.net_edge_no = 0.28
+    opp.bucket_low = None
+    opp.bucket_high = None
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-N": signals},
+        opportunities={"MKT-N": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_no"
+
+
+def test_yes_guard_rail_allows_low_prob_buy_yes():
+    """Guard-rail only fires above yes_guard_rail_max_prob (0.70 default).
+    A buy_yes with model_prob=0.40 must trade normally."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-Y2", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-Y2", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-Y2", side="buy_yes", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-Y2")
+    opp.model_probability = 0.40
+    opp.market_price = 0.22
+    opp.net_edge = 0.16
+    opp.net_edge_no = -0.20
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-Y2": signals},
+        opportunities={"MKT-Y2": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_yes"
+
+
+def test_yes_guard_rail_disabled_flag_lets_trade_through():
+    """When yes_guard_rail_enabled=False, high-prob buy_yes on threshold market passes."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    settings = make_settings(yes_guard_rail_enabled=False)
+    pm = PortfolioManager(settings, rm)
+
+    signals = [
+        Signal(market_id="MKT-Y3", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-Y3", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-Y3", side="buy_yes", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-Y3")
+    opp.model_probability = 0.95
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-Y3": signals},
+        opportunities={"MKT-Y3": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+
+
+def test_yes_guard_rail_does_not_block_bucket_market():
+    """Bucket markets (bucket_low/high set) are NOT threshold markets.
+    Guard-rail targets threshold markets only — bucket YES must still be evaluated
+    on its own merits (bucket-correlation and standard risk checks)."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-B", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-B", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-B", side="buy_yes", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-B")
+    opp.model_probability = 0.85
+    opp.bucket_low = 70.0
+    opp.bucket_high = 75.0
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-B": signals},
+        opportunities={"MKT-B": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
     assert orders[0].side == "buy_yes"

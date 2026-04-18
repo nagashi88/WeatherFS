@@ -42,7 +42,9 @@ class TestL3EndToEnd:
         portfolio_manager = PortfolioManager(settings, risk_manager)
         paper_trader = PaperTrader(initial_bankroll=1000.0)
 
-        # Build opportunity with strong edge (should trigger Conservative)
+        # Build opportunity with strong edge (should trigger Conservative).
+        # Use a bucket market so the April-2026 YES guard-rail (threshold-markets
+        # only) does not short-circuit this consensus-pipeline test.
         opp = MarketOpportunity(
             market_id="KXHIGHNY-2026-03-30",
             platform="kalshi", city="NYC", station="KNYC",
@@ -51,6 +53,7 @@ class TestL3EndToEnd:
             net_edge=0.32,  # Big edge
             forecast_temp=88.0, rmse=2.5, lead_time_days=1,
             gaussian_prob=0.75, ensemble_prob=0.74,
+            bucket_low=78.0, bucket_high=82.0,
         )
 
         # Run strategies
