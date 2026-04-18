@@ -1104,6 +1104,14 @@ def _run_decision_cycle(state: AppState) -> None:
         except Exception as _vpin_exc:
             log.debug("VPIN fill data unavailable: %s", _vpin_exc)
 
+    # Persist per-agent signals BEFORE aggregation so the audit trail survives
+    # an aggregator crash. Best-effort: failures are logged at DEBUG and never
+    # block trading.
+    try:
+        _persist_signals(signals_by_market, opportunities)
+    except Exception as exc:
+        log.debug("run_decision_loop: signal persistence failed: %s", exc)
+
     try:
         trade_orders = state.portfolio_manager.aggregate_signals(
             signals_by_market=signals_by_market,
@@ -1561,6 +1569,48 @@ def _read_latest_market_prices() -> dict[str, dict]:
                     "timestamp": row.timestamp,
                 }
     return result
+
+
+def _persist_signals(
+    signals_by_market: dict[str, list[Signal]],
+    opportunities: dict[str, MarketOpportunity],
+) -> None:
+    """Persist per-agent signals to the `signals` table for post-fact audit.
+
+    Captures every vote (including no_trade) so downstream analysis can attribute
+    profitability to specific agents and detect systematic disagreement patterns.
+    Best-effort: callers must guard with their own try/except — DB failures here
+    must NOT block the trading decision loop.
+    """
+    from weatheredge.db.models import Signal as SignalRow
+
+    rows: list[SignalRow] = []
+    for market_id, sigs in signals_by_market.items():
+        opp = opportunities.get(market_id)
+        market_price = opp.market_price if opp else None
+        model_probability = opp.model_probability if opp else None
+        for sig in sigs:
+            edge: float | None = None
+            if opp is not None and sig.side != "no_trade":
+                if sig.side == "buy_yes":
+                    edge = opp.net_edge
+                elif sig.side == "buy_no":
+                    edge = opp.net_edge_no
+            rows.append(SignalRow(
+                market_id=market_id,
+                agent_name=sig.agent_name or "unknown",
+                signal_type=sig.side,
+                model_probability=model_probability,
+                market_price=market_price,
+                edge=edge,
+                confidence=sig.confidence,
+                reasoning=sig.reasoning or None,
+            ))
+    if not rows:
+        return
+    with get_session() as session:
+        session.bulk_save_objects(rows)
+        # get_session() commits on clean exit; no explicit commit needed.
 
 
 def _build_opportunity(
