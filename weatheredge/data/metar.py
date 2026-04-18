@@ -75,6 +75,33 @@ def _station_local_hour(station: str) -> int:
     return (datetime.now(timezone.utc).hour + offset) % 24
 
 
+def _station_local_date(station: str) -> str:
+    """Get current local date (YYYY-MM-DD) for a station, respecting DST.
+
+    The market_date Polymarket/Kalshi resolves against is the *local* day at
+    the station, not UTC. Using UTC here wipes the daily tracker 4-7h before
+    local end-of-day for US west/mountain stations (KDEN UTC-7: UTC midnight =
+    Denver 17:00 yesterday, exactly when the daily HIGH is about to peak).
+    Symmetric problem for Asia (RKSS UTC+9 keeps yesterday's tracker for 9h
+    into local today).
+    """
+    tz_name = _STATION_TZ.get(station)
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # Fallback: shift UTC by the station's standard-time offset. Loses DST
+    # accuracy but at least keeps the date roughly aligned with local.
+    offset = _STATION_UTC_OFFSET_HOURS_FALLBACK.get(station)
+    if offset is None:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    from datetime import timedelta
+    shifted = datetime.now(timezone.utc) + timedelta(hours=offset)
+    return shifted.strftime("%Y-%m-%d")
+
+
 @dataclass
 class DailyTracker:
     """Tracks running daily high/low from actual observations for one station."""
@@ -171,8 +198,9 @@ class CurrentConditionsTracker:
                 raw_metar=obs_data.get("rawOb", ""),
             )
 
-            # Update daily tracker
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            # Update daily tracker — keyed on the station's *local* date so the
+            # running daily HIGH is not wiped at UTC midnight (Denver 17:00 etc).
+            today = _station_local_date(station)
             tracker = self._trackers.get(station)
             if tracker is None or tracker.date != today:
                 tracker = DailyTracker(station=station, date=today)
@@ -241,8 +269,9 @@ class CurrentConditionsTracker:
         Returns:
             Override probability (0.01 or 0.99) if METAR is decisive, else None.
         """
-        # Never override for future-date markets
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Never override for future-date markets — but compare against the
+        # station's *local* date (markets resolve at end of local day, not UTC).
+        today = _station_local_date(station)
         if market_date is not None and market_date != today:
             return None
 
