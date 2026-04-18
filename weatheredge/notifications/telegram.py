@@ -22,17 +22,18 @@ ALERT_TEMPLATES = {
 class TelegramBot:
     """Sends Telegram notifications for trade events and system alerts."""
 
+    _disabled_logged = False
+
     def __init__(self, settings: Settings) -> None:
         self._token = settings.telegram_bot_token
         self._chat_id = settings.telegram_chat_id
 
     async def send_alert(self, message: str) -> None:
         """Send a message to the configured chat_id. Logs and swallows errors."""
-        if not self._token:
-            logger.warning("Telegram bot token not configured; skipping alert.")
-            return
-        if not self._chat_id:
-            logger.warning("Telegram chat_id not configured; skipping alert.")
+        if not self._token or not self._chat_id:
+            if not TelegramBot._disabled_logged:
+                logger.info("Telegram notifications disabled (no token/chat_id configured).")
+                TelegramBot._disabled_logged = True
             return
         try:
             from telegram import Bot  # python-telegram-bot

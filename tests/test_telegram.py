@@ -144,21 +144,42 @@ def test_format_degraded_mode_alert():
 
 
 @pytest.mark.asyncio
-async def test_send_alert_missing_token_logs_warning_no_crash(caplog):
-    """send_alert should log a warning and not raise when token is empty."""
+async def test_send_alert_missing_token_logs_disabled_no_crash(caplog):
+    """send_alert silently no-ops when token is empty, logging a single
+    INFO line on first call (intentional opt-out by leaving creds blank)."""
+    from weatheredge.notifications.telegram import TelegramBot
+    TelegramBot._disabled_logged = False
     bot = make_bot(telegram_bot_token="", telegram_chat_id="12345")
-    with caplog.at_level(logging.WARNING, logger="weatheredge.notifications.telegram"):
+    with caplog.at_level(logging.INFO, logger="weatheredge.notifications.telegram"):
         await bot.send_alert("test message")
-    assert any("token" in record.message.lower() for record in caplog.records)
+    assert any("disabled" in record.message.lower() for record in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_send_alert_missing_chat_id_logs_warning_no_crash(caplog):
-    """send_alert should log a warning and not raise when chat_id is empty."""
+async def test_send_alert_missing_chat_id_logs_disabled_no_crash(caplog):
+    """send_alert silently no-ops when chat_id is empty (same intentional
+    opt-out path as missing token)."""
+    from weatheredge.notifications.telegram import TelegramBot
+    TelegramBot._disabled_logged = False
     bot = make_bot(telegram_bot_token="fake-token", telegram_chat_id="")
-    with caplog.at_level(logging.WARNING, logger="weatheredge.notifications.telegram"):
+    with caplog.at_level(logging.INFO, logger="weatheredge.notifications.telegram"):
         await bot.send_alert("test message")
-    assert any("chat_id" in record.message.lower() for record in caplog.records)
+    assert any("disabled" in record.message.lower() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_send_alert_disabled_logs_only_once(caplog):
+    """Repeated calls with empty creds must NOT spam the log — only the first
+    call emits the 'disabled' info line."""
+    from weatheredge.notifications.telegram import TelegramBot
+    TelegramBot._disabled_logged = False
+    bot = make_bot(telegram_bot_token="", telegram_chat_id="")
+    with caplog.at_level(logging.INFO, logger="weatheredge.notifications.telegram"):
+        await bot.send_alert("first")
+        await bot.send_alert("second")
+        await bot.send_alert("third")
+    disabled_records = [r for r in caplog.records if "disabled" in r.message.lower()]
+    assert len(disabled_records) == 1
 
 
 # ---------------------------------------------------------------------------
