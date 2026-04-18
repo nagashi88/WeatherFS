@@ -3270,6 +3270,52 @@ class TestBucketPhantomEdgeGuard:
         )
         assert 0.0 <= opp.raw_model_prob <= 1.0
 
+    def test_bucket_audit_fields_match_bucket_band_not_midpoint(self):
+        """For bucket markets, gaussian_prob/ensemble_prob must answer
+        P(low ≤ T ≤ high), NOT P(T ≥ midpoint). Forecast far above the bucket
+        should produce ~0 audit prob (matches bucket_hit_prob), not ~0.95
+        (which is what the midpoint formula would give)."""
+        state = self._state_no_metar()
+        market_id = "bucket_audit_far_above"
+        state.market_metadata[market_id] = self._bucket_meta(
+            market_id, low=50.0, high=51.0, date=self.TODAY,
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.50}, self._forecast(70.0),  # 19°F above bucket
+            )
+
+        assert opp is not None
+        assert opp.gaussian_prob is not None
+        # P(50 ≤ T ≤ 51 | forecast=70, rmse=2.5) is essentially 0; must NOT be ~0.95
+        assert opp.gaussian_prob < 0.10, (
+            f"bucket gaussian_prob should be near 0 for forecast far above bucket, "
+            f"got {opp.gaussian_prob:.3f} — likely still using midpoint formula"
+        )
+
+    def test_bucket_audit_gaussian_in_band_matches_blended(self):
+        """When forecast lands inside the bucket, gaussian audit prob should
+        be in the same ballpark as blended_prob (both answer the band question)."""
+        state = self._state_no_metar()
+        market_id = "bucket_audit_in_band"
+        state.market_metadata[market_id] = self._bucket_meta(
+            market_id, low=70.0, high=75.0, date=self.TODAY,
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.30}, self._forecast(72.5),  # mid-bucket
+            )
+
+        assert opp is not None
+        assert opp.gaussian_prob is not None
+        # In-band forecast: bucket gaussian should be a meaningful positive value,
+        # not 0.5 (midpoint formula collapses to ~0.5 at threshold).
+        assert opp.gaussian_prob > 0.10, (
+            f"in-band bucket gaussian_prob too low: {opp.gaussian_prob:.3f}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # PROBLEM #4: Adjacent-bucket correlation guard

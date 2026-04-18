@@ -1949,14 +1949,35 @@ def _build_opportunity(
 
     city = STATION_TO_CITY.get(station, station)
 
-    # Gaussian and ensemble probabilities for conservative model-agreement check
+    # Gaussian and ensemble probabilities for conservative model-agreement check.
+    # For bucket markets (`low ≤ T ≤ high`), the directional formulas evaluated at
+    # the midpoint answer the wrong question — they were storing P(T≥midpoint) ≈ 0.95
+    # in audit fields when the true bucket-hit probability was ≈ 0.01. Compute proper
+    # bucket-band probabilities so audit fields can be compared against
+    # `bucket_hit_prob` and `blended_prob` post-fact.
     from weatheredge.probability.gaussian import gaussian_probability
     from weatheredge.probability.ensemble import ensemble_probability
 
-    gaussian_prob = gaussian_probability(forecast_temp, threshold, rmse, direction)
+    gaussian_prob: float
     ensemble_prob: float | None = None
-    if ensemble_members and len(ensemble_members) >= 20:
-        ensemble_prob = ensemble_probability(ensemble_members, threshold, direction)
+    if bucket_low is not None and bucket_high is not None:
+        # P(low ≤ T ≤ high) = P(T≥low) − P(T≥high). clamp=False because clamping
+        # individual tails before subtracting destroys the bucket-band information
+        # for forecasts far from the bucket.
+        _p_above_low = gaussian_probability(
+            forecast_temp, bucket_low, rmse, "above", clamp=False,
+        )
+        _p_above_high = gaussian_probability(
+            forecast_temp, bucket_high, rmse, "above", clamp=False,
+        )
+        gaussian_prob = max(_p_above_low - _p_above_high, 0.0)
+        if ensemble_members and len(ensemble_members) >= 20:
+            _in_bucket = sum(1 for t in ensemble_members if bucket_low <= t <= bucket_high)
+            ensemble_prob = _in_bucket / len(ensemble_members)
+    else:
+        gaussian_prob = gaussian_probability(forecast_temp, threshold, rmse, direction)
+        if ensemble_members and len(ensemble_members) >= 20:
+            ensemble_prob = ensemble_probability(ensemble_members, threshold, direction)
 
     # BugFix P0-1: When blended probability hits the floor exactly (clamped),
     # the model has no differentiation signal. Use gaussian_prob as a better
