@@ -199,6 +199,45 @@ def test_parse_no_date():
     assert result is None
 
 
+def test_unknown_city_logs_warning(caplog):
+    """A genuinely unmapped city must still emit WARNING for alerting."""
+    with caplog.at_level(logging.WARNING, logger="weatheredge.data.market_parser"):
+        parse_polymarket_title(
+            "Will the highest temperature in Timbuktu be 50°F or above on April 4?"
+        )
+    assert any("UNKNOWN_CITY_HIGH_PRIORITY" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("city", [
+    "Cape Town", "Lagos", "Helsinki", "Amsterdam", "Jeddah",
+    "Karachi", "Jakarta", "Manila", "Kuala Lumpur", "Guangzhou",
+    "Busan", "Panama City",
+])
+def test_known_untradable_cities_log_debug_not_warning(caplog, city):
+    """Cities we know about but cannot trade (no RMSE/timezone/HRRR) should
+    NOT spam the WARNING channel — they're a known-skip, not a real alert."""
+    with caplog.at_level(logging.DEBUG, logger="weatheredge.data.market_parser"):
+        result = parse_polymarket_title(
+            f"Will the highest temperature in {city} be 50°F or above on April 4?"
+        )
+    assert result is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert not warnings, f"Expected no WARNING for {city}, got: {[r.message for r in warnings]}"
+
+
+def test_month_false_positive_does_not_warn(caplog):
+    """Global-temperature-anomaly markets (no city, contain 'in April 2026')
+    falsely match the 'in {Capitalized}' regex and extract the month name as
+    a city. Observed ~252/h in production. Must not pollute WARNING channel."""
+    with caplog.at_level(logging.DEBUG, logger="weatheredge.data.market_parser"):
+        parse_polymarket_title(
+            "April 2026 Temperature Increase (ºC) - Will global temperature "
+            "increase by less than 0.6°C in April 2026?"
+        )
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert not warnings, f"unexpected: {[r.message for r in warnings]}"
+
+
 # ---------------------------------------------------------------------------
 # Real Polymarket titles from production logs
 # ---------------------------------------------------------------------------

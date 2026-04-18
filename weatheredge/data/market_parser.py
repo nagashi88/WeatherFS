@@ -102,6 +102,24 @@ US_STATIONS: set[str] = {
     "KATL", "KDFW", "KPHX", "KIAH", "KSFO", "KBOS",
 }
 
+# Cities that appear in Polymarket weather universe but for which we have no
+# edge infrastructure (no STATION_RMSE, no METAR timezone, no HRRR coverage).
+# Suppress UNKNOWN_CITY_HIGH_PRIORITY warning for these — they're known-skip,
+# not real "unmapped" surprises. Promote to CITY_TO_STATION + add an RMSE row
+# in bias_correction.STATION_RMSE before removing from this list.
+KNOWN_UNTRADABLE_CITIES: set[str] = {
+    "cape town", "lagos", "helsinki", "amsterdam", "jeddah",
+    "karachi", "jakarta", "manila", "kuala lumpur", "guangzhou",
+    "busan", "panama city",
+}
+
+# Month names that the "in {City}" extraction regex falsely matches from
+# fragments like "...on April 4". Filter to avoid log spam.
+_MONTH_FALSE_POSITIVES: set[str] = {
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+}
+
 @dataclass
 class ParsedMarket:
     city: str
@@ -146,10 +164,17 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         # Try to extract city name from "in {City}" pattern for alerting
         city_match = re.search(r'\bin\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', title)
         unknown_city = city_match.group(1) if city_match else "UNKNOWN"
-        log.warning(
-            "UNKNOWN_CITY_HIGH_PRIORITY: could not map city from title: '%s' (extracted: %s)",
-            title[:80], unknown_city,
-        )
+        unknown_lower = unknown_city.lower()
+        if unknown_lower in KNOWN_UNTRADABLE_CITIES or unknown_lower in _MONTH_FALSE_POSITIVES:
+            log.debug(
+                "Skipping non-tradable city '%s' (no edge infrastructure)",
+                unknown_city,
+            )
+        else:
+            log.warning(
+                "UNKNOWN_CITY_HIGH_PRIORITY: could not map city from title: '%s' (extracted: %s)",
+                title[:80], unknown_city,
+            )
         return None
 
     # --- Extract date ---
