@@ -166,8 +166,11 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
     date_str = f"{current_year}-{month:02d}-{day:02d}"
 
     # --- Determine market type ---
+    # Substring "low" matches "below" (e.g. "55°F or below"), so require
+    # "low(est) temperature" as a word-adjacent phrase: classify as daily_low
+    # only when the contract subject is the daily minimum.
     market_type = "daily_high"  # Default
-    if "low" in title_lower and "temperature" in title_lower:
+    if re.search(r'\blow(?:est)?\s+temperature\b', title_lower):
         market_type = "daily_low"
 
     # --- Extract threshold/bucket ---

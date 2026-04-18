@@ -88,6 +88,32 @@ def test_parse_below():
     assert result is not None
     assert result.threshold == 43.0
     assert result.direction == "below"
+    # Regression: substring "low" in "below" must NOT flip a daily-high
+    # contract to daily_low. METAR override picks the wrong sensor reading
+    # (daily MIN vs MAX) when this misclassifies, so re-evaluation goes off.
+    assert result.market_type == "daily_high"
+
+
+def test_parse_below_does_not_misclassify_as_daily_low():
+    """A 'highest temperature ... or below' contract is direction-down on the
+    daily HIGH, not a daily_low contract. The naive `'low' in title` check
+    used to flip these because 'below' contains 'low'."""
+    result = parse_polymarket_title(
+        "Will the highest temperature in Chicago be 55°F or below on April 20?"
+    )
+    assert result is not None
+    assert result.market_type == "daily_high"
+    assert result.direction == "below"
+
+
+def test_parse_lowest_temperature_still_classified_as_daily_low():
+    """Counter-test: a real 'Lowest temperature' contract must still parse as
+    daily_low, ensuring the regex tightening didn't over-correct."""
+    result = parse_polymarket_title(
+        "Will the lowest temperature in Denver be 30°F or below on April 4?"
+    )
+    assert result is not None
+    assert result.market_type == "daily_low"
 
 
 # ---------------------------------------------------------------------------
