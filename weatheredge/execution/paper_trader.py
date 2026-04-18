@@ -44,6 +44,7 @@ class Order:
     order_type: str = "market"
     forecast_timestamp: datetime | None = None
     market_price_timestamp: datetime | None = None
+    cash_capped: bool = False  # propagated from TradeOrder; persisted on Trade row
 
 
 @dataclass
@@ -229,6 +230,7 @@ class PaperTrader:
                 ensemble_prob=trade_dict.get("ensemble_prob"),
                 blended_prob=trade_dict.get("blended_prob"),
                 raw_model_prob=trade_dict.get("raw_model_prob"),
+                cash_capped=bool(trade_dict.get("cash_capped", False)),
                 status="open",
             )
             session.add(db_trade)
@@ -303,6 +305,7 @@ class PaperTrader:
                 "ensemble_prob": order.ensemble_prob,
                 "blended_prob": order.blended_prob,
                 "raw_model_prob": order.raw_model_prob,
+                "cash_capped": order.cash_capped,
                 "status": "pending",
                 "created_at": datetime.now(timezone.utc),
                 "pnl": None,
@@ -335,6 +338,8 @@ class PaperTrader:
             "gaussian_prob": order.gaussian_prob,
             "ensemble_prob": order.ensemble_prob,
             "blended_prob": order.blended_prob,
+            "raw_model_prob": order.raw_model_prob,
+            "cash_capped": order.cash_capped,
             "status": "open",
             "created_at": datetime.now(timezone.utc),
             "pnl": None,

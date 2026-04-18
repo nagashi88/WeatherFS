@@ -29,6 +29,7 @@ class TradeOrder:
     blended_prob: float | None = None
     raw_model_prob: float | None = None  # Pre-clamp blended; None = not available (legacy/fallback)
     order_type: str = "market"
+    cash_capped: bool = False  # PortfolioManager sets True when amount was reduced to fit cash
 
 @dataclass
 class MarketOpportunity:

@@ -1,16 +1,145 @@
 """Parse Polymarket weather market titles into structured resolution data.
 
 Uses regex only — no LLM calls. Falls back to Gap 7b (skip + warn) on parse failure.
+
+Concurrency / test-isolation notes
+----------------------------------
+The parser keeps two pieces of *module-level* state — `_PARSE_HISTORY`
+(rolling failure-rate window) and `_last_parse_alert_at` (alert throttle).
+Both are guarded by `_PARSE_LOCK` for thread safety inside a single
+process, but they are NOT process-safe:
+
+* Tests that exercise parse counters under `pytest-xdist` (`pytest -n auto`)
+  will see counters from *one* worker only — the other workers each have
+  their own copy. Tests that assert exact counts on `_PARSE_HISTORY` should
+  either pin to a single worker (e.g. `--dist=loadfile` or `pytest -p no:xdist`)
+  or call `reset_parse_history_for_tests()` in a fixture to start clean.
+* The history is in-memory only — restart of the bot loses the window.
+  This is intentional: a 1h window is short enough that warm-up is fast.
+
+Timestamps stored in `_PARSE_HISTORY` use `time.monotonic()` (not
+`datetime.now`) so a backward NTP step (clock skew) does not silently
+prune live entries when the wall-clock jumps backward by minutes.
 """
 
 from __future__ import annotations
 
 import re
 import logging
+import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from threading import Lock
 
 log = logging.getLogger(__name__)
+
+# --- Parse-failure observability (P2) ---
+# Sliding window of (monotonic_seconds, success_bool) tuples covering the
+# last hour. Each call to parse_polymarket_title records its outcome here so
+# the daily-summary job and live alerting can compute the failure rate
+# without scanning logs. Bounded by both maxlen and time-window pruning.
+#
+# `time.monotonic()` is used instead of `datetime.now()` so a backward NTP
+# clock jump cannot silently prune live entries (or hide a real failure
+# spike behind a "future" cutoff). The monotonic counter is per-process and
+# never resets while the process is alive.
+_PARSE_WINDOW_SECONDS = 3600
+_PARSE_HISTORY: deque[tuple[float, bool]] = deque(maxlen=10_000)
+_PARSE_LOCK = Lock()
+# Above this fraction of failures over the rolling window the parser logs a
+# WARNING. Tuned for "title-drift event" detection — Polymarket usually
+# fails < 5% (untradable cities + month false positives), so 30% is a clear
+# anomaly without being so tight that a single bad scan triggers it.
+_PARSE_FAILURE_ALERT_THRESHOLD = 0.30
+# Don't alert until we've seen at least this many attempts in the window.
+# Avoids spurious WARNINGs at startup. Lowered from 20 → 5 because real
+# scrape cycles produce 5–15 titles, and the previous threshold meant a
+# title-drift event in a small batch went undetected for ~3 cycles.
+_PARSE_FAILURE_MIN_SAMPLES = 5
+# Throttle the WARNING so we don't log it on every single parse once the
+# threshold is crossed (we'd flood the log).
+_PARSE_ALERT_COOLDOWN_SECONDS = 300
+_last_parse_alert_at: float | None = None  # monotonic seconds; see above
+
+
+def _record_parse_outcome(success: bool) -> None:
+    """Append outcome to the rolling parse-failure window. Thread-safe."""
+    now = time.monotonic()
+    with _PARSE_LOCK:
+        _PARSE_HISTORY.append((now, success))
+        # Prune entries older than the window — the deque maxlen handles
+        # absolute upper bound, but time-pruning keeps the rate accurate.
+        cutoff = now - _PARSE_WINDOW_SECONDS
+        while _PARSE_HISTORY and _PARSE_HISTORY[0][0] < cutoff:
+            _PARSE_HISTORY.popleft()
+
+
+def get_parse_failure_stats(window_minutes: int = 60) -> dict[str, float | int]:
+    """Return (attempts, failures, failure_rate) over the last `window_minutes`.
+
+    Used by the daily-summary job and ad-hoc diagnostics. Always safe to
+    call — empty window returns zeros.
+    """
+    window_seconds = max(1, int(window_minutes) * 60)
+    cutoff = time.monotonic() - window_seconds
+    with _PARSE_LOCK:
+        snapshot = [(ts, ok) for ts, ok in _PARSE_HISTORY if ts >= cutoff]
+    attempts = len(snapshot)
+    failures = sum(1 for _, ok in snapshot if not ok)
+    rate = (failures / attempts) if attempts else 0.0
+    return {"attempts": attempts, "failures": failures, "failure_rate": rate}
+
+
+def _maybe_alert_parse_failure_rate() -> None:
+    """Emit a single throttled WARNING when the rolling failure rate is high.
+
+    The cooldown check AND the timestamp write happen atomically under
+    `_PARSE_LOCK`, so concurrent parsers cannot both pass the cooldown gate
+    and log duplicate warnings. Logging itself is moved outside the lock so
+    a slow logging handler never serializes parser throughput.
+    """
+    global _last_parse_alert_at
+    window_seconds = _PARSE_WINDOW_SECONDS
+    cutoff_mono = time.monotonic() - window_seconds
+
+    should_log = False
+    snapshot_attempts = 0
+    snapshot_failures = 0
+    snapshot_rate = 0.0
+    with _PARSE_LOCK:
+        snapshot = [(ts, ok) for ts, ok in _PARSE_HISTORY if ts >= cutoff_mono]
+        snapshot_attempts = len(snapshot)
+        snapshot_failures = sum(1 for _, ok in snapshot if not ok)
+        snapshot_rate = (snapshot_failures / snapshot_attempts) if snapshot_attempts else 0.0
+        if (
+            snapshot_attempts >= _PARSE_FAILURE_MIN_SAMPLES
+            and snapshot_rate >= _PARSE_FAILURE_ALERT_THRESHOLD
+        ):
+            now_mono = time.monotonic()
+            if (
+                _last_parse_alert_at is None
+                or (now_mono - _last_parse_alert_at) >= _PARSE_ALERT_COOLDOWN_SECONDS
+            ):
+                _last_parse_alert_at = now_mono
+                should_log = True
+
+    if should_log:
+        log.warning(
+            "PARSE_FAILURE_RATE_HIGH: %.1f%% (%d/%d) over last %dm — title drift?",
+            snapshot_rate * 100,
+            snapshot_failures,
+            snapshot_attempts,
+            window_seconds // 60,
+        )
+
+
+def reset_parse_history_for_tests() -> None:
+    """Test helper — clears the rolling window and the alert cooldown."""
+    global _last_parse_alert_at
+    with _PARSE_LOCK:
+        _PARSE_HISTORY.clear()
+        _last_parse_alert_at = None
 
 CITY_TO_STATION: dict[str, str] = {
     # NYC variants
@@ -142,8 +271,18 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
     3. Upper bound: "43°F or below" / "49°F or below"
     4. Exceed: "exceed 60°F"
 
-    Returns None if parsing fails.
+    Returns None if parsing fails. Also records the outcome in the rolling
+    failure-rate window so the daily summary can flag title drift.
     """
+    parsed = _parse_polymarket_title_inner(title, current_year=current_year)
+    _record_parse_outcome(success=parsed is not None)
+    if parsed is None:
+        _maybe_alert_parse_failure_rate()
+    return parsed
+
+
+def _parse_polymarket_title_inner(title: str, current_year: int | None = None) -> ParsedMarket | None:
+    """Pure parsing logic — no observability side-effects. See public wrapper."""
     # BugFix M5: Derive current year dynamically instead of hardcoding 2026
     if current_year is None:
         current_year = datetime.now().year
@@ -199,9 +338,11 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         market_type = "daily_low"
 
     # --- Extract threshold/bucket ---
+    # Note: thresholds use (-?\d+) so winter markets like "between -5-0°F"
+    # parse correctly. Greedy match keeps "5-10" → 5,10 and "-5-10" → -5,10.
 
     # Pattern 1: "between X-Y°F" (bucket market)
-    bucket_match = re.search(r'between\s+(\d+)\s*-\s*(\d+)\s*°?\s*f', title_lower)
+    bucket_match = re.search(r'between\s+(-?\d+)\s*-\s*(-?\d+)\s*°?\s*f', title_lower)
     if bucket_match:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,
@@ -211,7 +352,7 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         )
 
     # Pattern 2: "X°F or above" / "X°F or higher" (lower bound)
-    above_match = re.search(r'(\d+)\s*°?\s*f\s+or\s+(?:above|higher)', title_lower)
+    above_match = re.search(r'(-?\d+)\s*°?\s*f\s+or\s+(?:above|higher)', title_lower)
     if above_match:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,
@@ -220,7 +361,7 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         )
 
     # Pattern 3: "X°F or below" / "X°F or lower" (upper bound)
-    below_match = re.search(r'(\d+)\s*°?\s*f\s+or\s+(?:below|lower)', title_lower)
+    below_match = re.search(r'(-?\d+)\s*°?\s*f\s+or\s+(?:below|lower)', title_lower)
     if below_match:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,
@@ -229,7 +370,7 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         )
 
     # Pattern 4: "exceed X°F"
-    exceed_match = re.search(r'exceed\s+(\d+)\s*°?\s*f', title_lower)
+    exceed_match = re.search(r'exceed\s+(-?\d+)\s*°?\s*f', title_lower)
     if exceed_match:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,
@@ -238,7 +379,7 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         )
 
     # Pattern 5: "be X°F" (exact or simple threshold) - less common
-    be_match = re.search(r'be\s+(\d+)\s*°?\s*f', title_lower)
+    be_match = re.search(r'be\s+(-?\d+)\s*°?\s*f', title_lower)
     if be_match:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,
@@ -249,7 +390,7 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
     # --- °C patterns (international markets) ---
 
     # Pattern 1C: "between X-Y°C" (bucket)
-    bucket_c = re.search(r'between\s+(\d+)\s*-\s*(\d+)\s*°?\s*c\b', title_lower)
+    bucket_c = re.search(r'between\s+(-?\d+)\s*-\s*(-?\d+)\s*°?\s*c\b', title_lower)
     if bucket_c:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,
@@ -259,7 +400,7 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         )
 
     # Pattern 2C: "X°C or above/higher"
-    above_c = re.search(r'(\d+)\s*°?\s*c\s+or\s+(?:above|higher)', title_lower)
+    above_c = re.search(r'(-?\d+)\s*°?\s*c\s+or\s+(?:above|higher)', title_lower)
     if above_c:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,
@@ -268,7 +409,7 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         )
 
     # Pattern 3C: "X°C or below/lower"
-    below_c = re.search(r'(\d+)\s*°?\s*c\s+or\s+(?:below|lower)', title_lower)
+    below_c = re.search(r'(-?\d+)\s*°?\s*c\s+or\s+(?:below|lower)', title_lower)
     if below_c:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,
@@ -277,7 +418,7 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         )
 
     # Pattern 4C: "exceed X°C"
-    exceed_c = re.search(r'exceed\s+(\d+)\s*°?\s*c\b', title_lower)
+    exceed_c = re.search(r'exceed\s+(-?\d+)\s*°?\s*c\b', title_lower)
     if exceed_c:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,
@@ -286,7 +427,7 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
         )
 
     # Pattern 5C: "be X°C" (exact/simple)
-    be_c = re.search(r'be\s+(\d+)\s*°?\s*c\b', title_lower)
+    be_c = re.search(r'be\s+(-?\d+)\s*°?\s*c\b', title_lower)
     if be_c:
         return ParsedMarket(
             city=city, station=station, date=date_str, market_type=market_type,

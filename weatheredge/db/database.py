@@ -104,6 +104,9 @@ def init_db(engine: Engine | None = None) -> None:
     _migrate_trades_columns(target)
     # Migrate calibration_records for idempotent per-trade writes.
     _migrate_calibration_records_columns(target)
+    # Migrate signals: add trade_id back-link to enable JOIN from a trade to
+    # the per-agent votes that produced it.
+    _migrate_signals_columns(target)
     log.info("Database tables created (or already exist) at %s", target.url)
 
 
@@ -125,6 +128,12 @@ def _migrate_trades_columns(engine: Engine) -> None:
         if "market_date" not in existing:
             conn.execute(text("ALTER TABLE trades ADD COLUMN market_date TEXT"))
             log.info("Migrated trades table: added 'market_date' column")
+        if "cash_capped" not in existing:
+            # Boolean stored as INTEGER (SQLite convention). Default 0 for
+            # historic rows so the daily-summary fallback heuristic
+            # (amount < 1.0) is the only signal for pre-migration data.
+            conn.execute(text("ALTER TABLE trades ADD COLUMN cash_capped INTEGER DEFAULT 0"))
+            log.info("Migrated trades table: added 'cash_capped' column")
 
 
 def _migrate_calibration_records_columns(engine: Engine) -> None:
@@ -144,6 +153,38 @@ def _migrate_calibration_records_columns(engine: Engine) -> None:
             text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_calibration_records_trade_id "
                 "ON calibration_records(trade_id) WHERE trade_id IS NOT NULL"
+            )
+        )
+
+
+def _migrate_signals_columns(engine: Engine) -> None:
+    """Add trade_id back-link column + index to existing signals table.
+
+    Lets a losing trade be joined back to the per-agent votes that produced it,
+    closing the audit loop. Index speeds up the lookup query."""
+    from sqlalchemy import inspect as sa_inspect
+
+    inspector = sa_inspect(engine)
+    if "signals" not in inspector.get_table_names():
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("signals")}
+    with engine.begin() as conn:
+        if "trade_id" not in existing:
+            conn.execute(text("ALTER TABLE signals ADD COLUMN trade_id INTEGER"))
+            log.info("Migrated signals table: added 'trade_id' column")
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_signals_trade_id "
+                "ON signals(trade_id) WHERE trade_id IS NOT NULL"
+            )
+        )
+        # Lookup index for the back-link UPDATE done after each trade fills:
+        # WHERE market_id = ? AND trade_id IS NULL AND created_at >= ?
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_signals_market_id_trade_id "
+                "ON signals(market_id, trade_id)"
             )
         )
 

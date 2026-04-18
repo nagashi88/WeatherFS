@@ -259,6 +259,119 @@ class TestDecisionLoopStaleness:
         state.paper_trader.cancel_expired_orders.assert_not_called()
 
 
+class TestDecisionLoopMarketPriceStaleness:
+    """Market-price freshness gate (P0). Mirrors weather TTL: trading on a
+    stale book during a Polymarket/Kalshi outage manufactures phantom edge."""
+
+    def test_skips_when_market_prices_older_than_ttl(self):
+        """Loop skips cycle when market_price age > market_data_ttl_minutes."""
+        state = _make_app_state()
+        fresh_age = 10
+        stale_market_age = state.settings.market_data_ttl_minutes + 1
+
+        with _patch_state(state):
+            with patch.object(
+                main_module, "_get_weather_data_age_minutes", return_value=fresh_age
+            ):
+                with patch.object(
+                    main_module,
+                    "_get_market_price_data_age_minutes",
+                    return_value=stale_market_age,
+                ):
+                    run_decision_loop()
+
+        # Returned early — DB reads never happened
+        state.paper_trader.cancel_expired_orders.assert_not_called()
+
+    def test_proceeds_when_market_prices_fresh(self):
+        """Loop runs to completion when market_price age <= TTL."""
+        state = _make_app_state()
+        fresh_age = 10
+        fresh_market_age = state.settings.market_data_ttl_minutes - 1
+
+        with _patch_state(state):
+            with patch.object(
+                main_module, "_get_weather_data_age_minutes", return_value=fresh_age
+            ):
+                with patch.object(
+                    main_module,
+                    "_get_market_price_data_age_minutes",
+                    return_value=fresh_market_age,
+                ):
+                    with patch.object(
+                        main_module, "_read_latest_forecasts", return_value={}
+                    ):
+                        with patch.object(
+                            main_module,
+                            "_read_latest_market_prices",
+                            return_value={},
+                        ):
+                            run_decision_loop()
+
+        state.paper_trader.cancel_expired_orders.assert_called_once()
+
+    def test_proceeds_when_no_market_price_data_yet(self):
+        """First-run case: no market_prices rows → helper returns None →
+        loop must NOT block (the empty-prices path handles this gracefully)."""
+        state = _make_app_state()
+        fresh_age = 10
+
+        with _patch_state(state):
+            with patch.object(
+                main_module, "_get_weather_data_age_minutes", return_value=fresh_age
+            ):
+                with patch.object(
+                    main_module,
+                    "_get_market_price_data_age_minutes",
+                    return_value=None,
+                ):
+                    with patch.object(
+                        main_module, "_read_latest_forecasts", return_value={}
+                    ):
+                        with patch.object(
+                            main_module,
+                            "_read_latest_market_prices",
+                            return_value={},
+                        ):
+                            run_decision_loop()
+
+        state.paper_trader.cancel_expired_orders.assert_called_once()
+
+
+class TestGetMarketPriceDataAgeMinutes:
+    """Direct unit tests for the new freshness helper."""
+
+    def test_returns_none_when_no_rows(self):
+        """Helper returns None when market_prices table has no rows."""
+        with patch.object(main_module, "get_session") as mock_session:
+            session_ctx = MagicMock()
+            session_ctx.__enter__ = MagicMock(return_value=session_ctx)
+            session_ctx.__exit__ = MagicMock(return_value=False)
+            session_ctx.query.return_value.order_by.return_value.first.return_value = None
+            mock_session.return_value = session_ctx
+            assert main_module._get_market_price_data_age_minutes() is None
+
+    def test_computes_age_for_naive_timestamp(self):
+        """Pre-existing rows have naive timestamps; helper must coerce to UTC."""
+        ten_min_ago = datetime.now(timezone.utc) - timedelta(minutes=10)
+        with patch.object(main_module, "get_session") as mock_session:
+            session_ctx = MagicMock()
+            session_ctx.__enter__ = MagicMock(return_value=session_ctx)
+            session_ctx.__exit__ = MagicMock(return_value=False)
+            session_ctx.query.return_value.order_by.return_value.first.return_value = (
+                ten_min_ago.replace(tzinfo=None),
+            )
+            mock_session.return_value = session_ctx
+            age = main_module._get_market_price_data_age_minutes()
+        assert age is not None
+        assert 9.5 < age < 10.5
+
+    def test_returns_none_on_db_error(self):
+        """DB failure must not crash the loop — helper returns None."""
+        with patch.object(main_module, "get_session", side_effect=RuntimeError("boom")):
+            assert main_module._get_market_price_data_age_minutes() is None
+
+
 # ---------------------------------------------------------------------------
 # Gap 7: Decision loop — processes markets with fresh data
 # ---------------------------------------------------------------------------
@@ -744,8 +857,11 @@ class TestSchedulerJobRegistration:
         mock_scheduler.add_job.side_effect = capture_add_job
         mock_scheduler.start = MagicMock()
 
-        # Patch BackgroundScheduler to return our mock
-        monkeypatch.setattr(_main, "BackgroundScheduler", lambda: mock_scheduler)
+        # Patch BackgroundScheduler to return our mock.
+        # Accept arbitrary kwargs (e.g. timezone=) so Fix #1's
+        # `BackgroundScheduler(timezone=timezone.utc)` doesn't blow up the
+        # lambda signature.
+        monkeypatch.setattr(_main, "BackgroundScheduler", lambda *a, **kw: mock_scheduler)
 
         # Patch everything that main() calls before scheduler setup
         with patch.object(_main, "setup_logging"), \
@@ -861,15 +977,15 @@ class TestSchedulerJobRegistration:
         assert job["minute"] == 0
 
     def test_all_eleven_jobs_registered(self, registered_jobs):
-        """13 core jobs + 1 optional bias_correction_refresh when Phase 1 enabled.
+        """14 core jobs + 1 optional bias_correction_refresh when Phase 1 enabled.
 
         Core jobs: market_scan, forecast_poll, actuals_backfill, metar_poll,
         model_run_detector, decision_loop, resolution_check_intraday,
         resolution_check, rmse_recalculation, error_analysis, wallet_profiling,
-        edge_decay_check, morning_briefing.
+        edge_decay_check, morning_briefing, daily_summary.
         """
         from weatheredge.config import MODULES
-        expected = 13 + (1 if MODULES.get("bias_correction", False) else 0)
+        expected = 14 + (1 if MODULES.get("bias_correction", False) else 0)
         assert len(registered_jobs) == expected
 
     def test_bias_correction_refresh_registered_when_enabled(self, registered_jobs):
@@ -1125,7 +1241,7 @@ class TestBotWithoutApiKeys:
 
         mock_scheduler = MagicMock()
         mock_scheduler.start = MagicMock()
-        monkeypatch.setattr(_main, "BackgroundScheduler", lambda: mock_scheduler)
+        monkeypatch.setattr(_main, "BackgroundScheduler", lambda *a, **kw: mock_scheduler)
 
         with patch.object(_main, "setup_logging"), \
              patch.object(_main, "init_db"), \
@@ -2741,7 +2857,7 @@ class TestMainEntrypointExceptions:
 
         mock_scheduler = MagicMock()
         mock_scheduler.start = MagicMock()
-        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda: mock_scheduler)
+        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda *a, **kw: mock_scheduler)
 
         def fake_init_app():
             main_module._state = state
@@ -2781,7 +2897,7 @@ class TestMainEntrypointExceptions:
 
         mock_scheduler = MagicMock()
         mock_scheduler.start = MagicMock()
-        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda: mock_scheduler)
+        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda *a, **kw: mock_scheduler)
 
         def fake_init_app():
             main_module._state = state
@@ -2824,7 +2940,7 @@ class TestMainEntrypointExceptions:
 
         mock_scheduler = MagicMock()
         mock_scheduler.start = MagicMock()
-        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda: mock_scheduler)
+        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda *a, **kw: mock_scheduler)
 
         def fake_init_app():
             main_module._state = state
@@ -2867,7 +2983,7 @@ class TestMainEntrypointExceptions:
 
         mock_scheduler = MagicMock()
         mock_scheduler.start = MagicMock()
-        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda: mock_scheduler)
+        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda *a, **kw: mock_scheduler)
 
         def fake_init_app():
             main_module._state = state
@@ -2910,7 +3026,7 @@ class TestMainEntrypointExceptions:
 
         mock_scheduler = MagicMock()
         mock_scheduler.start = MagicMock()
-        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda: mock_scheduler)
+        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda *a, **kw: mock_scheduler)
 
         def fake_init_app():
             main_module._state = state
@@ -2954,7 +3070,7 @@ class TestMainEntrypointExceptions:
 
         mock_scheduler = MagicMock()
         mock_scheduler.start = MagicMock()
-        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda: mock_scheduler)
+        monkeypatch.setattr(main_module, "BackgroundScheduler", lambda *a, **kw: mock_scheduler)
 
         def fake_init_app():
             main_module._state = state

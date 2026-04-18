@@ -6,11 +6,13 @@ Covers:
 - Edge field uses net_edge for buy_yes / net_edge_no for buy_no, None for no_trade
 - Empty input is a no-op
 - Missing opportunity gracefully degrades to None fields
-- Persistence uses bulk_save_objects (single round-trip)
+- Persistence uses add_all+flush (single round-trip + IDs)
+- _link_signals_to_trade back-link populates signals.trade_id by primary key
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -19,7 +21,7 @@ from sqlalchemy import select
 from weatheredge.agents.base import MarketOpportunity, Signal
 from weatheredge.db.database import get_session, init_db, make_engine
 from weatheredge.db.models import Signal as SignalRow
-from weatheredge.main import _persist_signals
+from weatheredge.main import _link_signals_to_trade, _persist_signals
 
 
 @pytest.fixture()
@@ -201,3 +203,142 @@ def test_empty_agent_name_falls_back_to_unknown(engine, patched_session):
     rows = _read_all(engine)
     assert len(rows) == 1
     assert rows[0]["agent_name"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# _link_signals_to_trade — P1 fix #4 back-link
+# ---------------------------------------------------------------------------
+
+
+def _read_trade_ids(engine) -> dict[int, int | None]:
+    with get_session(engine=engine) as session:
+        rows = session.execute(select(SignalRow)).scalars().all()
+        return {r.id: r.trade_id for r in rows}
+
+
+def test_back_link_after_successful_trade(engine, patched_session):
+    """The signals from this cycle get their trade_id populated when a trade
+    fills. Lets a losing trade JOIN back to every per-agent vote later.
+
+    Fix #8 changed the linking contract from a time-window filter
+    (`created_at >= cycle_start`) to explicit primary-key lookup using IDs
+    returned by `_persist_signals`. The new test threads IDs end-to-end."""
+    sigs = {
+        "mkt1": [
+            Signal(market_id="mkt1", side="buy_yes", confidence=0.8, agent_name="Aggressive"),
+            Signal(market_id="mkt1", side="buy_yes", confidence=0.6, agent_name="Conservative"),
+        ],
+    }
+    ids_by_market = _persist_signals(sigs, {"mkt1": _opp("mkt1")})
+    assert len(ids_by_market["mkt1"]) == 2
+
+    updated = _link_signals_to_trade(42, ids_by_market["mkt1"])
+
+    assert updated == 2
+    trade_ids = _read_trade_ids(engine)
+    assert all(tid == 42 for tid in trade_ids.values())
+
+
+def test_link_does_not_touch_other_markets(engine, patched_session):
+    """Signals belonging to a different market stay untouched — only the IDs
+    explicitly passed are mutated."""
+    sigs = {
+        "mkt_kept": [Signal(market_id="mkt_kept", side="buy_yes", confidence=0.7, agent_name="Aggressive")],
+        "mkt_other": [Signal(market_id="mkt_other", side="buy_yes", confidence=0.5, agent_name="Aggressive")],
+    }
+    ids_by_market = _persist_signals(
+        sigs, {"mkt_kept": _opp("mkt_kept"), "mkt_other": _opp("mkt_other")}
+    )
+
+    updated = _link_signals_to_trade(99, ids_by_market["mkt_kept"])
+
+    assert updated == 1
+    with get_session(engine=engine) as session:
+        rows = session.execute(select(SignalRow)).scalars().all()
+        by_market = {r.market_id: r.trade_id for r in rows}
+    assert by_market["mkt_kept"] == 99
+    assert by_market["mkt_other"] is None
+
+
+def test_link_does_not_touch_stale_pre_cycle_signals(engine, patched_session):
+    """Signals written before the cycle must NOT be relinked.
+
+    Under Fix #8 the protection is structural rather than time-based: only
+    the IDs returned by *this* cycle's `_persist_signals` call are passed
+    in, so a stale row from a previous cycle is invisible to the linker."""
+    # Write a stale signal (simulates a previous cycle's leftover NULL row).
+    stale_ts = datetime.now(timezone.utc) - timedelta(minutes=10)
+    with get_session(engine=engine) as session:
+        session.add(SignalRow(
+            market_id="mkt1",
+            agent_name="StaleAgent",
+            signal_type="buy_yes",
+            created_at=stale_ts,
+        ))
+
+    ids_by_market = _persist_signals(
+        {"mkt1": [Signal(market_id="mkt1", side="buy_yes", confidence=0.8, agent_name="FreshAgent")]},
+        {"mkt1": _opp("mkt1")},
+    )
+
+    updated = _link_signals_to_trade(7, ids_by_market["mkt1"])
+
+    assert updated == 1
+    with get_session(engine=engine) as session:
+        rows = session.execute(select(SignalRow)).scalars().all()
+        by_agent = {r.agent_name: r.trade_id for r in rows}
+    assert by_agent["FreshAgent"] == 7
+    assert by_agent["StaleAgent"] is None  # untouched
+
+
+def test_link_skips_already_linked_signals(engine, patched_session):
+    """If a signal already has a trade_id (rare, but defensive), do not overwrite.
+
+    The `trade_id IS NULL` filter inside `_link_signals_to_trade` is the
+    safety net — even if a stale ID gets passed in, an existing link wins."""
+    # Insert two signals manually and capture IDs via flush.
+    with get_session(engine=engine) as session:
+        already = SignalRow(
+            market_id="mkt1",
+            agent_name="AlreadyLinked",
+            signal_type="buy_yes",
+            trade_id=111,
+            created_at=datetime.now(timezone.utc),
+        )
+        unlinked = SignalRow(
+            market_id="mkt1",
+            agent_name="Unlinked",
+            signal_type="buy_yes",
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add_all([already, unlinked])
+        session.flush()
+        already_id = int(already.id)
+        unlinked_id = int(unlinked.id)
+
+    # Pass BOTH IDs — the filter should preserve the already-linked row.
+    updated = _link_signals_to_trade(222, [already_id, unlinked_id])
+
+    assert updated == 1
+    with get_session(engine=engine) as session:
+        rows = session.execute(select(SignalRow)).scalars().all()
+        by_agent = {r.agent_name: r.trade_id for r in rows}
+    assert by_agent["AlreadyLinked"] == 111  # preserved
+    assert by_agent["Unlinked"] == 222
+
+
+def test_link_returns_zero_on_missing_inputs(engine, patched_session):
+    """Defensive: trade_id=0 or empty signal_ids must short-circuit and never
+    issue a wildcard UPDATE."""
+    ids_by_market = _persist_signals(
+        {"mkt1": [Signal(market_id="mkt1", side="buy_yes", confidence=0.7, agent_name="A")]},
+        {"mkt1": _opp("mkt1")},
+    )
+    sig_ids = ids_by_market["mkt1"]
+
+    assert _link_signals_to_trade(0, sig_ids) == 0
+    assert _link_signals_to_trade(1, []) == 0
+
+    # Confirm nothing was relinked.
+    trade_ids = _read_trade_ids(engine)
+    assert all(tid is None for tid in trade_ids.values())

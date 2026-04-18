@@ -22,8 +22,23 @@ from unittest.mock import MagicMock
 import pytest
 
 from weatheredge.config import Settings
-from weatheredge.data.market_parser import ParsedMarket, parse_polymarket_title
+from weatheredge.data import market_parser as mp_module
+from weatheredge.data.market_parser import (
+    ParsedMarket,
+    get_parse_failure_stats,
+    parse_polymarket_title,
+    reset_parse_history_for_tests,
+)
 from weatheredge.data.market import MarketScanner
+
+
+@pytest.fixture(autouse=True)
+def _clean_parse_history():
+    """Each test starts with an empty rolling parse-failure window so the
+    new failure-rate observability does not bleed between tests."""
+    reset_parse_history_for_tests()
+    yield
+    reset_parse_history_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -309,3 +324,188 @@ def test_process_market_uses_parser(scanner):
     assert "parsed" in result
     assert result["parsed"].threshold_low == 50.0
     assert result["parsed"].threshold_high == 51.0
+
+
+# ---------------------------------------------------------------------------
+# Negative thresholds (P1 fix) — winter US-mountain markets routinely list
+# buckets like [-5, 0]. The pre-fix regex `(\d+)` silently dropped these.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("title,expected_low,expected_high", [
+    (
+        "Will the highest temperature in Chicago be between -5-0°F on January 15?",
+        -5.0, 0.0,
+    ),
+    (
+        "Will the highest temperature in Denver be between -10--5°F on January 20?",
+        -10.0, -5.0,
+    ),
+    (
+        "Will the highest temperature in NYC be between -3-2°F on February 1?",
+        -3.0, 2.0,
+    ),
+])
+def test_parse_negative_bucket(title, expected_low, expected_high):
+    result = parse_polymarket_title(title)
+    assert result is not None, f"Failed to parse: {title}"
+    assert result.threshold_low == expected_low
+    assert result.threshold_high == expected_high
+    assert result.threshold is None
+
+
+@pytest.mark.parametrize("title,expected_threshold", [
+    ("Will the highest temperature in Chicago be -5°F or above on January 15?", -5.0),
+    ("Will the highest temperature in Denver be -10°F or higher on January 20?", -10.0),
+])
+def test_parse_negative_above(title, expected_threshold):
+    result = parse_polymarket_title(title)
+    assert result is not None, f"Failed to parse: {title}"
+    assert result.threshold == expected_threshold
+    assert result.direction == "above"
+
+
+@pytest.mark.parametrize("title,expected_threshold", [
+    ("Will the highest temperature in Chicago be -5°F or below on January 15?", -5.0),
+    ("Will the highest temperature in Denver be -10°F or lower on January 20?", -10.0),
+])
+def test_parse_negative_below(title, expected_threshold):
+    result = parse_polymarket_title(title)
+    assert result is not None, f"Failed to parse: {title}"
+    assert result.threshold == expected_threshold
+    assert result.direction == "below"
+
+
+def test_parse_negative_exceed():
+    result = parse_polymarket_title(
+        "Will the highest temperature in Denver exceed -5°F on January 20?"
+    )
+    assert result is not None
+    assert result.threshold == -5.0
+    assert result.direction == "above"
+
+
+def test_parse_negative_celsius_bucket():
+    """°C markets also need negative support (every continental winter)."""
+    result = parse_polymarket_title(
+        "Will the highest temperature in Helsinki be between -10--5°C on January 15?"
+    )
+    # Helsinki is in KNOWN_UNTRADABLE_CITIES so this won't parse to a city,
+    # but Amsterdam is also untradable. Use a tradable city instead:
+    result = parse_polymarket_title(
+        "Will the highest temperature in NYC be between -10--5°C on January 15?"
+    )
+    assert result is not None
+    assert result.threshold_low == -10.0
+    assert result.threshold_high == -5.0
+    assert result.unit == "C"
+
+
+def test_parse_positive_bucket_not_misread_as_negative():
+    """Regression: greedy `(-?\\d+)` must not steal a leading `-` that's
+    actually the bucket separator. 'between 5-10°F' must remain (5, 10),
+    NOT (5, -10) or (5-1, 0)."""
+    result = parse_polymarket_title(
+        "Will the highest temperature in NYC be between 5-10°F on January 15?"
+    )
+    assert result is not None
+    assert result.threshold_low == 5.0
+    assert result.threshold_high == 10.0
+
+
+# ---------------------------------------------------------------------------
+# P2 — parse-failure rate observability
+# ---------------------------------------------------------------------------
+
+
+def test_parse_failure_stats_zero_when_no_attempts():
+    stats = get_parse_failure_stats()
+    assert stats == {"attempts": 0, "failures": 0, "failure_rate": 0.0}
+
+
+def test_parse_failure_stats_records_success_and_failure():
+    parse_polymarket_title("Will the highest temperature in NYC be 50°F or above on April 4?")
+    parse_polymarket_title("totally garbage title — no city, no date, no threshold")
+    parse_polymarket_title("Will the highest temperature in Chicago be 50°F or above on April 4?")
+    stats = get_parse_failure_stats()
+    assert stats["attempts"] == 3
+    assert stats["failures"] == 1
+    assert stats["failure_rate"] == pytest.approx(1 / 3)
+
+
+def test_parse_failure_alert_fires_above_threshold(caplog):
+    """30% failure rate over the rolling window must emit one throttled WARNING."""
+    # Need at least _PARSE_FAILURE_MIN_SAMPLES attempts.
+    for _ in range(15):
+        parse_polymarket_title("Will the highest temperature in NYC be 50°F or above on April 4?")
+    # Add 10 unparseable titles → 10/25 = 40% failure rate, above 30%.
+    with caplog.at_level(logging.WARNING, logger="weatheredge.data.market_parser"):
+        for _ in range(10):
+            parse_polymarket_title("malformed " + "x" * 5)
+
+    warnings = [r for r in caplog.records if "PARSE_FAILURE_RATE_HIGH" in r.message]
+    assert len(warnings) >= 1, "Expected at least one rate-high WARNING"
+    # Throttle: cooldown means we must NOT see N warnings — at most a couple.
+    assert len(warnings) <= 3
+
+
+def test_parse_failure_alert_silent_below_threshold(caplog):
+    """A small number of failures — under the 30% threshold — must stay silent."""
+    # 25 attempts, 4 failures → 16% (below 30%).
+    for _ in range(21):
+        parse_polymarket_title("Will the highest temperature in NYC be 50°F or above on April 4?")
+    with caplog.at_level(logging.WARNING, logger="weatheredge.data.market_parser"):
+        for _ in range(4):
+            parse_polymarket_title("malformed nope")
+
+    warnings = [r for r in caplog.records if "PARSE_FAILURE_RATE_HIGH" in r.message]
+    assert warnings == []
+
+
+def test_parse_failure_alert_silent_below_min_samples(caplog):
+    """Even at 100% failure rate, warning is suppressed until min_samples reached.
+
+    Threshold is _PARSE_FAILURE_MIN_SAMPLES (currently 5); with strictly
+    fewer attempts than that, no warning fires regardless of failure rate.
+    """
+    with caplog.at_level(logging.WARNING, logger="weatheredge.data.market_parser"):
+        # 4 failures only — strictly under min_samples=5.
+        for _ in range(mp_module._PARSE_FAILURE_MIN_SAMPLES - 1):
+            parse_polymarket_title("totally bogus title")
+    warnings = [r for r in caplog.records if "PARSE_FAILURE_RATE_HIGH" in r.message]
+    assert warnings == []
+
+
+def test_parse_failure_alert_throttled(caplog):
+    """Once fired, the WARNING must be throttled by the cooldown — no flood."""
+    for _ in range(15):
+        parse_polymarket_title("Will the highest temperature in NYC be 50°F or above on April 4?")
+    with caplog.at_level(logging.WARNING, logger="weatheredge.data.market_parser"):
+        for _ in range(50):  # many more failures
+            parse_polymarket_title("malformed nope " + str(_))
+    warnings = [r for r in caplog.records if "PARSE_FAILURE_RATE_HIGH" in r.message]
+    # Cooldown is 5 minutes — within a single test run we should see exactly 1.
+    assert len(warnings) == 1
+
+
+def test_parse_failure_window_pruning():
+    """Records older than the window must not count toward the failure rate.
+
+    History tuples now use `time.monotonic()` (float seconds since process
+    start) instead of UTC datetimes — this makes pruning robust against
+    backward NTP clock jumps. Backdate the entry to "2 hours ago" by
+    subtracting from its monotonic timestamp.
+    """
+    parse_polymarket_title("malformed first")
+    # Manually backdate the only entry beyond the window (1h).
+    with mp_module._PARSE_LOCK:
+        ts, ok = mp_module._PARSE_HISTORY[0]
+        mp_module._PARSE_HISTORY[0] = (
+            ts - 2 * 3600,  # 2 hours into the past, well outside the 1h window
+            ok,
+        )
+
+    # A fresh attempt triggers the prune.
+    parse_polymarket_title("Will the highest temperature in NYC be 50°F or above on April 4?")
+    stats = get_parse_failure_stats()
+    assert stats["attempts"] == 1  # old failure pruned, only the success counts
+    assert stats["failures"] == 0

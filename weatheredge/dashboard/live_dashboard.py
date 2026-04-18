@@ -78,14 +78,57 @@ def _scalar(conn: sqlite3.Connection, sql: str, params: tuple = (), default: flo
 # ---------------------------------------------------------------------------
 
 def query_open_positions(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Open positions joined with the latest YES price for unrealized P&L.
+
+    `current_yes` is NULL when no recent non-NULL price exists for the market
+    (e.g. scraper outage). The previous COALESCE(lp.yes_price, t.price) hid
+    the outage by silently substituting the entry price, making positions
+    look perfectly flat ($0 unrealized) when in reality the bot was flying
+    blind. Returning NULL forces the renderer to show STALE so the operator
+    can react.
+    """
     return _safe_fetchall(
         conn,
         """
-        SELECT market_id, side, price, amount, cost, agent_name,
-               created_at, model_probability, edge_at_entry
+        SELECT t.market_id, t.side, t.price, t.amount, t.cost, t.agent_name,
+               t.created_at, t.model_probability, t.edge_at_entry,
+               lp.yes_price AS current_yes
+        FROM trades t
+        LEFT JOIN (
+            SELECT market_id, yes_price,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY market_id ORDER BY timestamp DESC, id DESC
+                   ) AS rn
+            FROM market_prices
+            WHERE market_id IS NOT NULL
+              AND yes_price IS NOT NULL
+        ) lp ON t.market_id = lp.market_id AND lp.rn = 1
+        WHERE t.status = 'open'
+        ORDER BY t.created_at DESC
+        """,
+    )
+
+
+def query_per_agent_pnl(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Per-agent realized P&L over all resolved trades.
+
+    Sorted by P&L descending so the table reads top-down "best agent first".
+    Includes early-exit statuses since they realize P&L too.
+    """
+    return _safe_fetchall(
+        conn,
+        """
+        SELECT
+            COALESCE(agent_name, 'unknown')                         AS agent,
+            COUNT(*)                                                AS resolved,
+            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)                AS wins,
+            SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END)               AS losses,
+            COALESCE(SUM(pnl), 0)                                   AS total_pnl
         FROM trades
-        WHERE status = 'open'
-        ORDER BY created_at DESC
+        WHERE status IN ('won','lost','edge_stop','capital_protect','time_decay','ev_based','abandoned')
+          AND pnl IS NOT NULL
+        GROUP BY COALESCE(agent_name, 'unknown')
+        ORDER BY total_pnl DESC
         """,
     )
 
@@ -156,7 +199,13 @@ def query_performance(conn: sqlite3.Connection) -> dict:
 
 
 def query_unrealized_pnl(conn: sqlite3.Connection) -> dict:
-    """Calculate unrealized P&L by comparing open positions to current market prices."""
+    """Calculate unrealized P&L by comparing open positions to current market prices.
+
+    Positions whose latest non-NULL `yes_price` is unavailable (scraper outage,
+    market just opened, etc.) are excluded from the totals AND counted in
+    `stale_positions`. The previous fallback to entry price made these read as
+    perfectly flat $0 P&L, which masked outages and lied to the operator.
+    """
     rows = _safe_fetchall(
         conn,
         """
@@ -166,7 +215,9 @@ def query_unrealized_pnl(conn: sqlite3.Connection) -> dict:
         LEFT JOIN (
             SELECT market_id, yes_price,
                    ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY timestamp DESC, id DESC) AS rn
-            FROM market_prices WHERE market_id IS NOT NULL
+            FROM market_prices
+            WHERE market_id IS NOT NULL
+              AND yes_price IS NOT NULL
         ) lp ON t.market_id = lp.market_id AND lp.rn = 1
         WHERE t.status = 'open'
         """,
@@ -174,16 +225,23 @@ def query_unrealized_pnl(conn: sqlite3.Connection) -> dict:
     total_cost = 0.0
     total_value = 0.0
     positions = 0
+    stale = 0
     for r in rows:
+        positions += 1
+        if r["current_yes"] is None:
+            # No recent price → exclude from P&L totals so we don't print a
+            # confident-looking $0; surface the count so operators see how
+            # many positions are unmarkable.
+            stale += 1
+            continue
         cost = float(r["cost"] or 0)
         amount = float(r["amount"] or 0)
-        current_yes = float(r["current_yes"]) if r["current_yes"] is not None else float(r["price"] or 0)
+        current_yes = float(r["current_yes"])
         total_cost += cost
         if r["side"] == "buy_yes":
             total_value += current_yes * amount
         else:
             total_value += (1.0 - current_yes) * amount
-        positions += 1
     unrealized = total_value - total_cost
     pct = (unrealized / total_cost * 100.0) if total_cost > 0 else 0.0
     return {
@@ -192,6 +250,7 @@ def query_unrealized_pnl(conn: sqlite3.Connection) -> dict:
         "total_cost": total_cost,
         "total_value": total_value,
         "open_positions": positions,
+        "stale_positions": stale,
     }
 
 
@@ -436,6 +495,7 @@ def build_header_panel(
     unr_pnl = unrealized.get("unrealized_pnl", 0.0) if unrealized else 0.0
     unr_pct = unrealized.get("unrealized_pct", 0.0) if unrealized else 0.0
     open_positions = unrealized.get("open_positions", 0) if unrealized else 0
+    stale_positions = unrealized.get("stale_positions", 0) if unrealized else 0
 
     # Bankroll = initial + realized P&L + unrealized P&L
     bankroll = initial_bankroll + total_pnl + unr_pnl
@@ -471,10 +531,40 @@ def build_header_panel(
         f"  Unrealized: {unr_sign}${unr_pnl:,.2f} ({unr_pct_sign}{unr_pct:.1f}%)",
         style=f"bold {unr_color}",
     )
-    line.append(f"  Positions: {open_positions}", style="bold yellow")
+    if stale_positions:
+        line.append(
+            f"  Positions: {open_positions} ({stale_positions} STALE)",
+            style="bold yellow",
+        )
+    else:
+        line.append(f"  Positions: {open_positions}", style="bold yellow")
     line.append(f"  Win Rate: {wr_str}", style="bold")
 
     return Panel(line, style="bold blue", padding=(0, 1))
+
+
+def _row_unrealized_pnl(row: sqlite3.Row) -> float | None:
+    """Per-position mark-to-market P&L using the latest YES price.
+
+    Returns None when the row lacks the joined `current_yes` column or any of
+    the price/amount/cost values are unusable, so the table cell can render
+    as '-' without crashing.
+    """
+    try:
+        side = str(row["side"] or "")
+        amount = float(row["amount"] or 0)
+        cost = float(row["cost"] or 0)
+        current_yes = row["current_yes"]
+        if current_yes is None:
+            return None
+        current_yes = float(current_yes)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if side == "buy_yes":
+        return current_yes * amount - cost
+    if side == "buy_no":
+        return (1.0 - current_yes) * amount - cost
+    return None
 
 
 def build_open_positions_panel(rows: list[sqlite3.Row]) -> Panel:
@@ -490,22 +580,36 @@ def build_open_positions_panel(rows: list[sqlite3.Row]) -> Panel:
     table.add_column("Price", justify="right", width=6)
     table.add_column("Amount", justify="right", width=7)
     table.add_column("Cost", justify="right", width=7)
+    table.add_column("Unr. P&L", justify="right", width=9)
     table.add_column("Agent", style="dim", max_width=14)
     table.add_column("Entered", style="dim", width=12)
 
     if not rows:
-        table.add_row(Text("Waiting for data...", style="dim"), "", "", "", "", "", "")
+        table.add_row(Text("Waiting for data...", style="dim"), "", "", "", "", "", "", "")
     else:
         for row in rows:
             side_text = Text(str(row["side"] or "-"))
             side_style = "green" if "yes" in str(row["side"] or "").lower() else "yellow"
             side_text.stylize(side_style)
+            unrealized = _row_unrealized_pnl(row)
+            if unrealized is not None:
+                unr_cell = _fmt_pnl(unrealized)
+            else:
+                # Distinguish "stale price" (no current_yes from scraper) from
+                # the rare malformed-row case so operators know to investigate
+                # the scraper rather than the trade itself.
+                try:
+                    is_stale = row["current_yes"] is None
+                except (KeyError, IndexError):
+                    is_stale = False
+                unr_cell = Text("STALE" if is_stale else "-", style="bold yellow" if is_stale else "dim")
             table.add_row(
                 str(row["market_id"] or "-")[-22:],
                 side_text,
                 _fmt_price(row["price"]),
                 _fmt_price(row["amount"]),
                 _fmt_price(row["cost"]),
+                unr_cell,
                 str(row["agent_name"] or "-")[:14],
                 _fmt_ts(row["created_at"])[-12:],
             )
@@ -514,6 +618,43 @@ def build_open_positions_panel(rows: list[sqlite3.Row]) -> Panel:
         table,
         title=f"[bold]OPEN POSITIONS ({len(rows)})[/bold]",
         border_style="cyan",
+        padding=(0, 0),
+    )
+
+
+def build_per_agent_pnl_panel(rows: list[sqlite3.Row]) -> Panel:
+    """Per-agent realized P&L panel — surfaces which agent is making/losing money."""
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        box=None,
+        padding=(0, 1),
+        expand=True,
+    )
+    table.add_column("Agent", style="white", max_width=14)
+    table.add_column("W/L", justify="right", width=8)
+    table.add_column("Resolved", justify="right", width=9)
+    table.add_column("P&L", justify="right", width=10)
+
+    if not rows:
+        table.add_row(Text("Waiting for data...", style="dim"), "", "", "")
+    else:
+        for row in rows:
+            wins = int(row["wins"] or 0)
+            losses = int(row["losses"] or 0)
+            resolved = int(row["resolved"] or 0)
+            pnl = float(row["total_pnl"] or 0)
+            table.add_row(
+                str(row["agent"] or "-")[:14],
+                f"{wins}/{losses}",
+                str(resolved),
+                _fmt_pnl(pnl),
+            )
+
+    return Panel(
+        table,
+        title="[bold]PER-AGENT P&L[/bold]",
+        border_style="magenta",
         padding=(0, 0),
     )
 
@@ -715,6 +856,7 @@ def build_layout(
     recent_trades: Panel,
     active_markets: Panel,
     pnl_history: Panel,
+    per_agent_pnl: Panel,
 ) -> Layout:
     layout = Layout()
 
@@ -727,12 +869,18 @@ def build_layout(
 
     layout["header"].update(header)
 
+    # Middle row now has three columns: open positions on the left, model
+    # performance in the middle, per-agent P&L on the right. Ratios chosen so
+    # the agent table gets enough width for $-amounts without crowding the
+    # market column in the open-positions table.
     layout["middle"].split_row(
-        Layout(name="open_pos", ratio=1),
+        Layout(name="open_pos", ratio=2),
         Layout(name="model_perf", ratio=1),
+        Layout(name="per_agent", ratio=1),
     )
     layout["middle"]["open_pos"].update(open_positions)
     layout["middle"]["model_perf"].update(model_perf)
+    layout["middle"]["per_agent"].update(per_agent_pnl)
 
     layout["recent"].update(recent_trades)
 
@@ -782,6 +930,7 @@ class LiveDashboard:
                 market_rows = query_active_markets(conn)
                 daily_pnl = query_daily_pnl(conn)
                 unrealized = query_unrealized_pnl(conn)
+                per_agent_rows = query_per_agent_pnl(conn)
             else:
                 open_rows = []
                 recent_rows = []
@@ -795,6 +944,7 @@ class LiveDashboard:
                 market_rows = []
                 daily_pnl = []
                 unrealized = None
+                per_agent_rows = []
         finally:
             if conn is not None:
                 conn.close()
@@ -805,8 +955,12 @@ class LiveDashboard:
         recent_trades = build_recent_trades_panel(recent_rows)
         active_markets = build_active_markets_panel(market_rows)
         pnl_history = build_pnl_history_panel(daily_pnl)
+        per_agent_pnl = build_per_agent_pnl_panel(per_agent_rows)
 
-        return build_layout(header, open_positions, model_perf, recent_trades, active_markets, pnl_history)
+        return build_layout(
+            header, open_positions, model_perf, recent_trades,
+            active_markets, pnl_history, per_agent_pnl,
+        )
 
     def run(self) -> None:
         console = Console()

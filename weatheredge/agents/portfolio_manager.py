@@ -322,9 +322,11 @@ class PortfolioManager:
             # one cycle cannot deploy more than the user actually has. Round DOWN
             # to nearest 0.01 contract to avoid floating-point overshoot.
             per_contract_cost = (1.0 - market_price) if majority_side == "buy_no" else market_price
+            cash_capped = False
             if per_contract_cost > 0 and remaining_cash < amount * per_contract_cost:
                 cap_amount = remaining_cash / per_contract_cost
                 amount = math.floor(cap_amount * 100) / 100
+                cash_capped = True
                 log.info(
                     "Cash-cap: market=%s amount reduced to %.2f (remaining_cash=%.2f, per_contract=%.4f)",
                     market_id, amount, remaining_cash, per_contract_cost,
@@ -350,6 +352,7 @@ class PortfolioManager:
                 ensemble_prob=opp.ensemble_prob if opp else None,
                 blended_prob=opp.blended_prob if opp else None,
                 raw_model_prob=opp.raw_model_prob if opp else None,
+                cash_capped=cash_capped,
             )
             orders.append(order)
 

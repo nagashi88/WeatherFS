@@ -83,6 +83,10 @@ class Signal(Base):
     edge: Mapped[float | None] = mapped_column(Float)
     confidence: Mapped[float | None] = mapped_column(Float)
     reasoning: Mapped[str | None] = mapped_column(Text)
+    # Back-link to the resulting trade. NULL when the aggregator chose not to
+    # trade or no signal carried this market over threshold. Lets a losing trade
+    # JOIN back to every per-agent vote that produced it for post-fact diagnosis.
+    trade_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("trades.id"))
     created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -125,6 +129,11 @@ class Trade(Base):
     pnl: Mapped[float | None] = mapped_column(Float)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # True when PortfolioManager reduced this trade's amount to fit available
+    # cash (the cap path floors size to 0.01 increments). Replaces the older
+    # "amount < 1.0" heuristic in daily_summary so a legitimately small
+    # full-size order isn't misreported as a cash-cap event.
+    cash_capped: Mapped[bool | None] = mapped_column(Boolean, default=False)
 
 
 class DailyPerformance(Base):

@@ -790,6 +790,26 @@ def _run_decision_cycle(state: AppState) -> None:
 
     log.debug("run_decision_loop: weather data age=%dm (TTL=%dm)", weather_age_minutes, ttl)
 
+    # Market-price freshness gate: trading on a stale book during a Polymarket /
+    # Kalshi outage would manufacture phantom edge against prices that already
+    # moved. Mirror the weather TTL check.
+    market_price_age_minutes = _get_market_price_data_age_minutes()
+    if market_price_age_minutes is not None:
+        market_ttl = state.settings.market_data_ttl_minutes
+        if market_price_age_minutes > market_ttl:
+            log.warning(
+                "run_decision_loop: market price data stale (%.1fm > %dm TTL) — skipping cycle",
+                market_price_age_minutes,
+                market_ttl,
+            )
+            return
+        log.debug(
+            "run_decision_loop: market price age=%.1fm (TTL=%dm)",
+            market_price_age_minutes, market_ttl,
+        )
+    # If None (no rows yet) we don't block — the no-prices branch below already
+    # handles that case with a clear "no trades this cycle" log.
+
     # --- (b) Read latest forecasts + market prices ---
     try:
         forecasts = _read_latest_forecasts()
@@ -1107,8 +1127,11 @@ def _run_decision_cycle(state: AppState) -> None:
     # Persist per-agent signals BEFORE aggregation so the audit trail survives
     # an aggregator crash. Best-effort: failures are logged at DEBUG and never
     # block trading.
+    # Signal IDs per market — used to back-link the resulting trade by PK
+    # (not by time window, which races with overlapping cycles).
+    _signal_ids_by_market: dict[str, list[int]] = {}
     try:
-        _persist_signals(signals_by_market, opportunities)
+        _signal_ids_by_market = _persist_signals(signals_by_market, opportunities)
     except Exception as exc:
         log.debug("run_decision_loop: signal persistence failed: %s", exc)
 
@@ -1189,6 +1212,7 @@ def _run_decision_cycle(state: AppState) -> None:
                 blended_prob=trade_order.blended_prob,
                 raw_model_prob=trade_order.raw_model_prob,
                 order_type=trade_order.order_type,
+                cash_capped=trade_order.cash_capped,
             )
             result = state.paper_trader.place_order(order)
             if result.get("filled") or result.get("pending"):
@@ -1224,6 +1248,19 @@ def _run_decision_cycle(state: AppState) -> None:
                         state,
                         result.get("trade"),
                         source="market_fill",
+                    )
+                # Back-link the signals from this cycle to the trade row so
+                # losing trades can be audited against the per-agent votes
+                # that produced them. Best-effort, never blocks trading.
+                try:
+                    _db_id = int(result.get("trade", {}).get("db_id", 0) or 0)
+                    _sig_ids = _signal_ids_by_market.get(trade_order.market_id, [])
+                    if _db_id and _sig_ids:
+                        _link_signals_to_trade(_db_id, _sig_ids)
+                except Exception as exc:
+                    log.debug(
+                        "run_decision_loop: signal back-link failed for %s: %s",
+                        trade_order.market_id, exc,
                     )
             else:
                 log.warning(
@@ -1360,6 +1397,32 @@ def _get_weather_data_age_minutes() -> float | None:
         return age
     except Exception as exc:
         log.warning("_get_weather_data_age_minutes: DB error: %s", exc)
+        return None
+
+
+def _get_market_price_data_age_minutes() -> float | None:
+    """Return age of most recent market_prices row in minutes, or None if no data.
+
+    Mirrors weather freshness check. If the Polymarket/Kalshi fetcher dies but
+    the forecast fetcher keeps running, run_decision_loop would otherwise
+    happily trade against a stale book and manufacture phantom edge.
+    """
+    try:
+        with get_session() as session:
+            row = (
+                session.query(MarketPrice.timestamp)
+                .order_by(MarketPrice.timestamp.desc())
+                .first()
+            )
+        if row is None:
+            return None
+        ts: datetime = row[0]
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+        return age
+    except Exception as exc:
+        log.warning("_get_market_price_data_age_minutes: DB error: %s", exc)
         return None
 
 
@@ -1574,21 +1637,26 @@ def _read_latest_market_prices() -> dict[str, dict]:
 def _persist_signals(
     signals_by_market: dict[str, list[Signal]],
     opportunities: dict[str, MarketOpportunity],
-) -> None:
+) -> dict[str, list[int]]:
     """Persist per-agent signals to the `signals` table for post-fact audit.
 
     Captures every vote (including no_trade) so downstream analysis can attribute
     profitability to specific agents and detect systematic disagreement patterns.
     Best-effort: callers must guard with their own try/except — DB failures here
     must NOT block the trading decision loop.
+
+    Returns {market_id: [signal_id, ...]} for the rows that were just written,
+    so callers can back-link to the resulting trade by primary key rather than
+    time-window (which races with overlapping cycles — CCG-bug-8).
     """
     from weatheredge.db.models import Signal as SignalRow
 
-    rows: list[SignalRow] = []
+    rows_by_market: dict[str, list[SignalRow]] = {}
     for market_id, sigs in signals_by_market.items():
         opp = opportunities.get(market_id)
         market_price = opp.market_price if opp else None
         model_probability = opp.model_probability if opp else None
+        market_rows: list[SignalRow] = []
         for sig in sigs:
             edge: float | None = None
             if opp is not None and sig.side != "no_trade":
@@ -1596,7 +1664,7 @@ def _persist_signals(
                     edge = opp.net_edge
                 elif sig.side == "buy_no":
                     edge = opp.net_edge_no
-            rows.append(SignalRow(
+            market_rows.append(SignalRow(
                 market_id=market_id,
                 agent_name=sig.agent_name or "unknown",
                 signal_type=sig.side,
@@ -1606,11 +1674,64 @@ def _persist_signals(
                 confidence=sig.confidence,
                 reasoning=sig.reasoning or None,
             ))
-    if not rows:
-        return
+        if market_rows:
+            rows_by_market[market_id] = market_rows
+
+    if not rows_by_market:
+        return {}
+    all_rows = [r for rows in rows_by_market.values() for r in rows]
+    # add_all + flush populates primary keys (bulk_save_objects skips them).
+    # The flush must happen inside the session so the IDs are read before
+    # commit; the session context manager commits on clean exit.
     with get_session() as session:
-        session.bulk_save_objects(rows)
-        # get_session() commits on clean exit; no explicit commit needed.
+        session.add_all(all_rows)
+        session.flush()
+        ids_by_market = {
+            market_id: [int(r.id) for r in rows if r.id is not None]
+            for market_id, rows in rows_by_market.items()
+        }
+    return ids_by_market
+
+
+def _link_signals_to_trade(
+    trade_id: int,
+    signal_ids: list[int] | tuple[int, ...],
+) -> int:
+    """Back-link the current cycle's signals to the trade they produced.
+
+    Updates `signals.trade_id` for the explicit IDs returned by the matching
+    _persist_signals call. Looking up by primary key removes the race where
+    overlapping cycles (slow DB, fast scheduler) could link signals from the
+    *next* cycle to the previous cycle's trade — the old `created_at >=
+    cycle_start_utc` filter was a time window, not an identity check.
+
+    Returns the row count, or 0 on any failure. Best-effort — must never
+    raise into the trading loop.
+    """
+    from weatheredge.db.models import Signal as SignalRow
+
+    if not trade_id or not signal_ids:
+        return 0
+    try:
+        with get_session() as session:
+            stmt = (
+                session.query(SignalRow)
+                .filter(
+                    SignalRow.id.in_(list(signal_ids)),
+                    SignalRow.trade_id.is_(None),
+                )
+            )
+            updated = stmt.update(
+                {SignalRow.trade_id: trade_id},
+                synchronize_session=False,
+            )
+            return int(updated or 0)
+    except Exception as exc:
+        log.debug(
+            "_link_signals_to_trade: trade=%d signals=%d failed: %s",
+            trade_id, len(signal_ids), exc,
+        )
+        return 0
 
 
 def _build_opportunity(
@@ -2966,6 +3087,41 @@ def run_edge_decay_check() -> None:
         log.error("run_edge_decay_check failed: %s", exc, exc_info=True)
 
 
+def run_daily_summary() -> None:
+    """Daily aggregation job: log P&L by agent, parser failure rate,
+    cash-cap hits, agent disagreement.
+
+    Cron fires at 00:05 UTC of day N+1 — we always summarise day N (yesterday
+    in UTC). Passing target_day explicitly avoids the off-by-one where
+    compute_daily_summary defaults to "today UTC" (which would be ~5min old
+    and almost empty)."""
+    log.info("run_daily_summary: computing daily summary")
+    try:
+        from datetime import timedelta as _td
+        from weatheredge.daily_summary import (
+            compute_daily_summary,
+            format_daily_summary_text,
+        )
+        yesterday_utc = (datetime.now(timezone.utc) - _td(days=1)).date()
+        summary = compute_daily_summary(target_day=yesterday_utc)
+        text = format_daily_summary_text(summary)
+        # INFO so it lands in the log even when DEBUG is off — operators
+        # check this every morning.
+        for line in text.splitlines():
+            log.info("DAILY_SUMMARY %s", line)
+
+        state = get_state()
+        if state.settings.telegram_bot_token and state.settings.telegram_chat_id:
+            try:
+                from weatheredge.notifications.telegram import TelegramBot
+                bot = TelegramBot(state.settings)
+                _run_async_safely(bot.send_alert(text))
+            except Exception as exc:
+                log.warning("run_daily_summary: telegram send failed: %s", exc)
+    except Exception as exc:
+        log.error("run_daily_summary failed: %s", exc, exc_info=True)
+
+
 def run_morning_briefing() -> None:
     """Daily 06:00 job: query wallet intelligence for overnight changes and send via Telegram."""
     state = get_state()
@@ -3247,8 +3403,10 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
 
-    # Build APScheduler (BackgroundScheduler uses threads, not asyncio)
-    scheduler = BackgroundScheduler()
+    # Build APScheduler (BackgroundScheduler uses threads, not asyncio).
+    # timezone=UTC: cron jobs (e.g. daily_summary) MUST fire on UTC wall-clock,
+    # not host local time, otherwise summary boundaries drift by ±N hours.
+    scheduler = BackgroundScheduler(timezone=timezone.utc)
     state.scheduler = scheduler
 
     # Data fetch jobs (scheduler layer — DB writes only)
@@ -3376,6 +3534,21 @@ def main() -> None:
         id="morning_briefing",
         max_instances=1,
         coalesce=True,
+    )
+
+    # P2 — daily summary at 00:05 UTC of the next day, summarising the day
+    # that just closed. Running after midnight (rather than 23:55) avoids the
+    # rare "missed last-5-minutes" gap where late-resolving trades land in the
+    # current day but the summary was already cut.
+    scheduler.add_job(
+        run_daily_summary,
+        "cron",
+        hour=0,
+        minute=5,
+        id="daily_summary",
+        max_instances=1,
+        coalesce=True,
+        timezone=timezone.utc,
     )
 
     scheduler.start()
