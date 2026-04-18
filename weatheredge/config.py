@@ -236,6 +236,10 @@ class Settings(BaseSettings):
 
     # Data freshness (Addendum Gap 12)
     weather_data_ttl_minutes: int = 120
+    # Market prices age out much faster than forecasts; if the Polymarket /
+    # Kalshi fetcher stalls we must NOT trade against a stale book or we
+    # manufacture imaginary edge against prices that already moved.
+    market_data_ttl_minutes: int = 15
     api_retry_count: int = 3
     api_retry_backoff_base: int = 1
 

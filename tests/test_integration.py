@@ -300,6 +300,7 @@ class TestDecisionLoopRunsStrategies:
         state = _make_app_state()
         state.settings = MagicMock(spec=Settings)
         state.settings.weather_data_ttl_minutes = 120
+        state.settings.market_data_ttl_minutes = 60
         state.settings.min_edge_percent = 10.0
         state.settings.conservative_min_edge = 0.20
         state.settings.aggressive_min_edge = 0.08
