@@ -225,10 +225,16 @@ class Settings(BaseSettings):
     # YES-side calibration guard-rail (April-2026 calibration audit).
     # Historical sample n=33 on daily_high/daily_low threshold markets:
     # mean predicted P(YES)=0.556, actual win rate=0.030 → 18x miscalibration,
-    # zero wins above predicted 0.50 except one outlier. Block high-conviction
-    # buy_yes on threshold markets until the YES calibration curve improves.
+    # zero wins above predicted 0.50 except one outlier. Tiered response:
+    #   - model_p > max_prob (0.70)     → HARD BLOCK   (extreme conviction, likely data error)
+    #   - model_p > haircut_prob (0.50) → HAIRCUT 0.15x size (gray zone, keep learning)
+    #   - model_p ≤ haircut_prob        → normal
+    # Applies ONLY to buy_yes on threshold (non-bucket) markets. buy_no
+    # and bucket markets are never affected by this guard-rail.
     yes_guard_rail_enabled: bool = True
-    yes_guard_rail_max_prob: float = 0.70  # Reject buy_yes on daily_high/low when model_prob exceeds this
+    yes_guard_rail_max_prob: float = 0.70  # Above this → HARD BLOCK
+    yes_guard_rail_haircut_prob: float = 0.50  # Above this (and ≤ max_prob) → size × haircut_multiplier
+    yes_guard_rail_haircut_multiplier: float = 0.15  # Kelly haircut for gray zone (0.50 < p ≤ 0.70)
 
     # Learning
     weight_update_interval_trades: int = 50

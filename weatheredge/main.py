@@ -3251,6 +3251,24 @@ def main() -> None:
     state = init_app()
     settings = state.settings
 
+    # Operational warning if the YES calibration guard-rail is disabled.
+    # This guard is the circuit-breaker protecting against the April-2026
+    # buy_yes miscalibration on threshold markets (18x overestimate). Running
+    # with it off is intentional only during controlled recalibration work.
+    if not getattr(settings, "yes_guard_rail_enabled", True):
+        log.warning(
+            "YES guard-rail DISABLED — buy_yes on threshold markets will trade without "
+            "block or haircut. Enable in config unless you are in controlled recalibration."
+        )
+    else:
+        log.info(
+            "YES guard-rail active: block>%.2f, haircut x%.2f in (%.2f, %.2f] on threshold markets",
+            getattr(settings, "yes_guard_rail_max_prob", 0.70),
+            getattr(settings, "yes_guard_rail_haircut_multiplier", 0.15),
+            getattr(settings, "yes_guard_rail_haircut_prob", 0.50),
+            getattr(settings, "yes_guard_rail_max_prob", 0.70),
+        )
+
     # Init database
     try:
         init_db()

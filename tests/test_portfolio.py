@@ -88,6 +88,10 @@ def test_weighted_voting_above_threshold():
         Signal(market_id="MKT-1", side="buy_yes",   confidence=0.8, agent_name="Qualitative"),
     ]
     opp = make_opportunity("MKT-1")
+    # Voting-logic test — mark as bucket market so the YES calibration haircut
+    # (threshold-markets only) does not alter the asserted size.
+    opp.bucket_low = 72.0
+    opp.bucket_high = 78.0
 
     orders = pm.aggregate_signals(
         signals_by_market={"MKT-1": signals},
@@ -166,6 +170,10 @@ def test_vpin_reduces_size():
         Signal(market_id="MKT-4", side="buy_yes", confidence=1.0, agent_name="Qualitative"),
     ]
     opp = make_opportunity("MKT-4")
+    # VPIN-reduction test — mark as bucket market so the YES calibration haircut
+    # (threshold-markets only) does not compound with the VPIN halving.
+    opp.bucket_low = 72.0
+    opp.bucket_high = 78.0
 
     orders = pm.aggregate_signals(
         signals_by_market={"MKT-4": signals},
@@ -513,3 +521,177 @@ def test_yes_guard_rail_does_not_block_bucket_market():
 
     assert len(orders) == 1
     assert orders[0].side == "buy_yes"
+
+
+# ---------------------------------------------------------------------------
+# YES guard-rail: safety net + haircut tier (April-2026 iteration)
+# ---------------------------------------------------------------------------
+
+def test_yes_guard_rail_never_blocks_buy_no_even_at_extreme_prob():
+    """Regression guard: buy_no with model_probability=0.95 on a threshold
+    market must pass through untouched. The guard-rail is side-specific —
+    NO trades have calibrated win rates and must never be penalised."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 40.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-NO-EXTREME", side="buy_no", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-NO-EXTREME", side="buy_no", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-NO-EXTREME", side="buy_no", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-NO-EXTREME")
+    opp.model_probability = 0.95
+    opp.market_price = 0.99  # YES=0.99 → NO=0.01, edge for NO when P(YES)=0.95
+    opp.net_edge = 0.0
+    opp.net_edge_no = 0.04
+    opp.bucket_low = None
+    opp.bucket_high = None
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-NO-EXTREME": signals},
+        opportunities={"MKT-NO-EXTREME": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_no"
+    # Full size — no haircut applied to NO
+    assert orders[0].amount == 40.0
+
+
+def test_yes_guard_rail_haircut_reduces_size_in_gray_zone():
+    """buy_yes on threshold market with model_p in (haircut_prob, max_prob]
+    (default 0.50 < p ≤ 0.70) must trade but at haircut_multiplier × size."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-HAIRCUT", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-HAIRCUT", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-HAIRCUT", side="buy_yes", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-HAIRCUT")
+    opp.model_probability = 0.60  # In gray zone (0.50, 0.70]
+    opp.market_price = 0.40
+    opp.net_edge = 0.18
+    opp.bucket_low = None
+    opp.bucket_high = None
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-HAIRCUT": signals},
+        opportunities={"MKT-HAIRCUT": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_yes"
+    # Default haircut multiplier 0.15 → 100.0 × 0.15 = 15.0
+    assert orders[0].amount == pytest.approx(15.0, rel=1e-3), (
+        f"Expected haircut to reduce 100.0→15.0, got {orders[0].amount}"
+    )
+
+
+def test_yes_guard_rail_haircut_does_not_apply_to_low_prob_yes():
+    """buy_yes with model_p ≤ haircut_prob (0.50) must trade at full size —
+    the haircut is surgical, not a blanket penalty on all YES."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-LOW", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-LOW", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-LOW", side="buy_yes", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-LOW")
+    opp.model_probability = 0.40  # Below haircut_prob
+    opp.market_price = 0.22
+    opp.net_edge = 0.16
+    opp.bucket_low = None
+    opp.bucket_high = None
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-LOW": signals},
+        opportunities={"MKT-LOW": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].amount == 100.0  # No haircut
+
+
+def test_yes_guard_rail_haircut_does_not_apply_to_bucket_market():
+    """Bucket markets are exempt from the YES guard-rail at every tier
+    (block AND haircut). A gray-zone YES on a bucket market trades full size."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-BUCKET-GRAY", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-BUCKET-GRAY", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-BUCKET-GRAY", side="buy_yes", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-BUCKET-GRAY")
+    opp.model_probability = 0.60  # Gray zone, but bucket market
+    opp.bucket_low = 72.0
+    opp.bucket_high = 76.0
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-BUCKET-GRAY": signals},
+        opportunities={"MKT-BUCKET-GRAY": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].amount == 100.0  # No haircut — bucket exempt
+
+
+def test_yes_guard_rail_disabled_also_skips_haircut():
+    """When yes_guard_rail_enabled=False, neither block nor haircut applies.
+    A high-prob buy_yes trades full size even in the gray zone."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    settings = make_settings(yes_guard_rail_enabled=False)
+    pm = PortfolioManager(settings, rm)
+
+    signals = [
+        Signal(market_id="MKT-OFF", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-OFF", side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        Signal(market_id="MKT-OFF", side="buy_yes", confidence=0.9, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-OFF")
+    opp.model_probability = 0.60  # Gray zone
+    opp.bucket_low = None
+    opp.bucket_high = None
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-OFF": signals},
+        opportunities={"MKT-OFF": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].amount == 100.0  # Full size, no haircut

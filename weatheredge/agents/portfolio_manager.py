@@ -267,23 +267,28 @@ class PortfolioManager:
                 if correlated:
                     continue
 
-            # YES calibration guard-rail (April-2026 audit).
+            # YES calibration guard-rail (April-2026 audit) — HARD BLOCK tier.
             # Historical daily_high/daily_low buy_yes: n=33, mean predicted 0.556,
-            # actual 0.030 — effectively zero wins above predicted 0.50. Block
-            # high-conviction buy_yes on threshold markets (bucket_low/high None)
-            # until recalibration data proves the YES curve has shifted.
-            if (
-                getattr(self.settings, "yes_guard_rail_enabled", True)
+            # actual 0.030 — effectively zero wins above predicted 0.50. Extreme
+            # conviction (model_p > max_prob, default 0.70) is nearly always a
+            # data/calibration artefact, not a real edge. Applies only to
+            # threshold markets (bucket_low/high both None); bucket markets and
+            # buy_no are always exempt.
+            is_threshold_market = bucket_low is None and bucket_high is None
+            guard_enabled = getattr(self.settings, "yes_guard_rail_enabled", True)
+            guard_max_prob = getattr(self.settings, "yes_guard_rail_max_prob", 0.70)
+            guard_haircut_prob = getattr(self.settings, "yes_guard_rail_haircut_prob", 0.50)
+            yes_on_threshold = (
+                guard_enabled
                 and majority_side == "buy_yes"
-                and bucket_low is None
-                and bucket_high is None
-                and model_probability > getattr(self.settings, "yes_guard_rail_max_prob", 0.70)
-            ):
+                and is_threshold_market
+            )
+            if yes_on_threshold and model_probability > guard_max_prob:
                 log.warning(
-                    "YES guard-rail: market=%s skipped buy_yes (model_p=%.3f > %.2f on threshold market)",
+                    "YES guard-rail BLOCK: market=%s skipped buy_yes (model_p=%.3f > %.2f on threshold market)",
                     market_id,
                     model_probability,
-                    getattr(self.settings, "yes_guard_rail_max_prob", 0.70),
+                    guard_max_prob,
                 )
                 continue
 
@@ -337,6 +342,28 @@ class PortfolioManager:
             # Step 5: VPIN reduction
             if risk_result.get("reduce_size"):
                 amount = round(amount / 2, 2)
+
+            # YES calibration guard-rail (April-2026 audit) — HAIRCUT tier.
+            # For buy_yes on threshold markets with model_p in (haircut_prob, max_prob]
+            # (default 0.50 < p ≤ 0.70), apply a Kelly haircut (default 0.15x) rather
+            # than blocking outright. Rationale: we keep collecting calibration
+            # data in the gray zone while capping downside until the YES curve
+            # is re-validated. buy_no, bucket markets, and low-conviction YES
+            # (p ≤ 0.50) are never touched.
+            if yes_on_threshold and model_probability > guard_haircut_prob:
+                haircut = getattr(self.settings, "yes_guard_rail_haircut_multiplier", 0.15)
+                pre_haircut = amount
+                amount = round(amount * haircut, 2)
+                log.warning(
+                    "YES guard-rail HAIRCUT: market=%s buy_yes size %.2f→%.2f (x%.2f, model_p=%.3f in (%.2f, %.2f])",
+                    market_id,
+                    pre_haircut,
+                    amount,
+                    haircut,
+                    model_probability,
+                    guard_haircut_prob,
+                    guard_max_prob,
+                )
 
             # CCG-bug-8: hard-cap by remaining free cash so cumulative orders within
             # one cycle cannot deploy more than the user actually has. Round DOWN
