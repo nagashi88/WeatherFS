@@ -212,7 +212,7 @@ interval = st.sidebar.slider("Refresh (sec)", 5, 60, 15)
 
 # ── Stats ────────────────────────────────────────────────────────────────
 
-_CLOSED = "('won','lost','edge_stop','capital_protect','time_decay','ev_based')"
+_CLOSED = "('won','lost','edge_stop','capital_protect','time_decay','ev_based','abandoned')"
 total_trades = _scalar("SELECT COUNT(*) FROM trades")
 open_trades = _scalar("SELECT COUNT(*) FROM trades WHERE status='open'")
 won = _scalar("SELECT COUNT(*) FROM trades WHERE status='won'")
@@ -261,18 +261,39 @@ if brier_rows:
         brier_sum += (r["model_probability"] - outcome_yes) ** 2
     brier = brier_sum / len(brier_rows)
 
+# Total equity = initial bankroll + realized P&L (all exited trades) + unrealized P&L (open positions).
+# This is the headline number — the actual portfolio value right now.
+_initial_bankroll = 100.0
+try:
+    from weatheredge.config import Settings as _Settings
+    _initial_bankroll = float(_Settings().initial_bankroll)
+except Exception:
+    pass
+total_equity = _initial_bankroll + total_pnl + unrealized_pnl
+equity_delta = total_equity - _initial_bankroll
+
+eq1, eq2, eq3 = st.columns([2, 1, 1])
+eq1.metric(
+    "Total Equity",
+    f"${total_equity:.2f}",
+    delta=f"{equity_delta:+.2f} ({100*equity_delta/_initial_bankroll:+.1f}%)",
+    help=f"Initial ${_initial_bankroll:.2f} + realized ${total_pnl:.2f} + unrealized ${unrealized_pnl:.2f}",
+)
+eq2.metric("Realized P&L", f"${total_pnl:.2f}", help="Sum of pnl across ALL exited trades (won, lost, abandoned, edge_stop, etc.)")
+eq3.metric("Unrealized P&L", f"${unrealized_pnl:.2f}", help="Mark-to-market on currently open positions")
+
 c1, c2, c3, c4, c4b = st.columns(5)
 c1.metric("Total Trades", total_trades)
 c2.metric("Win Rate", f"{win_rate:.1f}%", help=f"{wins_all}/{resolved} closed trades with pnl>0")
-c3.metric("Realized P&L", f"${total_pnl:.2f}", delta=f"${total_pnl:.2f}" if total_pnl != 0 else None)
-c4.metric("Unrealized P&L", f"${unrealized_pnl:.2f}", delta=f"${unrealized_pnl:.2f}" if unrealized_pnl != 0 else None)
+c3.metric("Open Positions", open_trades)
+c4.metric("Resolved", resolved, help="All exited trades (won, lost, abandoned, edge_stop, capital_protect, time_decay, ev_based)")
 c4b.metric("Brier Score", f"{brier:.4f}" if brier_rows else "N/A", help="Only market-resolved (won/lost) trades")
 
 c5, c6, c7, c8 = st.columns(4)
 c5.metric("Won (final)", won)
 c6.metric("Lost (final)", lost)
-c7.metric("Open Positions", open_trades)
-c8.metric("Resolved", resolved, help="All closed trades incl. edge_stop")
+c7.metric("Forecasts", forecasts)
+c8.metric("Markets", markets)
 
 st.divider()
 
@@ -347,12 +368,7 @@ else:
     df = df.dropna(subset=["resolved_at"]).sort_values("resolved_at").reset_index(drop=True)
     df["day"] = df["resolved_at"].dt.tz_convert("UTC").dt.date
 
-    initial_bankroll = 100.0
-    try:
-        from weatheredge.config import Settings
-        initial_bankroll = float(Settings().initial_bankroll)
-    except Exception:
-        pass
+    initial_bankroll = _initial_bankroll  # Reuse value loaded for Total Equity metric
 
     min_day = df["day"].min()
     max_day = df["day"].max()
