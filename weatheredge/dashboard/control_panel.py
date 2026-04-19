@@ -354,26 +354,108 @@ st.subheader("Equity Curve")
 import altair as alt
 import pandas as pd
 
-equity_rows = _query_db(
-    f"SELECT resolved_at, pnl FROM trades "
-    f"WHERE status IN {_CLOSED} AND pnl IS NOT NULL AND resolved_at IS NOT NULL "
-    f"ORDER BY resolved_at ASC"
+initial_bankroll = _initial_bankroll  # Reuse value loaded for Total Equity metric
+
+# Build hourly equity timeline with TWO lines:
+#   - Realized equity:  initial_bankroll + sum(pnl) of trades closed by tick
+#   - Total equity:     realized + mark-to-market value of open positions at tick
+# Reads the full trades table + market_prices history; for each hour we
+# look up the latest yes_price (≤ tick) per still-open market_id.
+trades_all_q = (
+    "SELECT id, market_id, side, amount, cost, status, pnl, "
+    "created_at, resolved_at FROM trades"
 )
-
-if not equity_rows:
-    st.info("Nessun trade risolto ancora — equity curve disponibile dopo la prima chiusura.")
+prices_q = (
+    "SELECT market_id, yes_price, timestamp FROM market_prices "
+    "WHERE yes_price IS NOT NULL ORDER BY timestamp"
+)
+if DB_PATH.exists():
+    _eq_conn = sqlite3.connect(str(DB_PATH), timeout=5)
+    try:
+        trades_df = pd.read_sql_query(trades_all_q, _eq_conn)
+        prices_df = pd.read_sql_query(prices_q, _eq_conn)
+    finally:
+        _eq_conn.close()
 else:
-    df = pd.DataFrame([dict(r) for r in equity_rows])
-    df["resolved_at"] = pd.to_datetime(df["resolved_at"], errors="coerce", utc=True)
-    df = df.dropna(subset=["resolved_at"]).sort_values("resolved_at").reset_index(drop=True)
-    df["day"] = df["resolved_at"].dt.tz_convert("UTC").dt.date
+    trades_df = pd.DataFrame()
+    prices_df = pd.DataFrame()
 
-    initial_bankroll = _initial_bankroll  # Reuse value loaded for Total Equity metric
+if trades_df.empty:
+    st.info("Nessun trade nel DB — equity curve disponibile dopo il primo trade.")
+else:
+    trades_df["created_at"] = pd.to_datetime(trades_df["created_at"], utc=True, errors="coerce")
+    trades_df["resolved_at"] = pd.to_datetime(trades_df["resolved_at"], utc=True, errors="coerce")
+    trades_df["pnl"] = pd.to_numeric(trades_df["pnl"], errors="coerce").fillna(0.0)
+    if not prices_df.empty:
+        prices_df["timestamp"] = pd.to_datetime(prices_df["timestamp"], utc=True, errors="coerce")
+        prices_df = prices_df.dropna(subset=["timestamp"]).sort_values("timestamp")
+    closed_set = {"won", "lost", "edge_stop", "capital_protect", "time_decay", "ev_based", "abandoned"}
 
-    min_day = df["day"].min()
-    max_day = df["day"].max()
+    # Hourly grid: from earliest trade open to now
+    start_ts = trades_df["created_at"].min()
+    if pd.isna(start_ts):
+        st.warning("Nessun trade con timestamp valido.")
+        st.stop()
+    start_h = start_ts.floor("h")
+    end_h = pd.Timestamp.now(tz="UTC").ceil("h")
+    hours = pd.date_range(start_h, end_h, freq="h")
 
-    eq_col1, eq_col2, eq_col3 = st.columns([2, 1, 1])
+    # Pre-index prices per market for fast as-of lookups
+    prices_by_market: dict[str, pd.DataFrame] = {}
+    if not prices_df.empty:
+        for mid, grp in prices_df.groupby("market_id"):
+            prices_by_market[mid] = grp[["timestamp", "yes_price"]].reset_index(drop=True)
+
+    def _yes_price_at(mid: str, tick: pd.Timestamp) -> float | None:
+        grp = prices_by_market.get(mid)
+        if grp is None or grp.empty:
+            return None
+        idx = grp["timestamp"].searchsorted(tick, side="right") - 1
+        if idx < 0:
+            return None
+        return float(grp.iloc[idx]["yes_price"])
+
+    records = []
+    for tick in hours:
+        closed_mask = (
+            trades_df["resolved_at"].notna()
+            & (trades_df["resolved_at"] <= tick)
+            & (trades_df["status"].isin(closed_set))
+        )
+        realized_pnl = float(trades_df.loc[closed_mask, "pnl"].sum())
+
+        open_mask = (
+            trades_df["created_at"].notna()
+            & (trades_df["created_at"] <= tick)
+            & (trades_df["resolved_at"].isna() | (trades_df["resolved_at"] > tick))
+        )
+        unrealized = 0.0
+        for _, t in trades_df.loc[open_mask].iterrows():
+            yp = _yes_price_at(t["market_id"], tick)
+            if yp is None:
+                # No price yet — fall back to entry price (zero unrealized)
+                entry_yes = (
+                    (t["cost"] / t["amount"]) if t["side"] == "buy_yes"
+                    else (1.0 - t["cost"] / t["amount"])
+                ) if t["amount"] else 0.0
+                yp = entry_yes
+            value = (1.0 - yp) * t["amount"] if t["side"] == "buy_no" else yp * t["amount"]
+            unrealized += value - t["cost"]
+
+        records.append({
+            "timestamp": tick,
+            "realized_equity": initial_bankroll + realized_pnl,
+            "total_equity": initial_bankroll + realized_pnl + unrealized,
+            "unrealized": unrealized,
+            "realized_pnl": realized_pnl,
+        })
+
+    equity_ts = pd.DataFrame(records)
+
+    # Date filter (still useful for longer histories)
+    min_day = equity_ts["timestamp"].dt.date.min()
+    max_day = equity_ts["timestamp"].dt.date.max()
+    eq_col1, eq_col2 = st.columns([2, 1])
     with eq_col1:
         date_range = st.date_input(
             "Intervallo date",
@@ -383,93 +465,72 @@ else:
             key="equity_date_range",
         )
     with eq_col2:
-        granularity = st.selectbox(
-            "Granularità", ["Per trade", "Daily"], index=0, key="equity_granularity"
-        )
-    with eq_col3:
-        min_threshold = st.number_input(
-            "Soglia minima ($)",
-            value=float(initial_bankroll * 0.9),
-            step=1.0,
-            key="equity_min_threshold",
-            help="Linea di riferimento — eventi sotto soglia sono evidenziati.",
-        )
+        show_drawdown = st.toggle("Mostra drawdown", value=False, key="equity_show_dd")
 
     if isinstance(date_range, tuple) and len(date_range) == 2:
         d_from, d_to = date_range
     else:
         d_from = d_to = date_range if not isinstance(date_range, tuple) else min_day
 
-    mask = (df["day"] >= d_from) & (df["day"] <= d_to)
-    sub = df.loc[mask].copy()
+    mask = (equity_ts["timestamp"].dt.date >= d_from) & (equity_ts["timestamp"].dt.date <= d_to)
+    plot_df = equity_ts.loc[mask].copy().reset_index(drop=True)
 
-    if sub.empty:
-        st.warning("Nessun trade nell'intervallo selezionato.")
+    if plot_df.empty:
+        st.warning("Nessun dato nell'intervallo selezionato.")
     else:
-        if granularity == "Daily":
-            daily = sub.groupby("day", as_index=False)["pnl"].sum()
-            daily["cum_pnl"] = daily["pnl"].cumsum()
-            daily["equity"] = initial_bankroll + daily["cum_pnl"]
-            daily["timestamp"] = pd.to_datetime(daily["day"])
-            plot_df = daily[["timestamp", "equity", "pnl"]].rename(columns={"pnl": "delta"})
-        else:
-            sub["cum_pnl"] = sub["pnl"].cumsum()
-            sub["equity"] = initial_bankroll + sub["cum_pnl"]
-            plot_df = sub[["resolved_at", "equity", "pnl"]].rename(
-                columns={"resolved_at": "timestamp", "pnl": "delta"}
-            )
-
-        plot_df["running_max"] = plot_df["equity"].cummax()
-        plot_df["drawdown"] = plot_df["equity"] - plot_df["running_max"]
-
-        max_idx = plot_df["equity"].idxmax()
-        min_idx = plot_df["equity"].idxmin()
-        max_dd = float(plot_df["drawdown"].min())
-        max_dd_pct = (max_dd / float(plot_df.loc[plot_df["drawdown"].idxmin(), "running_max"]) * 100.0) \
-            if plot_df.loc[plot_df["drawdown"].idxmin(), "running_max"] else 0.0
-
+        # Headline metrics
+        latest = plot_df.iloc[-1]
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Equity finale", f"${float(plot_df['equity'].iloc[-1]):.2f}")
-        m2.metric("Max equity", f"${float(plot_df['equity'].max()):.2f}")
-        m3.metric("Min equity", f"${float(plot_df['equity'].min()):.2f}")
-        m4.metric("Max drawdown", f"${max_dd:.2f}", delta=f"{max_dd_pct:.1f}%")
+        m1.metric("Total Equity", f"${latest['total_equity']:.2f}",
+                  delta=f"{latest['total_equity'] - initial_bankroll:+.2f}")
+        m2.metric("Realized Equity", f"${latest['realized_equity']:.2f}",
+                  delta=f"{latest['realized_pnl']:+.2f}")
+        m3.metric("Max Total Equity", f"${plot_df['total_equity'].max():.2f}")
+        m4.metric("Min Total Equity", f"${plot_df['total_equity'].min():.2f}")
 
-        line = alt.Chart(plot_df).mark_line(color="#00ccff", strokeWidth=2).encode(
-            x=alt.X("timestamp:T", title="Tempo"),
+        # Long-form for Altair color encoding
+        long_df = pd.concat([
+            plot_df[["timestamp", "total_equity"]].rename(columns={"total_equity": "equity"}).assign(serie="Total (realized + unrealized)"),
+            plot_df[["timestamp", "realized_equity"]].rename(columns={"realized_equity": "equity"}).assign(serie="Realized only"),
+        ], ignore_index=True)
+
+        bankroll_rule = alt.Chart(pd.DataFrame({"y": [initial_bankroll]})).mark_rule(
+            color="#888", strokeDash=[3, 4]
+        ).encode(y=alt.Y("y:Q", title="Equity ($)"))
+
+        # Soft area underneath the Total line
+        total_area = alt.Chart(plot_df).mark_area(
+            color="#00ff88", opacity=0.10,
+        ).encode(
+            x="timestamp:T",
+            y=alt.Y("total_equity:Q", scale=alt.Scale(zero=False)),
+            y2=alt.Y2(datum=initial_bankroll),
+        )
+
+        line = alt.Chart(long_df).mark_line(strokeWidth=2.5).encode(
+            x=alt.X("timestamp:T", title="Tempo (UTC, hourly)"),
             y=alt.Y("equity:Q", title="Equity ($)", scale=alt.Scale(zero=False)),
+            color=alt.Color(
+                "serie:N",
+                scale=alt.Scale(
+                    domain=["Total (realized + unrealized)", "Realized only"],
+                    range=["#00ff88", "#00ccff"],
+                ),
+                legend=alt.Legend(title=None, orient="top"),
+            ),
             tooltip=[
                 alt.Tooltip("timestamp:T", title="Quando"),
+                alt.Tooltip("serie:N", title="Serie"),
                 alt.Tooltip("equity:Q", title="Equity", format="$.2f"),
-                alt.Tooltip("delta:Q", title="ΔP&L", format="$.2f"),
-                alt.Tooltip("drawdown:Q", title="Drawdown", format="$.2f"),
             ],
         )
 
-        threshold_line = alt.Chart(pd.DataFrame({"y": [float(min_threshold)]})).mark_rule(
-            color="#ffaa00", strokeDash=[6, 4]
-        ).encode(y="y:Q")
-
-        bankroll_line = alt.Chart(pd.DataFrame({"y": [initial_bankroll]})).mark_rule(
-            color="#666", strokeDash=[2, 4]
-        ).encode(y="y:Q")
-
-        markers_df = plot_df.loc[[max_idx, min_idx]].copy()
-        markers_df["label"] = ["MAX", "MIN"]
-        markers = alt.Chart(markers_df).mark_point(size=120, filled=True).encode(
-            x="timestamp:T",
-            y="equity:Q",
-            color=alt.Color(
-                "label:N",
-                scale=alt.Scale(domain=["MAX", "MIN"], range=["#00ff88", "#ff4444"]),
-                legend=alt.Legend(title="Estremi"),
-            ),
-            tooltip=["label:N", alt.Tooltip("equity:Q", format="$.2f")],
-        )
-
-        chart = (bankroll_line + threshold_line + line + markers).properties(height=320)
+        chart = (total_area + bankroll_rule + line).properties(height=360)
         st.altair_chart(chart, use_container_width=True)
 
-        with st.expander("Drawdown nel tempo"):
+        if show_drawdown:
+            plot_df["running_max"] = plot_df["total_equity"].cummax()
+            plot_df["drawdown"] = plot_df["total_equity"] - plot_df["running_max"]
             dd_chart = alt.Chart(plot_df).mark_area(
                 color="#ff4444", opacity=0.4
             ).encode(
