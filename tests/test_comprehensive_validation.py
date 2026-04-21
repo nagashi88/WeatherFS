@@ -334,10 +334,25 @@ class TestFinancialCorrectness:
         assert PLATFORM_FEES["polymarket"]["estimated_round_trip"] == 0.015
 
     def test_kalshi_fee_constant_is_02(self):
-        """Kalshi estimated_round_trip = 0.02 (2%)."""
+        """Kalshi legacy scalar estimated_round_trip = 0.02 (fallback only;
+        authoritative cost is price-dependent via kalshi_round_trip_cost)."""
         from weatheredge.probability.edge import PLATFORM_FEES
 
         assert PLATFORM_FEES["kalshi"]["estimated_round_trip"] == 0.02
+
+    def test_kalshi_taker_fee_formula_ceil_0_07_p_1mp(self):
+        """Kalshi taker fee per contract: ceil(0.07 * p * (1-p) * 100) / 100."""
+        from weatheredge.probability.edge import kalshi_taker_fee
+
+        # p=0.5 → 0.07 * 0.25 = 0.0175 → ceil(1.75)/100 = 0.02
+        assert kalshi_taker_fee(0.50) == pytest.approx(0.02)
+        # p=0.1 → 0.07 * 0.09 = 0.0063 → ceil(0.63)/100 = 0.01
+        assert kalshi_taker_fee(0.10) == pytest.approx(0.01)
+        # p=0.9 symmetric with p=0.1
+        assert kalshi_taker_fee(0.90) == pytest.approx(0.01)
+        # Degenerate prices → 0
+        assert kalshi_taker_fee(0.0) == 0.0
+        assert kalshi_taker_fee(1.0) == 0.0
 
     # -----------------------------------------------------------------------
     # Net edge calculation exactness
@@ -353,13 +368,21 @@ class TestFinancialCorrectness:
         assert abs(net - 0.185) < 1e-9, f"Expected 0.185, got {net}"
 
     def test_net_edge_kalshi_exact_value(self):
-        """model_prob=0.80, market_price=0.60, kalshi → net_edge = 0.18."""
+        """model_prob=0.80, market_price=0.60, kalshi → net_edge = 0.15.
+
+        Round-trip cost at p=0.60:
+          taker_fee = ceil(0.07 * 0.60 * 0.40 * 100) / 100 = 0.02
+          round_trip_fee = 2 * 0.02 = 0.04
+          half_spread = 0.02 / 2 = 0.01
+          total = 0.05
+        Net edge = 0.20 - 0.05 = 0.15
+        """
         from weatheredge.probability.edge import calculate_net_edge
 
         net = calculate_net_edge(
             model_probability=0.80, market_price=0.60, platform="kalshi"
         )
-        assert abs(net - 0.18) < 1e-9, f"Expected 0.18, got {net}"
+        assert abs(net - 0.15) < 1e-9, f"Expected 0.15, got {net}"
 
     def test_net_edge_negative_when_market_overpriced(self):
         """model_prob=0.45, market_price=0.60, polymarket → net_edge = -0.165."""
