@@ -231,8 +231,9 @@ def test_open_positions_panel_renders_with_data(conn):
     from rich.console import Console
     out = Console(record=True, width=120).render(panel)
     rendered = "".join(seg.text for seg in out)
-    assert "abc" in rendered
-    # Unrealized P&L (+2.50) should appear in the rendered panel.
+    # Panel no longer renders market_id; verify the header and the
+    # unrealized P&L (+2.50 = (0.65 - 0.40) * 10) are present.
+    assert "OPEN POSITIONS" in rendered
     assert "2.5" in rendered or "+2.5" in rendered
 
 

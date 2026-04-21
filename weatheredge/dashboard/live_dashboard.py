@@ -28,7 +28,7 @@ from rich.text import Text
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "weatheredge.db"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "logs" / "weatheredge.log"
-BOT_FRESHNESS_SECONDS = 60
+BOT_FRESHNESS_SECONDS = 120
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
 INITIAL_BANKROLL_DEFAULT = 1000.0
 
@@ -138,7 +138,7 @@ def query_recent_trades(conn: sqlite3.Connection, limit: int = 20) -> list[sqlit
         conn,
         """
         SELECT created_at, market_id, side, price, edge_at_entry,
-               agent_name, status, pnl
+               agent_name, status, pnl, cost
         FROM trades
         ORDER BY created_at DESC
         LIMIT ?
@@ -347,6 +347,333 @@ def query_daily_pnl(conn: sqlite3.Connection) -> list[tuple[str, float]]:
 
 
 # ---------------------------------------------------------------------------
+# New observability queries (dashboard-only, no algorithm change)
+# ---------------------------------------------------------------------------
+
+PROB_FLOOR_VALUE = 0.10  # mirrors weatheredge.probability.gaussian.PROB_FLOOR
+
+
+def query_open_positions_enriched(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Open positions joined with market thresholds, latest station forecast,
+    and calibration RMSE so the dashboard can compute distance-to-band.
+
+    Columns returned add: station, market_date, threshold_low, threshold_high,
+    forecast_temp, station_rmse, raw_model_prob on top of the basic trade data.
+    LEFT JOINs so missing forecast / calibration do not drop the row.
+    """
+    return _safe_fetchall(
+        conn,
+        """
+        WITH latest_forecast AS (
+            SELECT station, target_date, temperature_forecast,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY station, target_date
+                       ORDER BY forecast_timestamp DESC, id DESC
+                   ) AS rn
+            FROM forecasts
+        ),
+        station_rmse AS (
+            SELECT station, AVG(rmse) AS rmse
+            FROM calibration
+            WHERE rmse IS NOT NULL
+            GROUP BY station
+        ),
+        latest_price AS (
+            SELECT market_id, yes_price,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY market_id ORDER BY timestamp DESC, id DESC
+                   ) AS rn
+            FROM market_prices
+            WHERE market_id IS NOT NULL
+              AND yes_price IS NOT NULL
+        )
+        SELECT t.id AS trade_id, t.market_id, t.side, t.price, t.amount, t.cost,
+               t.agent_name, t.created_at, t.model_probability, t.edge_at_entry,
+               t.raw_model_prob, t.station, t.market_date,
+               m.threshold_low, m.threshold_high,
+               lf.temperature_forecast AS forecast_temp,
+               sr.rmse AS station_rmse,
+               lp.yes_price AS current_yes
+        FROM trades t
+        LEFT JOIN markets m ON t.market_id = m.id
+        LEFT JOIN latest_forecast lf
+            ON lf.station = t.station
+           AND lf.target_date = t.market_date
+           AND lf.rn = 1
+        LEFT JOIN station_rmse sr ON sr.station = t.station
+        LEFT JOIN latest_price lp ON lp.market_id = t.market_id AND lp.rn = 1
+        WHERE t.status = 'open'
+        ORDER BY t.market_date ASC, t.created_at DESC
+        """,
+    )
+
+
+def query_exposure_by_date(conn: sqlite3.Connection) -> list[tuple[str, int, float]]:
+    """Per-date exposure summary for open positions.
+
+    Returns a list of (market_date, position_count, total_cost) sorted by date.
+    Used by the Risk Cluster gauge.
+    """
+    rows = _safe_fetchall(
+        conn,
+        """
+        SELECT market_date, COUNT(*) AS n, COALESCE(SUM(cost), 0) AS total_cost
+        FROM trades
+        WHERE status = 'open'
+          AND market_date IS NOT NULL
+        GROUP BY market_date
+        ORDER BY market_date ASC
+        """,
+    )
+    return [(str(r["market_date"]), int(r["n"] or 0), float(r["total_cost"] or 0.0)) for r in rows]
+
+
+def query_edge_flip_stats(conn: sqlite3.Connection) -> dict:
+    """Lifetime edge_stop statistics for the flip-saved counter.
+
+    Estimates money saved vs a worst-case full-loss (cost) for each
+    edge_stop trade: saved = cost - |pnl|. Shown as an approximate figure so
+    the operator sees the mechanism at work, not a strict counterfactual.
+    """
+    rows = _safe_fetchall(
+        conn,
+        """
+        SELECT COALESCE(pnl, 0) AS pnl, COALESCE(cost, 0) AS cost
+        FROM trades
+        WHERE status = 'edge_stop'
+        """,
+    )
+    total_saved = 0.0
+    realised_loss = 0.0
+    for r in rows:
+        pnl = float(r["pnl"] or 0.0)
+        cost = float(r["cost"] or 0.0)
+        realised_loss += pnl  # usually negative for edge_stop
+        # Saved = cost - |loss|. Clamp at 0 so profitable flips don't distort.
+        total_saved += max(0.0, cost + pnl)
+    return {
+        "count": len(rows),
+        "total_saved": total_saved,
+        "realised_loss": realised_loss,
+    }
+
+
+def query_source_of_edge(conn: sqlite3.Connection) -> dict:
+    """Breakdown of open trades by whether the model signal or the floor is
+    driving the pricing probability.
+
+    floor_saturated: raw_model_prob < PROB_FLOOR (the floor is effectively the
+    model). model_signal: raw_model_prob >= PROB_FLOOR (the model actually
+    contributes).
+    """
+    total = int(_scalar(conn, "SELECT COUNT(*) FROM trades WHERE status='open'"))
+    floor_saturated = int(_scalar(
+        conn,
+        "SELECT COUNT(*) FROM trades WHERE status='open' AND raw_model_prob IS NOT NULL AND raw_model_prob < ?",
+        (PROB_FLOOR_VALUE,),
+    ))
+    model_signal = int(_scalar(
+        conn,
+        "SELECT COUNT(*) FROM trades WHERE status='open' AND raw_model_prob IS NOT NULL AND raw_model_prob >= ?",
+        (PROB_FLOOR_VALUE,),
+    ))
+    unknown = max(0, total - floor_saturated - model_signal)
+    return {
+        "total_open": total,
+        "floor_saturated": floor_saturated,
+        "model_signal": model_signal,
+        "unknown": unknown,
+    }
+
+
+def query_decisive_counts(conn: sqlite3.Connection) -> dict:
+    """Decisive market-resolved counts (only won/lost, excludes early-exits)
+    used to compute a defensible win-rate with a binomial CI.
+    """
+    won = int(_scalar(conn, "SELECT COUNT(*) FROM trades WHERE status='won'"))
+    lost = int(_scalar(conn, "SELECT COUNT(*) FROM trades WHERE status='lost'"))
+    return {"wins": won, "losses": lost, "decisive": won + lost}
+
+
+def query_delta_24h(conn: sqlite3.Connection) -> float:
+    """Net realised P&L over the last 24h (for the header delta ribbon)."""
+    return _scalar(
+        conn,
+        """
+        SELECT COALESCE(SUM(pnl), 0)
+        FROM trades
+        WHERE resolved_at >= datetime('now', '-1 day')
+          AND pnl IS NOT NULL
+          AND status IN ('won','lost','edge_stop','capital_protect','time_decay','ev_based','bucket_invalidated')
+        """,
+    )
+
+
+def query_data_freshness(conn: sqlite3.Connection) -> dict:
+    """Last-update seconds-ago for forecasts, market_prices and signals.
+
+    Used by the data-freshness banner. Values are seconds since last write;
+    None means no row seen at all (scraper never ran).
+    """
+    def _age_seconds(sql: str) -> float | None:
+        row = _safe_fetchone(conn, sql)
+        if row is None or row[0] is None:
+            return None
+        try:
+            return float(row[0])
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "forecast_age_s": _age_seconds(
+            "SELECT (julianday('now') - julianday(MAX(forecast_timestamp))) * 86400.0 FROM forecasts"
+        ),
+        "market_age_s": _age_seconds(
+            "SELECT (julianday('now') - julianday(MAX(timestamp))) * 86400.0 FROM market_prices"
+        ),
+    }
+
+
+def query_next_resolution(conn: sqlite3.Connection) -> dict | None:
+    """Earliest upcoming market_date among open trades, for the countdown.
+
+    Returns {date, positions, hours_to_resolution} or None.
+    Resolution is assumed at 23:59Z of the market_date (end-of-day UTC),
+    matching WeatherEdge's daily_high resolution convention. Clamps to 0 if
+    past (which means resolution is happening now).
+    """
+    row = _safe_fetchone(
+        conn,
+        """
+        SELECT market_date, COUNT(*) AS n
+        FROM trades
+        WHERE status='open' AND market_date IS NOT NULL
+        GROUP BY market_date
+        ORDER BY market_date ASC
+        LIMIT 1
+        """,
+    )
+    if row is None or row["market_date"] is None:
+        return None
+    date_str = str(row["market_date"])
+    n = int(row["n"] or 0)
+    try:
+        # End-of-day UTC approximation for resolution time.
+        dt = datetime.fromisoformat(f"{date_str}T23:59:00+00:00")
+        delta = dt - datetime.now(timezone.utc)
+        hours = max(0.0, delta.total_seconds() / 3600.0)
+    except ValueError:
+        hours = None
+    return {"date": date_str, "positions": n, "hours_to_resolution": hours}
+
+
+# ---------------------------------------------------------------------------
+# Computation helpers (pure functions; unit-testable)
+# ---------------------------------------------------------------------------
+
+def compute_binomial_ci(k: int, n: int, conf: float = 0.95) -> tuple[float, float]:
+    """Clopper-Pearson exact binomial CI. Returns (lo, hi) in [0,1].
+
+    Falls back to Wilson if scipy is unavailable so the dashboard keeps
+    rendering in stripped-down environments.
+    """
+    if n <= 0:
+        return (0.0, 1.0)
+    alpha = 1.0 - conf
+    try:
+        from scipy.stats import beta  # type: ignore
+        lo = 0.0 if k == 0 else float(beta.ppf(alpha / 2, k, n - k + 1))
+        hi = 1.0 if k == n else float(beta.ppf(1 - alpha / 2, k + 1, n - k))
+        return (lo, hi)
+    except Exception:
+        # Wilson score interval fallback (z=1.96 for 95%).
+        import math
+        z = 1.959963984540054 if conf >= 0.95 else 1.6448536269514722
+        phat = k / n
+        denom = 1 + z * z / n
+        centre = (phat + z * z / (2 * n)) / denom
+        half = z * math.sqrt(phat * (1 - phat) / n + z * z / (4 * n * n)) / denom
+        return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def compute_distance_to_band(
+    forecast_temp: float | None,
+    low: float | None,
+    high: float | None,
+) -> float | None:
+    """Minimum distance (in °F) from forecast to the nearer band edge.
+
+    For a range market [low, high]:
+      - forecast inside band → distance = 0 (dangerous zone)
+      - forecast outside band → min(|forecast-low|, |forecast-high|)
+    For one-sided thresholds (only one of low/high set) we use that edge.
+    Returns None if forecast or both edges are missing.
+    """
+    if forecast_temp is None:
+        return None
+    try:
+        f = float(forecast_temp)
+    except (TypeError, ValueError):
+        return None
+    edges: list[float] = []
+    if low is not None:
+        try:
+            edges.append(float(low))
+        except (TypeError, ValueError):
+            pass
+    if high is not None:
+        try:
+            edges.append(float(high))
+        except (TypeError, ValueError):
+            pass
+    if not edges:
+        return None
+    lo = min(edges)
+    hi = max(edges)
+    if lo <= f <= hi and len(edges) == 2:
+        return 0.0
+    return min(abs(f - e) for e in edges)
+
+
+def compute_system_status(
+    exposure_by_date: list[tuple[str, int, float]],
+    delta_24h: float,
+    initial_bankroll: float,
+    freshness: dict,
+    bot_running: bool,
+) -> tuple[str, str, str]:
+    """Aggregate portfolio-level status → (label, color, hint).
+
+    CRITICAL when: bot halted, daily loss >10% bankroll, forecast stale >30min
+    CONCENTRATED when: any single date >20% bankroll, total open >35% bankroll
+    NORMAL otherwise.
+    """
+    if not bot_running:
+        return ("CRITICAL", "bold red", "Bot not running")
+    if initial_bankroll > 0 and delta_24h < -0.10 * initial_bankroll:
+        return ("CRITICAL", "bold red", f"24h loss >10% bankroll ({delta_24h:+.2f})")
+    fc_age = freshness.get("forecast_age_s")
+    if fc_age is not None and fc_age > 1800:  # 30 min
+        return ("CRITICAL", "bold red", f"Forecast stale ({fc_age/60:.0f}min)")
+    total_open = sum(c for _, _, c in exposure_by_date)
+    if initial_bankroll > 0:
+        if any(c > 0.20 * initial_bankroll for _, _, c in exposure_by_date):
+            offender = max(exposure_by_date, key=lambda r: r[2])
+            return (
+                "CONCENTRATED",
+                "bold yellow",
+                f"{offender[0]} holds ${offender[2]:.0f} ({offender[2]/initial_bankroll*100:.0f}%)",
+            )
+        if total_open > 0.35 * initial_bankroll:
+            return (
+                "CONCENTRATED",
+                "bold yellow",
+                f"Total open ${total_open:.0f} ({total_open/initial_bankroll*100:.0f}%)",
+            )
+    return ("NORMAL", "bold green", "All gauges green")
+
+
+# ---------------------------------------------------------------------------
 # Bot status helpers
 # ---------------------------------------------------------------------------
 
@@ -488,6 +815,10 @@ def build_header_panel(
     initial_bankroll: float,
     refresh_ts: str,
     unrealized: dict | None = None,
+    system_status: tuple[str, str, str] | None = None,
+    delta_24h: float | None = None,
+    freshness: dict | None = None,
+    next_resolution: dict | None = None,
 ) -> Panel:
     open_cost = perf.get("open_cost", 0.0)
     total_pnl = perf.get("total_pnl", 0.0)
@@ -516,14 +847,55 @@ def build_header_panel(
 
     line = Text()
     line.append("  WEATHEREDGE LIVE DASHBOARD", style="bold white")
-    line.append("          Status: ")
+    line.append("  ")
+    # System status semaforo (NORMAL/CONCENTRATED/CRITICAL)
+    if system_status:
+        label, style, hint = system_status
+        line.append(f"[{label}]", style=style)
+        if hint:
+            line.append(f" {hint}", style="dim")
+    line.append("\n")
+    line.append("  Status: ")
     line.append("RUNNING" if bot_running else "STOPPED", style="bold green" if bot_running else "bold red")
     line.append(f"  Uptime: {uptime}")
-    line.append(f"  Refresh: {refresh_ts}\n", style="dim")
+    line.append(f"  Refresh: {refresh_ts}", style="dim")
+    # Data freshness inline: forecast/market price ages
+    if freshness is not None:
+        fc_age = freshness.get("forecast_age_s")
+        mk_age = freshness.get("market_age_s")
+
+        def _fmt_age(age: float | None) -> tuple[str, str]:
+            if age is None:
+                return ("none", "dim red")
+            if age < 60:
+                return (f"{age:.0f}s", "dim green")
+            if age < 600:
+                return (f"{age/60:.0f}m", "dim green")
+            if age < 1800:
+                return (f"{age/60:.0f}m", "dim yellow")
+            return (f"{age/60:.0f}m", "dim red")
+
+        fc_txt, fc_style = _fmt_age(fc_age)
+        mk_txt, mk_style = _fmt_age(mk_age)
+        line.append("  Data: ", style="dim")
+        line.append(f"fc {fc_txt}", style=fc_style)
+        line.append(" | ", style="dim")
+        line.append(f"mkt {mk_txt}", style=mk_style)
+    line.append("\n")
     line.append(
         f"  Bankroll: ${bankroll:,.2f}",
         style="bold cyan",
     )
+    # 24h delta ribbon
+    if delta_24h is not None:
+        d_sign = "+" if delta_24h >= 0 else ""
+        d_color = "green" if delta_24h >= 0 else "red"
+        d_pct = (delta_24h / initial_bankroll * 100.0) if initial_bankroll else 0.0
+        d_pct_sign = "+" if d_pct >= 0 else ""
+        line.append(
+            f"  24h: {d_sign}${delta_24h:,.2f} ({d_pct_sign}{d_pct:.1f}%)",
+            style=d_color,
+        )
     line.append(
         f"  Realized: {pnl_sign}${total_pnl:,.2f} ({pnl_pct_sign}{pnl_pct:.1f}%)",
         style=pnl_color,
@@ -540,6 +912,21 @@ def build_header_panel(
     else:
         line.append(f"  Positions: {open_positions}", style="bold yellow")
     line.append(f"  Win Rate: {wr_str}", style="bold")
+    # Next resolution countdown
+    if next_resolution:
+        hrs = next_resolution.get("hours_to_resolution")
+        date_str = next_resolution.get("date", "-")
+        n = next_resolution.get("positions", 0)
+        if hrs is not None:
+            if hrs < 1:
+                cd = f"{int(hrs * 60)}m"
+            elif hrs < 48:
+                cd = f"{hrs:.1f}h"
+            else:
+                cd = f"{hrs/24:.1f}d"
+            line.append(f"  Next: {date_str} ({n} pos, in {cd})", style="dim cyan")
+        else:
+            line.append(f"  Next: {date_str} ({n} pos)", style="dim cyan")
 
     return Panel(line, style="bold blue", padding=(0, 1))
 
@@ -568,7 +955,81 @@ def _row_unrealized_pnl(row: sqlite3.Row) -> float | None:
     return None
 
 
+def _row_band_label(row: sqlite3.Row) -> str:
+    """Format the threshold band into a short label like '64-65F' or '>55F'."""
+    try:
+        lo = row["threshold_low"]
+        hi = row["threshold_high"]
+    except (KeyError, IndexError):
+        return "-"
+    if lo is not None and hi is not None:
+        try:
+            return f"{float(lo):.0f}-{float(hi):.0f}F"
+        except (TypeError, ValueError):
+            return "-"
+    if lo is not None:
+        try:
+            return f">{float(lo):.0f}F"
+        except (TypeError, ValueError):
+            return "-"
+    if hi is not None:
+        try:
+            return f"<{float(hi):.0f}F"
+        except (TypeError, ValueError):
+            return "-"
+    return "-"
+
+
+def _row_distance_cell(row: sqlite3.Row) -> tuple[Text, Text]:
+    """Return (distance, d/rmse+tag) cells for a position.
+
+    Colors encode the "distance / RMSE" ratio:
+      <1.0  → red   (lottery zone, trade 12 KDEN territory)
+      1-1.25→ yellow (marginal safety margin)
+      ≥1.25 → green (safe)
+    """
+    try:
+        forecast = row["forecast_temp"]
+        rmse = row["station_rmse"]
+        lo = row["threshold_low"]
+        hi = row["threshold_high"]
+    except (KeyError, IndexError):
+        return (Text("-", style="dim"), Text("-", style="dim"))
+
+    dist = compute_distance_to_band(forecast, lo, hi)
+    if dist is None:
+        return (Text("-", style="dim"), Text("-", style="dim"))
+    dist_cell = Text(f"{dist:.1f}F")
+
+    try:
+        rmse_f = float(rmse) if rmse is not None else None
+    except (TypeError, ValueError):
+        rmse_f = None
+    if rmse_f is None or rmse_f <= 0:
+        return (dist_cell, Text("?", style="dim"))
+
+    ratio = dist / rmse_f
+    if ratio < 1.0:
+        style = "bold red"
+        tag = f"{ratio:.2f}x ZONE"
+    elif ratio < 1.25:
+        style = "bold yellow"
+        tag = f"{ratio:.2f}x MARGIN"
+    else:
+        style = "bold green"
+        tag = f"{ratio:.2f}x SAFE"
+    return (dist_cell, Text(tag, style=style))
+
+
 def build_open_positions_panel(rows: list[sqlite3.Row]) -> Panel:
+    if not rows:
+        return Panel(
+            Text("Waiting for data...", style="dim"),
+            title="[bold]OPEN POSITIONS (0)[/bold]",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+
     table = Table(
         show_header=True,
         header_style="bold cyan",
@@ -576,44 +1037,51 @@ def build_open_positions_panel(rows: list[sqlite3.Row]) -> Panel:
         padding=(0, 1),
         expand=True,
     )
-    table.add_column("Market", style="white", no_wrap=True, max_width=22)
+    table.add_column("Stn", style="white", width=5)
+    table.add_column("Date", style="dim", width=10)
+    table.add_column("Band", style="white", width=8)
     table.add_column("Side", style="cyan", width=8)
-    table.add_column("Price", justify="right", width=6)
-    table.add_column("Amount", justify="right", width=7)
-    table.add_column("Cost", justify="right", width=7)
-    table.add_column("Unr. P&L", justify="right", width=9)
-    table.add_column("Agent", style="dim", max_width=14)
-    table.add_column("Entered", style="dim", width=12)
+    table.add_column("Px", justify="right", width=5)
+    table.add_column("Cost", justify="right", width=6)
+    table.add_column("Unr P&L", justify="right", width=8)
+    table.add_column("Dist", justify="right", width=6)
+    table.add_column("D/RMSE", justify="right", width=12)
 
-    if not rows:
-        table.add_row(Text("Waiting for data...", style="dim"), "", "", "", "", "", "", "")
-    else:
-        for row in rows:
-            side_text = Text(str(row["side"] or "-"))
-            side_style = "green" if "yes" in str(row["side"] or "").lower() else "yellow"
-            side_text.stylize(side_style)
-            unrealized = _row_unrealized_pnl(row)
-            if unrealized is not None:
-                unr_cell = _fmt_pnl(unrealized)
-            else:
-                # Distinguish "stale price" (no current_yes from scraper) from
-                # the rare malformed-row case so operators know to investigate
-                # the scraper rather than the trade itself.
-                try:
-                    is_stale = row["current_yes"] is None
-                except (KeyError, IndexError):
-                    is_stale = False
-                unr_cell = Text("STALE" if is_stale else "-", style="bold yellow" if is_stale else "dim")
-            table.add_row(
-                str(row["market_id"] or "-")[-22:],
-                side_text,
-                _fmt_price(row["price"]),
-                _fmt_price(row["amount"]),
-                _fmt_price(row["cost"]),
-                unr_cell,
-                str(row["agent_name"] or "-")[:14],
-                _fmt_ts(row["created_at"])[-12:],
-            )
+    for row in rows:
+        side_text = Text(str(row["side"] or "-"))
+        side_style = "green" if "yes" in str(row["side"] or "").lower() else "yellow"
+        side_text.stylize(side_style)
+        unrealized = _row_unrealized_pnl(row)
+        if unrealized is not None:
+            unr_cell = _fmt_pnl(unrealized)
+        else:
+            try:
+                is_stale = row["current_yes"] is None
+            except (KeyError, IndexError):
+                is_stale = False
+            unr_cell = Text("STALE" if is_stale else "-", style="bold yellow" if is_stale else "dim")
+
+        dist_cell, ratio_cell = _row_distance_cell(row)
+        try:
+            station = str(row["station"] or "-")[:5]
+        except (KeyError, IndexError):
+            station = "-"
+        try:
+            mkt_date = str(row["market_date"] or "-")[-10:]
+        except (KeyError, IndexError):
+            mkt_date = "-"
+
+        table.add_row(
+            station,
+            mkt_date,
+            _row_band_label(row),
+            side_text,
+            _fmt_price(row["price"]),
+            _fmt_price(row["cost"]),
+            unr_cell,
+            dist_cell,
+            ratio_cell,
+        )
 
     return Panel(
         table,
@@ -665,6 +1133,9 @@ def build_model_performance_panel(
     brier: float | None,
     timesfm_active: bool,
     timesfm_corrections: int,
+    decisive: dict | None = None,
+    edge_source: dict | None = None,
+    flip_stats: dict | None = None,
 ) -> Panel:
     won_final = perf.get("won", 0)
     lost_final = perf.get("lost", 0)
@@ -675,35 +1146,71 @@ def build_model_performance_panel(
     best_wr = perf.get("best_agent_wr")
 
     lines = Text()
-    brier_str = f"{brier:.4f}" if brier is not None else "N/A (need won/lost)"
+    brier_str = f"{brier:.4f}" if brier is not None else "N/A"
     wr_str = f"{win_rate:.1f}%" if win_rate is not None else "N/A"
 
-    lines.append("Brier Score:  ", style="dim")
+    lines.append("Brier:    ", style="dim")
     lines.append(f"{brier_str}\n", style="bold")
 
-    lines.append("Win Rate:     ", style="dim")
+    lines.append("Win Rate: ", style="dim")
     lines.append(f"{wr_str}", style="bold green" if (win_rate or 0) >= 55 else "bold yellow")
     lines.append(f"  ({wins_all}/{resolved} closed)\n", style="dim")
 
-    lines.append("Final:        ", style="dim")
+    # Decisive win rate with binomial 95% CI — makes sample-size fragility visible.
+    if decisive is not None:
+        wins = int(decisive.get("wins", 0))
+        losses = int(decisive.get("losses", 0))
+        n = wins + losses
+        if n > 0:
+            phat = wins / n
+            lo, hi = compute_binomial_ci(wins, n, conf=0.95)
+            ci_width = hi - lo
+            ci_color = "bold red" if ci_width > 0.50 else ("bold yellow" if ci_width > 0.25 else "bold green")
+            lines.append("Decisive: ", style="dim")
+            lines.append(f"{wins}/{n} = {phat*100:.0f}%", style="bold")
+            lines.append(f"  95%CI [{lo*100:.0f}%, {hi*100:.0f}%]\n", style=ci_color)
+        else:
+            lines.append("Decisive: ", style="dim")
+            lines.append("no won/lost yet\n", style="dim")
+
+    lines.append("Final:    ", style="dim")
     lines.append(f"{won_final}", style="green")
     lines.append(" won / ", style="dim")
     lines.append(f"{lost_final}", style="red")
-    lines.append(" lost (market-resolved)\n", style="dim")
+    lines.append(" lost\n", style="dim")
+
+    # Source of edge: floor-saturated vs genuine model signal among open trades.
+    if edge_source is not None and edge_source.get("total_open", 0) > 0:
+        total = int(edge_source["total_open"])
+        floor = int(edge_source.get("floor_saturated", 0))
+        model = int(edge_source.get("model_signal", 0))
+        floor_pct = floor / total * 100 if total else 0.0
+        model_pct = model / total * 100 if total else 0.0
+        lines.append("Edge Src: ", style="dim")
+        lines.append(f"Arb {floor_pct:.0f}%", style="yellow")
+        lines.append(" | ", style="dim")
+        lines.append(f"Model {model_pct:.0f}%", style="cyan")
+        lines.append(f"  ({floor}+{model}/{total})\n", style="dim")
+
+    # Edge Flip lifetime saver: shows the exit mechanism paying off.
+    if flip_stats is not None and flip_stats.get("count", 0) > 0:
+        count = int(flip_stats["count"])
+        saved = float(flip_stats.get("total_saved", 0.0))
+        lines.append("Flip Save:", style="dim")
+        lines.append(f" {count}x ", style="bold cyan")
+        lines.append(f"~${saved:.2f}\n", style="cyan")
 
     if best_agent and best_wr is not None:
-        lines.append("Best Agent:   ", style="dim")
-        lines.append(f"{best_agent} ({best_wr:.1f}%)\n", style="bold magenta")
-    else:
-        lines.append("Best Agent:   N/A\n", style="dim")
+        lines.append("Best Ag.: ", style="dim")
+        lines.append(f"{best_agent[:12]} ({best_wr:.0f}%)\n", style="bold magenta")
 
-    lines.append("TimesFM:      ", style="dim")
+    lines.append("TimesFM:  ", style="dim")
     if timesfm_active:
-        lines.append("Active ", style="bold green")
+        lines.append("On ", style="bold green")
         lines.append("\u2713", style="bold green")
     else:
-        lines.append("Inactive \u2717", style="dim red")
-    lines.append(f"  Corrections: {timesfm_corrections}\n", style="dim")
+        lines.append("Off \u2717", style="dim red")
+    lines.append(f"  ({timesfm_corrections})", style="dim")
 
     return Panel(
         lines,
@@ -739,6 +1246,26 @@ def build_recent_trades_panel(rows: list[sqlite3.Row]) -> Panel:
             side_str = str(row["side"] or "-")
             side_style = "green" if "yes" in side_str.lower() else "yellow"
 
+            # Edge-flip badge: status=edge_stop means the exit manager
+            # bailed out early. The "saved" estimate is cost + pnl when
+            # pnl is negative (the remaining capital we recovered vs a
+            # hypothetical total-loss outcome).
+            if status == "edge_stop":
+                cost = row["cost"]
+                pnl = row["pnl"]
+                saved = None
+                try:
+                    if cost is not None and pnl is not None and float(pnl) < 0:
+                        saved = float(cost) + float(pnl)
+                except (TypeError, ValueError):
+                    saved = None
+                status_cell = Text()
+                status_cell.append("EDGE-FLIP ", style="bold magenta")
+                if saved is not None and saved > 0:
+                    status_cell.append(f"+${saved:.2f}", style="dim green")
+            else:
+                status_cell = Text(status, style=st)
+
             table.add_row(
                 _fmt_ts(row["created_at"])[-14:],
                 str(row["market_id"] or "-")[-22:],
@@ -746,7 +1273,7 @@ def build_recent_trades_panel(rows: list[sqlite3.Row]) -> Panel:
                 _fmt_price(row["price"]),
                 _fmt_edge(row["edge_at_entry"]),
                 str(row["agent_name"] or "-")[:14],
-                Text(status, style=st),
+                status_cell,
                 _fmt_pnl(row["pnl"]),
             )
 
@@ -846,6 +1373,68 @@ def build_pnl_history_panel(daily_pnl: list[tuple[str, float]]) -> Panel:
     )
 
 
+def build_risk_cluster_panel(
+    exposure_by_date: list[tuple[str, int, float]],
+    initial_bankroll: float,
+) -> Panel:
+    """Bar gauge showing concentration of open cost per resolution date.
+
+    Highlights correlation risk: multiple positions on the same date share
+    the same synoptic regime, so a single regime miss can take them all.
+    Color thresholds: >20% red, >10% yellow, else green.
+    """
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        box=None,
+        padding=(0, 1),
+        expand=True,
+    )
+    table.add_column("Date", style="dim", width=10)
+    table.add_column("#", justify="right", width=3)
+    table.add_column("Cost", justify="right", width=9)
+    table.add_column("% BR", justify="right", width=6)
+    table.add_column("Gauge", no_wrap=True)
+
+    if not exposure_by_date:
+        table.add_row(Text("No open positions", style="dim"), "", "", "", "")
+        return Panel(
+            table,
+            title="[bold]RISK CLUSTER (per date)[/bold]",
+            border_style="magenta",
+            padding=(0, 0),
+        )
+
+    bankroll = initial_bankroll if initial_bankroll else 1.0
+
+    for date_str, count, total_cost in exposure_by_date:
+        pct = (total_cost / bankroll * 100.0) if bankroll else 0.0
+        if pct >= 20.0:
+            color = "red"
+        elif pct >= 10.0:
+            color = "yellow"
+        else:
+            color = "green"
+
+        bar_len = min(int(pct / 2), 20)
+        bar = "█" * max(bar_len, 1)
+
+        table.add_row(
+            str(date_str or "-")[:10],
+            str(count),
+            f"${total_cost:,.2f}",
+            f"{pct:.1f}%",
+            Text(bar, style=color),
+        )
+
+    return Panel(
+        table,
+        title="[bold]RISK CLUSTER (per date)[/bold]",
+        border_style="magenta",
+        padding=(0, 0),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Layout builder
 # ---------------------------------------------------------------------------
@@ -858,11 +1447,12 @@ def build_layout(
     active_markets: Panel,
     pnl_history: Panel,
     per_agent_pnl: Panel,
+    risk_cluster: Panel | None = None,
 ) -> Layout:
     layout = Layout()
 
     layout.split_column(
-        Layout(name="header", size=4),
+        Layout(name="header", size=5),
         Layout(name="middle", size=12),
         Layout(name="recent", size=14),
         Layout(name="bottom", size=12),
@@ -885,12 +1475,22 @@ def build_layout(
 
     layout["recent"].update(recent_trades)
 
-    layout["bottom"].split_row(
-        Layout(name="active_markets", ratio=3),
-        Layout(name="pnl_history", ratio=2),
-    )
-    layout["bottom"]["active_markets"].update(active_markets)
-    layout["bottom"]["pnl_history"].update(pnl_history)
+    if risk_cluster is not None:
+        layout["bottom"].split_row(
+            Layout(name="active_markets", ratio=3),
+            Layout(name="risk_cluster", ratio=2),
+            Layout(name="pnl_history", ratio=2),
+        )
+        layout["bottom"]["active_markets"].update(active_markets)
+        layout["bottom"]["risk_cluster"].update(risk_cluster)
+        layout["bottom"]["pnl_history"].update(pnl_history)
+    else:
+        layout["bottom"].split_row(
+            Layout(name="active_markets", ratio=3),
+            Layout(name="pnl_history", ratio=2),
+        )
+        layout["bottom"]["active_markets"].update(active_markets)
+        layout["bottom"]["pnl_history"].update(pnl_history)
 
     return layout
 
@@ -923,7 +1523,9 @@ class LiveDashboard:
         conn = _open_db(self.db_path)
         try:
             if conn is not None:
-                open_rows = query_open_positions(conn)
+                # Enriched query replaces the legacy open_positions call — it
+                # carries the columns the distance/RMSE column needs.
+                open_rows = query_open_positions_enriched(conn)
                 recent_rows = query_recent_trades(conn)
                 perf = query_performance(conn)
                 brier = query_brier_score(conn)
@@ -932,6 +1534,13 @@ class LiveDashboard:
                 daily_pnl = query_daily_pnl(conn)
                 unrealized = query_unrealized_pnl(conn)
                 per_agent_rows = query_per_agent_pnl(conn)
+                exposure_by_date = query_exposure_by_date(conn)
+                flip_stats = query_edge_flip_stats(conn)
+                edge_source = query_source_of_edge(conn)
+                decisive = query_decisive_counts(conn)
+                delta_24h = query_delta_24h(conn)
+                freshness = query_data_freshness(conn)
+                next_resolution = query_next_resolution(conn)
             else:
                 open_rows = []
                 recent_rows = []
@@ -946,21 +1555,57 @@ class LiveDashboard:
                 daily_pnl = []
                 unrealized = None
                 per_agent_rows = []
+                exposure_by_date = []
+                flip_stats = {"count": 0, "total_saved": 0.0, "realised_loss": 0.0}
+                edge_source = {"total_open": 0, "floor_saturated": 0, "model_signal": 0, "unknown": 0}
+                decisive = {"wins": 0, "losses": 0, "decisive": 0}
+                delta_24h = 0.0
+                freshness = {"forecast_age_s": None, "market_age_s": None}
+                next_resolution = None
         finally:
             if conn is not None:
                 conn.close()
 
-        header = build_header_panel(bot_running, uptime, perf, self._initial_bankroll, now_str, unrealized)
+        system_status = compute_system_status(
+            exposure_by_date,
+            delta_24h,
+            self._initial_bankroll,
+            freshness,
+            bot_running,
+        )
+
+        header = build_header_panel(
+            bot_running,
+            uptime,
+            perf,
+            self._initial_bankroll,
+            now_str,
+            unrealized,
+            system_status=system_status,
+            delta_24h=delta_24h,
+            freshness=freshness,
+            next_resolution=next_resolution,
+        )
         open_positions = build_open_positions_panel(open_rows)
-        model_perf = build_model_performance_panel(perf, brier, tf_active, tf_corrections)
+        model_perf = build_model_performance_panel(
+            perf,
+            brier,
+            tf_active,
+            tf_corrections,
+            decisive=decisive,
+            edge_source=edge_source,
+            flip_stats=flip_stats,
+        )
         recent_trades = build_recent_trades_panel(recent_rows)
         active_markets = build_active_markets_panel(market_rows)
         pnl_history = build_pnl_history_panel(daily_pnl)
         per_agent_pnl = build_per_agent_pnl_panel(per_agent_rows)
+        risk_cluster = build_risk_cluster_panel(exposure_by_date, self._initial_bankroll)
 
         return build_layout(
             header, open_positions, model_perf, recent_trades,
             active_markets, pnl_history, per_agent_pnl,
+            risk_cluster=risk_cluster,
         )
 
     def run(self) -> None:
