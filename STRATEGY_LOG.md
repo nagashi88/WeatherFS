@@ -2,19 +2,71 @@
 
 Living document per tracciare ipotesi, piano e lezioni. **Non è un PRD**, è un diario operativo. Aggiornare quando un'ipotesi viene validata/falsificata o quando una decisione cambia.
 
-Last updated: 2026-04-21 (Phase 1 week 2, post Apr-20 resolution + Apr-21 partial; EXIT 0 `bucket_invalidated` merged)
+Last updated: 2026-04-21 (🚨 CCG audit: Phase 1 never actually activated since 2026-04-11 — see CRITICAL FINDING below)
 
 ---
 
 ## 🎯 Stato attuale
 
-- **Phase:** 1 (activated ~2026-04-11)
-- **Trade chiusi:** 21 (11W / 2L / 7 edge_stop / 1 abandoned), win rate decisive **11/13 = 84.6%** [95% CI Clopper-Pearson ≈ 55–98%]
-- **Aperti:** 8 (4 Apr-21 / 3 Apr-22 / 1 Apr-23)
+- **Phase dichiarata:** 1 (file `current_phase.json` dal 2026-04-11)
+- **Phase runtime reale:** **phase_0_actual** — vedi CRITICAL FINDING sotto
+- **Trade chiusi:** 21 (11W / 2L / 7 edge_stop / 1 abandoned), win rate decisive **11/13 = 84.6%** [95% CI Clopper-Pearson ≈ 55–98%] — **tutti generati sotto phase_0_actual**
+- **Aperti:** 8 (4 Apr-21 / 3 Apr-22 / 1 Apr-23) — anch'essi in phase_0_actual
 - **Net realized PnL:** **+$15.39** (winners +$20.77, losers -$5.52, stops aggregati quasi flat +$0.17)
 - **Apr-19 outcome** (concentration test): 5W / 1L / 1 edge_stop, net **+$5.69**
 - **Apr-20 outcome** (post-resolution): **2W / 0L / 4 edge_stop**, net **+$5.21** — 3 dei 4 stop risolti **non** sarebbero stati loss (exit reattivo, non protettivo); id=24 KNYC buy_yes exit +$2.09 confermato YES
 - **Apr-21 partial**: id=16 KMIA stop -$0.20, altri 4 aperti (17, 21, 28, 29)
+
+---
+
+## 🚨 CRITICAL FINDING 2026-04-21 — Phase 1 never actually activated
+
+Audit CCG (Codex finding #1, verified live) ha rivelato che **Phase 1 non è mai stata applicata al runtime** dal 2026-04-11 in poi, nonostante `current_phase.json` dicesse `phase_1`.
+
+**Root cause:** `main.py:_apply_runtime_phase_override` legge solo la env var `WEATHEREDGE_PHASE`. Se vuota (default), non c'è fallback a `current_phase.json` → `MODULES` resta sui default Phase 0 di `config.py:13`. Nessun `.sh`, `.env`, systemd, plist del repo setta quella env var → in produzione è sempre stata vuota.
+
+**Evidenza live** (riprodotta su shell pulita):
+```
+current_phase.json says: phase_1
+MODULES.exit_ev_based      = False   ← doveva essere True in phase_1
+MODULES.bias_correction    = False   ← doveva essere True
+MODULES.rmse_floor_dynamic = False   ← doveva essere True
+MODULES.limit_orders       = False   ← doveva essere True
+MODULES.exit_edge_flip     = True    ← già True anche in phase_0 defaults
+MODULES.temporal_guard     = True    ← già True anche in phase_0 defaults
+MODULES.volume_filter      = True    ← già True anche in phase_0 defaults
+```
+
+**Cosa significa per i 21 trade chiusi + 8 aperti:**
+- EV-based exit **mai scattata** — `exit_edge_flip` ha fatto 100% del lavoro di chiusura; i 7 `edge_stop` sono tutti prodotto del solo edge_flip, senza competizione di EV.
+- Nessun `bias_correction` sui forecast — H4 (KMDW station bias WEAK) va riletta: il bias poteva esserci ma non lo stavamo correggendo né misurando.
+- `rmse_floor_dynamic=False` → RMSE statica; Distance/RMSE normalizzata su floor fisso.
+- `limit_orders=False` → tutti market orders, zero limit. No slippage control.
+
+**Re-tagging delle ipotesi:**
+- **H3 "VALIDATED"** → `VALIDATED under phase_0_actual`. L'edge strutturale floor-bound esiste anche senza i moduli Phase 1; è stato validato in un regime più semplice. **Conclusione più forte, non più debole** (meno confound).
+- **H7 "edge_flip troppo reattivo"** → rinforzata. Senza EV-based che competeva per tenere aperto, edge_flip ha chiuso 7/21 trade (33%): il tasso è 100% attribuibile al solo edge_flip.
+- **H4 KMDW bias** → inconclusiva, non WEAK. Non stavamo correggendo nulla.
+- **EXIT 0 `bucket_invalidated`** (merged Apr-21) → valido, non impattato dal finding.
+
+**Cosa NON abbiamo mai visto funzionare:**
+1. `_evaluate_exit_ev` — EV-based exit, mai scattata una volta
+2. Limit orders e relativo fill logic
+3. `rmse_floor_dynamic` — floor adattivo
+4. `bias_correction` — correzione station-bias
+
+**Piano di rientro (concordato 2026-04-21):**
+1. **STEP 0 (questo update)**: documentazione finding + re-tag regime runs
+2. **STEP 1**: fix `paper_trader.py` `buy_no` price semantics canonica (prep per limit_orders)
+3. **STEP 2**: fix `exit_manager.py` — EV prima di edge_flip, edge netto side-aware (prep per exit_ev_based)
+4. **STEP 3**: fix `main.py` freshness gate per-market (safety net pre-scale)
+5. **STEP 4** (post resolution delle 8 aperte, ~Apr-23/24): fix `main.py:_apply_runtime_phase_override` con fallback a `get_current_phase()` + boot assertion di coerenza MODULES vs phase dichiarata → cutover ufficiale Phase 1
+6. **Dopo cutover**: counter strategia **reset a 0** sotto `phase_1_actual`. H3/H7 vanno rivalidate sotto il nuovo regime.
+
+**Riferimenti audit:**
+- `/tmp/ccg_codex_out.md` — output completo Codex
+- `/tmp/ccg_gemini_out.md` — output completo Gemini (contributo debole, vedi sintesi)
+- File chiave: `weatheredge/main.py:74,167-182`, `weatheredge/phase_config.py:170`, `weatheredge/config.py:13`
 
 ---
 
@@ -24,11 +76,11 @@ Last updated: 2026-04-21 (Phase 1 week 2, post Apr-20 resolution + Apr-21 partia
 |---|---------|--------------|-----------------|-------|---------------------|
 | H1 | Strategia `buy_no` su bande narrow (1°F) ha edge reale | 11/13 decisive (84.6%) | CI [55-98%] — ancora largo ma bordo inferiore sale | **LIKELY** | 25+ indipendenti |
 | H2 | `distance_to_band / RMSE` è il discriminatore chiave | Winners con dist ≥3°F, loser KMDW Apr-19 a 0°F (forecast dentro la banda) | n piccolo, solo 2 losers totali | **LIKELY** | ~10-15 trade con distance <3°F |
-| H3 | Vero edge NON è il modello ma il mispricing strutturale del mercato sui narrow bands | Floor-bound NO su narrow bands continua a dominare: id=22 (p=0.05 post-shrink), id=23 (p=0.10) entrambi WON +$4.77 Apr-20. | — | **VALIDATED, RINFORZATA** (2026-04-21) | Mantenere monitoraggio, ricomputare corr con n=21 |
+| H3 | Vero edge NON è il modello ma il mispricing strutturale del mercato sui narrow bands | Floor-bound NO su narrow bands continua a dominare: id=22 (p=0.05 post-shrink), id=23 (p=0.10) entrambi WON +$4.77 Apr-20. | — | **VALIDATED under phase_0_actual** (2026-04-21 post-CCG). Re-validate after Phase 1 cutover. | Rivalidare post-cutover con nuovi trade sotto phase_1_actual |
 | H4 | KMDW ha station bias persistente (-4.4°F) | — | KMDW Apr-18 64-65F e 60-61F won + Apr-19 48-49F lost → nessun bias consistente visibile | **WEAK (verso falsificazione)** | 5+ giorni distinti prima di archiviare |
 | H5 | PROB_FLOOR=0.10 è troppo alto | Raw prob 0.003-0.095 → floor appiattisce tutto | Floor è load-bearing per i NO. Ma la distribuzione p_model è ora **bimodale**: floor=0.10 (maggioranza) + override METAR=0.80-0.95 (YES su bucket già toccato). 2/2 YES override risolti (id=24, 25) exit positivi. Sono strategie diverse. | **LIKELY FALSIFIED as "too high"** + **nuova sotto-categoria YES-override** da trattare separatamente (2026-04-21) | Logging/metriche distinte per YES-override |
 | H6 | Correlazione intra-day su same-regime rende `max_single_date=25%` troppo largo | — | **Apr-20 post-resolution: 3/4 stop non sarebbero stati loss** (id=13, 15, 18 → resolution win in altri bucket adiacenti es. id=22, 23). Il "cluster" era exit reattivo, non correlazione strutturale. | **WEAKENED again** (2026-04-21, post-resolution Apr-20) — il problema è `exit_edge_flip`, non concentration | Osservare Apr-21 cluster (4 pos) + confermare pattern |
-| H7 | `exit_edge_flip` è troppo reattivo sui NO narrow bands | 7 stop su 21 (33%), aggregato +$0.17. Apr-20: id=13/15/18 stop -$1.65 mentre cugini floor-bound (id=22, 23) su bucket adiacenti stesso station-day hanno WON +$4.77. | Save reali: id=24 (+$2.09), id=25 (+$0.45), id=9 evitato loss peggiore. | **NEW, LIKELY** (2026-04-21); **parzialmente indirizzata** da EXIT 0 per i buy_yes post-invalidazione METAR (2026-04-21) | Event study Apr-20 stops (ora tutti risolti); osservare se dopo EXIT 0 il tasso di edge_stop sui `buy_no` resta sproporzionato |
+| H7 | `exit_edge_flip` è troppo reattivo sui NO narrow bands | 7 stop su 21 (33%), aggregato +$0.17. Apr-20: id=13/15/18 stop -$1.65 mentre cugini floor-bound (id=22, 23) su bucket adiacenti stesso station-day hanno WON +$4.77. Post-CCG: `exit_ev_based=False` in phase_0_actual → edge_flip ha fatto 100% lavoro di chiusura, no competizione. | Save reali: id=24 (+$2.09), id=25 (+$0.45), id=9 evitato loss peggiore. | **NEW, RINFORZATA** (2026-04-21 post-CCG); il tasso 33% è da attribuire al solo edge_flip, senza EV che potesse tenere aperto. Post-cutover Phase 1 osservare se EV-based riduce stop rate. | Event study Apr-20 stops (ora tutti risolti); osservare tasso edge_stop post-cutover con EV attivo |
 
 ---
 
@@ -77,6 +129,8 @@ Last updated: 2026-04-21 (Phase 1 week 2, post Apr-20 resolution + Apr-21 partia
 | 2026-04-21 | **Riconoscere strategia bimodale**: floor-bound NO (H3) + YES-override METAR (nuova) | Distribuzione p_model bimodale (0.10 vs 0.80-0.95). id=24, 25 ambedue YES-override exit positivi. Richiede logging/metriche separate. Nessun cambio di codice, solo disambiguazione analitica. |
 | 2026-04-21 | **Confermato monitor-only** (nessun intervento da giorni — scelta esplicita) | Mancano ~4 trade a raggiungere soglia 25 totali. Apr-21/22/23 apertura 8 pos già fatta dal sistema; aspettare resolution senza override manuale. |
 | 2026-04-21 | **EXIT 0 `bucket_invalidated`** implementato (validato CCG: Codex + Gemini) | Bug strutturale: quando METAR osserva `daily_high > bucket_high`, YES è fisicamente impossibile ma nessuna regola esistente chiudeva la posizione (edge_flip non scatta se market≈0 e model≈0.05, EV marginalmente a favore di hold, time_decay aspetta l'ultima ora). Nuova regola pre-empts tutte: check flag `bucket_invalidated_for_yes` + side `buy_yes` → exit con status `bucket_invalidated`. Asimmetrica: `buy_no` non inclusa (edge_flip gestisce naturalmente). 7 test, 0 regressioni su 1868 test totali. Indirizza la root cause di H7 (exit reattivo su buy_yes post-invalidazione); H7 sui `buy_no` resta aperta. |
+| 2026-04-21 | 🚨 **CCG audit finding: Phase 1 never actually activated** (verified live) | `main.py:_apply_runtime_phase_override` legge solo env var `WEATHEREDGE_PHASE`, mai settata in prod. `current_phase.json=phase_1` dal 2026-04-11 è stato ignorato al boot. MODULES runtime = phase_0 defaults: `exit_ev_based=False`, `bias_correction=False`, `rmse_floor_dynamic=False`, `limit_orders=False`. Conseguenza: tutti i 21 trade chiusi + 8 aperti generati sotto **phase_0_actual**. H3 re-tagged `VALIDATED under phase_0_actual` (conclusione più forte, meno confound); H7 rinforzata (edge_flip ha fatto 100% lavoro chiusura senza EV-based a competere); H4 inconclusiva (nessuna bias_correction in gioco). |
+| 2026-04-21 | Piano di rientro in 5 step | STEP 0 (fatto): update STRATEGY_LOG. STEP 1-3: fix preparatori zero-impact in Phase 0 (buy_no price semantics canonica, EV prima di edge_flip, freshness per-market). STEP 4 (post resolution 8 aperte ~Apr-23/24): fix attivazione phase + boot assertion → cutover Phase 1 + counter trade reset. STEP 5: conferma formula fee Kalshi (flat 0.02 vs 0.07·p·(1-p)). |
 
 ---
 
