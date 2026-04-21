@@ -2,14 +2,14 @@
 
 Living document per tracciare ipotesi, piano e lezioni. **Non è un PRD**, è un diario operativo. Aggiornare quando un'ipotesi viene validata/falsificata o quando una decisione cambia.
 
-Last updated: 2026-04-21 (🚨 CCG audit: Phase 1 never actually activated since 2026-04-11 — see CRITICAL FINDING below)
+Last updated: 2026-04-22 (✅ Piano di rientro Phase 1 completato — 5/5 step committati; runtime ora allineato a `current_phase.json`)
 
 ---
 
 ## 🎯 Stato attuale
 
 - **Phase dichiarata:** 1 (file `current_phase.json` dal 2026-04-11)
-- **Phase runtime reale:** **phase_0_actual** — vedi CRITICAL FINDING sotto
+- **Phase runtime reale:** **phase_1_actual** post-cutover 2026-04-22 (era phase_0_actual fino al 2026-04-21 — vedi CRITICAL FINDING + close-out sotto)
 - **Trade chiusi:** 21 (11W / 2L / 7 edge_stop / 1 abandoned), win rate decisive **11/13 = 84.6%** [95% CI Clopper-Pearson ≈ 55–98%] — **tutti generati sotto phase_0_actual**
 - **Aperti:** 8 (4 Apr-21 / 3 Apr-22 / 1 Apr-23) — anch'essi in phase_0_actual
 - **Net realized PnL:** **+$15.39** (winners +$20.77, losers -$5.52, stops aggregati quasi flat +$0.17)
@@ -55,13 +55,14 @@ MODULES.volume_filter      = True    ← già True anche in phase_0 defaults
 3. `rmse_floor_dynamic` — floor adattivo
 4. `bias_correction` — correzione station-bias
 
-**Piano di rientro (concordato 2026-04-21):**
-1. **STEP 0 (questo update)**: documentazione finding + re-tag regime runs
-2. **STEP 1**: fix `paper_trader.py` `buy_no` price semantics canonica (prep per limit_orders)
-3. **STEP 2**: fix `exit_manager.py` — EV prima di edge_flip, edge netto side-aware (prep per exit_ev_based)
-4. **STEP 3**: fix `main.py` freshness gate per-market (safety net pre-scale)
-5. **STEP 4** (post resolution delle 8 aperte, ~Apr-23/24): fix `main.py:_apply_runtime_phase_override` con fallback a `get_current_phase()` + boot assertion di coerenza MODULES vs phase dichiarata → cutover ufficiale Phase 1
-6. **Dopo cutover**: counter strategia **reset a 0** sotto `phase_1_actual`. H3/H7 vanno rivalidate sotto il nuovo regime.
+**Piano di rientro (concordato 2026-04-21, completato 2026-04-22):**
+1. ✅ **STEP 0** (`b65c1e8`): documentazione finding + re-tag regime runs
+2. ✅ **STEP 1** (`b6e188f`): fix `paper_trader.py` `buy_no` price semantics canonica (prep per limit_orders)
+3. ✅ **STEP 2** (`313a024`): fix `exit_manager.py` — EV prima di edge_flip, edge netto side-aware (prep per exit_ev_based)
+4. ✅ **STEP 3** (`2caedd7`): fix `main.py` freshness gate per-market (safety net pre-scale)
+5. ✅ **STEP 4** (`f3dc61e`): fix `main.py:_apply_runtime_phase_override` con fallback a `get_current_phase()` + boot assertion di coerenza MODULES vs phase dichiarata → **cutover ufficiale Phase 1 avvenuto 2026-04-22**
+6. ✅ **STEP 5** (`0692b6a`): fix formula fee Kalshi `ceil(0.07·p·(1-p)·100)/100` per trade (round-trip ≈ 0.05 a p=0.5, non flat 0.02) — elimina trade sub-break-even post-fee
+7. **Post-cutover**: counter strategia **reset a 0** sotto `phase_1_actual`. H3/H7 vanno rivalidate sotto il nuovo regime. Test suite verde (1881 passed, 39 skipped, 0 regressioni).
 
 **Riferimenti audit:**
 - `/tmp/ccg_codex_out.md` — output completo Codex
@@ -131,6 +132,12 @@ MODULES.volume_filter      = True    ← già True anche in phase_0 defaults
 | 2026-04-21 | **EXIT 0 `bucket_invalidated`** implementato (validato CCG: Codex + Gemini) | Bug strutturale: quando METAR osserva `daily_high > bucket_high`, YES è fisicamente impossibile ma nessuna regola esistente chiudeva la posizione (edge_flip non scatta se market≈0 e model≈0.05, EV marginalmente a favore di hold, time_decay aspetta l'ultima ora). Nuova regola pre-empts tutte: check flag `bucket_invalidated_for_yes` + side `buy_yes` → exit con status `bucket_invalidated`. Asimmetrica: `buy_no` non inclusa (edge_flip gestisce naturalmente). 7 test, 0 regressioni su 1868 test totali. Indirizza la root cause di H7 (exit reattivo su buy_yes post-invalidazione); H7 sui `buy_no` resta aperta. |
 | 2026-04-21 | 🚨 **CCG audit finding: Phase 1 never actually activated** (verified live) | `main.py:_apply_runtime_phase_override` legge solo env var `WEATHEREDGE_PHASE`, mai settata in prod. `current_phase.json=phase_1` dal 2026-04-11 è stato ignorato al boot. MODULES runtime = phase_0 defaults: `exit_ev_based=False`, `bias_correction=False`, `rmse_floor_dynamic=False`, `limit_orders=False`. Conseguenza: tutti i 21 trade chiusi + 8 aperti generati sotto **phase_0_actual**. H3 re-tagged `VALIDATED under phase_0_actual` (conclusione più forte, meno confound); H7 rinforzata (edge_flip ha fatto 100% lavoro chiusura senza EV-based a competere); H4 inconclusiva (nessuna bias_correction in gioco). |
 | 2026-04-21 | Piano di rientro in 5 step | STEP 0 (fatto): update STRATEGY_LOG. STEP 1-3: fix preparatori zero-impact in Phase 0 (buy_no price semantics canonica, EV prima di edge_flip, freshness per-market). STEP 4 (post resolution 8 aperte ~Apr-23/24): fix attivazione phase + boot assertion → cutover Phase 1 + counter trade reset. STEP 5: conferma formula fee Kalshi (flat 0.02 vs 0.07·p·(1-p)). |
+| 2026-04-22 | ✅ **STEP 1 chiuso** (`b6e188f`): `paper_trader.py` buy_no limit-fill ora persiste YES-price canonica (`1 - no_price`) su `entry_price`. Unblocka `limit_orders=True` Phase 1 senza rompere downstream (edge, EV, exit_manager). | Audit CCG: discrepanza tra entry_price (veniva persistito NO-price dopo fill limit) e `market_price_yes` avrebbe contaminato tutti i calcoli di edge/EV post-entry su ordini limit. Fix zero-impact in Phase 0 (limit_orders=False → codepath mai eseguito), necessario prima del cutover. |
+| 2026-04-22 | ✅ **STEP 2 chiuso** (`313a024`): `exit_manager.py` riordina exit rules — `_evaluate_exit_ev` ora viene valutata PRIMA di `_evaluate_exit_edge_flip`. Edge netto side-aware (non più solo YES-side). | H7 (edge_flip troppo reattivo) identificava la root cause: in phase_0_actual, edge_flip ha fatto 100% del lavoro di chiusura perché EV-based era disattivo. Riordinando le rules, quando Phase 1 attiva `exit_ev_based=True`, EV può vincere la competizione e tenere aperta una posizione che edge_flip avrebbe chiuso prematuramente. Zero-impact fino al cutover. |
+| 2026-04-22 | ✅ **STEP 3 chiuso** (`2caedd7`): `main.py` freshness gate ora per-market (oltre al gate globale esistente). `MarketOpportunity` porta `market_price_timestamp`; pre-pass in `_run_decision_cycle` skippa i mercati con age > `market_data_ttl_minutes`. Summary log include `stale_market_count`. | Il gate globale sul newest row non protegge i mercati illiquidi: con 20+ mercati per cluster, un row fresco su uno qualsiasi lascia passare tutti gli altri. Safety net pre-scaling — se il fetcher fallisce in modo parziale, ora i mercati con dati vecchi vengono esclusi singolarmente. Exit_manager gestisce già "opp is None → hold" sulle posizioni aperte. |
+| 2026-04-22 | ✅ **STEP 4 chiuso** (`f3dc61e`) — **CUTOVER PHASE 1 UFFICIALE**: `_apply_runtime_phase_override` ora fa fallback su `get_current_phase()` quando `WEATHEREDGE_PHASE` env non è set. Boot assertion confronta `MODULES` vs `get_phase_modules(phase)` e logga `ERROR` su divergenza. Test `test_runtime_phase_boot_assertion_logs_on_mismatch` copre il caso April-2026 che avrebbe dovuto suonare l'allarme. | La safety net permanente contro questa classe di bug: ogni boot ora emette `boot_phase_check: MODULES match declared phase <X>` (info) o un ERROR ultra-rumoroso se qualcosa rompe il merge. **Da ora in poi i trade sono phase_1_actual** (EV-based exit, bias_correction, rmse_floor_dynamic, limit_orders tutti attivi). Counter H3/H7 **resettato a 0** sotto nuovo regime. |
+| 2026-04-22 | ✅ **STEP 5 chiuso** (`0692b6a`): `probability/edge.py` corretta formula fee Kalshi. Prima: flat `0.02` round-trip. Ora: `kalshi_taker_fee(p) = ceil(0.07·p·(1-p)·100)/100` per trade, round-trip = `2·taker(p) + avg_spread/2`. A p=0.5, vera round-trip = $0.05 (non $0.02). | Sotto la vecchia formula, il bot stava accettando trade con edge netto positivo apparente ma reale sub-break-even (underpricing del fee di 2.5× nel worst case). Test `test_kalshi_taker_fee_formula_ceil_0_07_p_1mp` copre i punti chiave della curva. Test `test_net_edge_kalshi_exact_value` aggiornato con il nuovo costo atteso (0.18 → 0.15). **Impatto atteso**: soglia di entrata più alta sui mercati p∈[0.3, 0.7] — molti "win marginali" pre-fix non supereranno più il net-edge threshold. |
+| 2026-04-22 | ✅ **Piano di rientro COMPLETO** (5/5 step committati) | Test suite verde: 1881 passed, 39 skipped, 0 regressioni. Branch `exp/phase1-vs-phase2-paper`. Prossimo boot del bot applicherà automaticamente phase_1 + logga boot assertion. Da monitorare Apr-22/23/24: tasso `edge_stop`, numero di exit_ev_based scattate, trade filtrati dal nuovo fee model. |
 
 ---
 
