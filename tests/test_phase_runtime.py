@@ -37,6 +37,69 @@ def test_runtime_phase_override_uses_env_without_persist(monkeypatch):
     mock_activate.assert_called_once_with("phase_1", persist=False)
 
 
+def test_runtime_phase_falls_back_to_current_phase_json_when_env_unset(monkeypatch):
+    """STEP 4: without WEATHEREDGE_PHASE, the bot must load the phase
+    persisted in current_phase.json instead of silently running Phase 0."""
+    from weatheredge.main import _apply_runtime_phase_override
+
+    mock_activate = MagicMock()
+    monkeypatch.delenv("WEATHEREDGE_PHASE", raising=False)
+    monkeypatch.setattr("weatheredge.phase_config.activate_phase", mock_activate)
+    monkeypatch.setattr("weatheredge.phase_config.get_current_phase", lambda: "phase_1")
+
+    result = _apply_runtime_phase_override()
+
+    assert result == "phase_1"
+    mock_activate.assert_called_once_with("phase_1", persist=False)
+
+
+def test_runtime_phase_phase_0_no_env_does_not_call_activate(monkeypatch):
+    """STEP 4: when neither env var nor json declare a post-Phase-0 state,
+    the function should be a no-op (no activate_phase call, no noisy logs)."""
+    from weatheredge.main import _apply_runtime_phase_override
+
+    mock_activate = MagicMock()
+    monkeypatch.delenv("WEATHEREDGE_PHASE", raising=False)
+    monkeypatch.setattr("weatheredge.phase_config.activate_phase", mock_activate)
+    monkeypatch.setattr("weatheredge.phase_config.get_current_phase", lambda: "phase_0")
+
+    result = _apply_runtime_phase_override()
+
+    assert result == "phase_0"
+    mock_activate.assert_not_called()
+
+
+def test_runtime_phase_boot_assertion_logs_on_mismatch(monkeypatch, caplog):
+    """STEP 4: boot_phase_check must log ERROR when MODULES diverge from
+    the declared phase's expected modules. This is the safety net that
+    would have surfaced the April-2026 bug where current_phase.json said
+    phase_1 but MODULES silently stayed at Phase-0 defaults."""
+    import logging
+    from weatheredge.main import _apply_runtime_phase_override
+
+    monkeypatch.delenv("WEATHEREDGE_PHASE", raising=False)
+    monkeypatch.setattr("weatheredge.phase_config.get_current_phase", lambda: "phase_1")
+    # activate_phase is mocked out → MODULES never actually get updated, so
+    # the boot check must detect the divergence (exit_ev_based expected True
+    # in phase_1 but config.py default is False).
+    monkeypatch.setattr("weatheredge.phase_config.activate_phase", MagicMock())
+
+    original_modules = dict(cfg.MODULES)
+    cfg.MODULES["exit_ev_based"] = False
+    cfg.MODULES["bias_correction"] = False
+    try:
+        with caplog.at_level(logging.ERROR, logger="weatheredge.main"):
+            _apply_runtime_phase_override()
+    finally:
+        cfg.MODULES.clear()
+        cfg.MODULES.update(original_modules)
+
+    assert any(
+        "boot_phase_check" in rec.message and "diverge" in rec.message
+        for rec in caplog.records
+    ), f"Expected boot_phase_check divergence ERROR, got: {[r.message for r in caplog.records]}"
+
+
 def test_runtime_order_mode_override_market(monkeypatch):
     from weatheredge.main import _apply_runtime_order_mode_override
 

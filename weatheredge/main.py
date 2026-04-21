@@ -165,21 +165,77 @@ def setup_logging() -> None:
 
 
 def _apply_runtime_phase_override() -> str | None:
-    """Apply phase from WEATHEREDGE_PHASE to MODULES for this process only.
+    """Apply phase to MODULES at startup.
 
-    This keeps per-process phase isolation for parallel paper runs.
+    Precedence:
+      1. WEATHEREDGE_PHASE env var — explicit override for parallel paper
+         runs. Does not write current_phase.json.
+      2. current_phase.json — persisted phase from activate_phase(). If
+         neither is set, falls through with no change (MODULES keeps the
+         hard-coded defaults in config.py, which is effectively Phase 0).
+
+    After applying, runs a boot assertion comparing active MODULES against
+    the declared phase's expected modules. Mismatches are logged as ERROR
+    but not raised — the bot keeps running with whatever MODULES were set,
+    so the operator sees the divergence in logs instead of a silent drift.
+
+    Pre-STEP-4 this function only read the env var, so a bot started
+    without WEATHEREDGE_PHASE ran with config.py's hardcoded Phase-0-ish
+    defaults even when current_phase.json declared phase_1.
     """
-    phase_name = (os.getenv(_PHASE_ENV_VAR) or "").strip()
-    if not phase_name:
-        return None
-    from weatheredge.phase_config import activate_phase
-    activate_phase(phase_name, persist=False)
-    log.info(
-        "Runtime phase override active: %s=%s (no current_phase.json write)",
-        _PHASE_ENV_VAR,
-        phase_name,
+    from weatheredge.phase_config import (
+        activate_phase,
+        get_current_phase,
+        get_phase_modules,
     )
-    return phase_name
+    import weatheredge.config as _cfg
+
+    env_value = (os.getenv(_PHASE_ENV_VAR) or "").strip()
+    if env_value:
+        activate_phase(env_value, persist=False)
+        log.info(
+            "Runtime phase override active: %s=%s (no current_phase.json write)",
+            _PHASE_ENV_VAR,
+            env_value,
+        )
+        applied_phase: str | None = env_value
+    else:
+        persisted = get_current_phase()
+        if persisted != "phase_0":
+            # Only activate when the persisted phase adds something on top of
+            # the config.py defaults — avoids a noisy no-op log on first boot
+            # before any phase has ever been activated.
+            activate_phase(persisted, persist=False)
+            log.info(
+                "Startup phase loaded from current_phase.json: %s (no %s env var)",
+                persisted, _PHASE_ENV_VAR,
+            )
+        else:
+            log.info(
+                "Startup phase: phase_0 (no %s env var, no persisted phase)",
+                _PHASE_ENV_VAR,
+            )
+        applied_phase = persisted
+
+    # Boot assertion: MODULES active vs MODULES expected for applied phase.
+    try:
+        expected = get_phase_modules(applied_phase) if applied_phase else {}
+    except Exception as exc:
+        log.warning("boot_phase_check: could not resolve expected modules: %s", exc)
+        return applied_phase
+    mismatches: list[str] = []
+    for key, want in expected.items():
+        got = _cfg.MODULES.get(key)
+        if got != want:
+            mismatches.append(f"{key}=expected:{want},got:{got}")
+    if mismatches:
+        log.error(
+            "boot_phase_check: MODULES diverge from declared phase %s — %s",
+            applied_phase, "; ".join(mismatches),
+        )
+    else:
+        log.info("boot_phase_check: MODULES match declared phase %s", applied_phase)
+    return applied_phase
 
 
 def _apply_runtime_order_mode_override() -> str | None:

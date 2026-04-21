@@ -3100,6 +3100,13 @@ class TestMainEntrypointExceptions:
         """QualitativeAgent is created when enabled and api key present (lines 1464-1465)."""
         from weatheredge.agents.qualitative import QualitativeAgent
 
+        # STEP 4: _apply_runtime_phase_override now reads current_phase.json at
+        # startup (phase_1 there disables agent_qualitative), which would wipe
+        # the conftest autouse-all-True MODULES state this test depends on.
+        # Short-circuit it for this test since the test doesn't exercise phase
+        # logic — it just verifies QualitativeAgent is constructed.
+        monkeypatch.setattr(main_module, "_apply_runtime_phase_override", lambda: None)
+
         state = _make_app_state()
         state.shutting_down = True
         state.settings = MagicMock()
