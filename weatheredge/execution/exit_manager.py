@@ -1,9 +1,11 @@
 """Exit strategy manager for WeatherEdge.
 
-Evaluates 3 exit rules on every open position each decision cycle:
-  1. Edge-Based Trailing Stop  — sell if model flips against us by >3%
-  2. Asymmetric Capital Protection — stop-loss with model-confidence gate
-  3. Time-Decay Exit — lock profits / force-exit near resolution
+Evaluates 5 exit rules per open position each decision cycle, in priority:
+  0. Structural bucket invalidation — buy_yes on physically-impossible bucket
+  1. EV-Based Exit (Phase 1) — close if EV(close) > EV(hold) + buffer
+  2. Edge-Based Trailing Stop — fallback if model flips against us by >3%
+  3. Asymmetric Capital Protection — P&L stop-loss (gated)
+  4. Time-Decay Exit — lock profits / force-exit near resolution
 
 Returns a list of (position, reason) tuples for positions that should be closed.
 """
@@ -111,11 +113,31 @@ class ExitManager:
             )
             return "bucket_invalidated"
 
-        # ================================================================
-        # EXIT 1: Edge-Based Trailing Stop
-        # Gated by MODULES flag — disabled in Phase 1+ in favour of EV-based exit.
-        # ================================================================
         from weatheredge.config import MODULES
+
+        # ================================================================
+        # EXIT 1: EV-Based Exit (Phase 1 primary decision rule)
+        # STEP 2: moved before edge_flip. With EV at check #1, closes that
+        # optimal EV would author get labeled ev_based instead of being
+        # shadowed by the edge_flip heuristic. When EV says hold (returns
+        # False), execution falls through to edge_flip as a safety net.
+        # ================================================================
+        if MODULES.get("exit_ev_based", False):
+            ev_exit = self._evaluate_exit_ev(pos, current_price, model_prob)
+            if ev_exit:
+                log.info(
+                    "EXIT ev_based: market=%s pnl=%.1f%% → EV of closing > EV of holding",
+                    market_id, pnl_pct * 100,
+                )
+                return "ev_based"
+
+        # ================================================================
+        # EXIT 2: Edge-Based Trailing Stop (fallback when EV says hold but
+        # current edge has flipped hard against our position).
+        # NOTE: current_edge is gross (model - price) side-aware;
+        # entry_edge stored on pos is NET of fees (see portfolio_manager).
+        # The asymmetry is kept for now — threshold is calibrated on gross.
+        # ================================================================
         if MODULES.get("exit_edge_flip", True) and current_edge < EDGE_STOP_THRESHOLD:
             log.info(
                 "EXIT edge_stop: market=%s entry_edge=%.1f%% current_edge=%.1f%% → selling",
@@ -124,7 +146,7 @@ class ExitManager:
             return "edge_stop"
 
         # ================================================================
-        # EXIT 2: Asymmetric Capital Protection
+        # EXIT 3: Asymmetric Capital Protection
         # PRD v3.1: STRUCTURAL KILL on P&L stop-loss — gated by MODULES flag.
         # On prediction markets, P&L drawdown without model change = better odds.
         # ================================================================
@@ -149,18 +171,6 @@ class ExitManager:
                 "exit_manager: market=%s pnl=%.1f%% but model_confidence=%.1f%% >= %.0f%% → holding dip",
                 market_id, pnl_pct * 100, model_confidence * 100, MODEL_CONF_FLOOR * 100,
             )
-
-        # ================================================================
-        # EXIT 2b: EV-Based Exit (Phase 1 — replaces P&L stop-loss)
-        # ================================================================
-        if MODULES.get("exit_ev_based", False):
-            ev_exit = self._evaluate_exit_ev(pos, current_price, model_prob)
-            if ev_exit:
-                log.info(
-                    "EXIT ev_based: market=%s pnl=%.1f%% → EV of closing > EV of holding",
-                    market_id, pnl_pct * 100,
-                )
-                return "ev_based"
 
         # ================================================================
         # EXIT 3: Time-Decay Exit

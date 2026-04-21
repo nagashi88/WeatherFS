@@ -98,20 +98,29 @@ def test_evaluate_returns_empty_when_no_positions(mgr):
 
 
 def test_evaluate_returns_only_positions_that_should_close(mgr):
-    pos_close = make_pos(market_id="MKT-A", side="buy_yes", price=0.60, amount=100, cost=60)
-    pos_hold = make_pos(market_id="MKT-B", side="buy_yes", price=0.60, amount=100, cost=60)
+    # STEP 2: isolate edge_flip by disabling exit_ev_based so this test
+    # targets the edge-based rule only (after STEP 2 reorder, ev_based
+    # would also fire on these params and shadow edge_stop).
+    import weatheredge.config as cfg
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_ev_based"] = False
+    try:
+        pos_close = make_pos(market_id="MKT-A", side="buy_yes", price=0.60, amount=100, cost=60)
+        pos_hold = make_pos(market_id="MKT-B", side="buy_yes", price=0.60, amount=100, cost=60)
 
-    # MKT-A: model flipped against us hard → edge_stop
-    opp_close = make_opp(model_probability=0.50, market_price=0.60)  # edge = -0.10
-    # MKT-B: model still favourable → no exit
-    opp_hold = make_opp(model_probability=0.70, market_price=0.60)   # edge = +0.10
+        # MKT-A: model flipped against us hard → edge_stop
+        opp_close = make_opp(model_probability=0.50, market_price=0.60)  # edge = -0.10
+        # MKT-B: model still favourable → no exit
+        opp_hold = make_opp(model_probability=0.70, market_price=0.60)   # edge = +0.10
 
-    opps = {"MKT-A": opp_close, "MKT-B": opp_hold}
-    result = mgr.evaluate([pos_close, pos_hold], opps, {})
+        opps = {"MKT-A": opp_close, "MKT-B": opp_hold}
+        result = mgr.evaluate([pos_close, pos_hold], opps, {})
 
-    assert len(result) == 1
-    assert result[0][0]["market_id"] == "MKT-A"
-    assert result[0][1] == "edge_stop"
+        assert len(result) == 1
+        assert result[0][0]["market_id"] == "MKT-A"
+        assert result[0][1] == "edge_stop"
+    finally:
+        cfg.MODULES["exit_ev_based"] = orig_ev
 
 
 def test_evaluate_appends_tuple_of_position_and_reason(mgr):
@@ -174,10 +183,17 @@ def test_exit1_buy_no_edge_formula(mgr):
     """buy_no edge = (1-model_prob) - (1-price) = price - model_prob.
     price=0.60, model_prob=0.65 → edge = 0.60-0.65 = -0.05 → edge_stop.
     """
-    pos = make_pos(side="buy_no", price=0.60, amount=100, cost=40)
-    opp = make_opp(model_probability=0.65, market_price=0.60)  # edge = -0.05
-    reason = mgr._check_position(pos, {"MKT-1": opp}, {})
-    assert reason == "edge_stop"
+    # STEP 2: isolate edge_flip — after reorder, ev_based would also fire.
+    import weatheredge.config as cfg
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_ev_based"] = False
+    try:
+        pos = make_pos(side="buy_no", price=0.60, amount=100, cost=40)
+        opp = make_opp(model_probability=0.65, market_price=0.60)  # edge = -0.05
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+        assert reason == "edge_stop"
+    finally:
+        cfg.MODULES["exit_ev_based"] = orig_ev
 
 
 def test_exit1_buy_no_no_trigger_when_edge_favourable(mgr):
@@ -834,6 +850,59 @@ def test_exit0_handles_missing_bucket_metadata_gracefully(mgr):
     )
     reason = mgr._check_position(pos, {"MKT-1": opp}, {})
     assert reason == "bucket_invalidated"
+
+
+def test_ev_based_priority_over_edge_flip_when_both_would_fire(mgr):
+    # STEP 2: with both exit_ev_based and exit_edge_flip enabled, and both
+    # rules would trigger on the same position, the reorder guarantees the
+    # close is labeled "ev_based" (the optimal rule) rather than "edge_stop"
+    # (the heuristic trailing stop).
+    # buy_yes, cost=60, model=0.10, price=0.50:
+    #   current_edge = 0.10 - 0.50 = -0.40 → edge_flip would fire
+    #   ev_hold = 0.10*(100-60) - 0.90*60 = 4 - 54 = -50
+    #   ev_close = 0.50*100 - 60 - 2 = -12 → ev_close(-12) > ev_hold(-50)+0.05*60(3) → fire
+    import weatheredge.config as cfg
+    orig_flip = cfg.MODULES.get("exit_edge_flip", True)
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_edge_flip"] = True
+    cfg.MODULES["exit_ev_based"] = True
+    try:
+        pos = make_pos(side="buy_yes", price=0.60, amount=100, cost=60)
+        opp = make_opp(model_probability=0.10, market_price=0.50)
+        with patch.object(ExitManager, "_lead_time_hours", return_value=10.0):
+            reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+        assert reason == "ev_based", f"expected ev_based priority, got {reason}"
+    finally:
+        cfg.MODULES["exit_edge_flip"] = orig_flip
+        cfg.MODULES["exit_ev_based"] = orig_ev
+
+
+def test_edge_flip_still_fires_when_ev_says_hold(mgr):
+    # STEP 2 regression: if EV returns False (hold) but edge has flipped,
+    # edge_flip must still fire as the safety net. The reorder MUST NOT
+    # mask edge_flip when EV itself does not want to close.
+    # Setup: pick params where EV says hold but edge_flip would trigger.
+    # buy_no, entry YES=0.20, cost=80. Now model_prob=0.10, market YES=0.05.
+    #   current_edge = current_price - model_prob = 0.05 - 0.10 = -0.05
+    #                  → below EDGE_STOP_THRESHOLD (-0.03) → edge_flip triggers
+    #   ev_hold = (1-0.10)*(100-80) - 0.10*80 = 18 - 8 = +10
+    #   ev_close = (1-0.05)*100 - 80 - 0.02*100 = 95 - 80 - 2 = +13
+    #   buffer = 0.05*80 = 4; 13 > 10 + 4 → FALSE → EV says HOLD
+    # Expectation: EV holds (falls through) but edge_flip catches it.
+    import weatheredge.config as cfg
+    orig_flip = cfg.MODULES.get("exit_edge_flip", True)
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_edge_flip"] = True
+    cfg.MODULES["exit_ev_based"] = True
+    try:
+        pos = make_pos(side="buy_no", price=0.20, amount=100, cost=80)
+        opp = make_opp(model_probability=0.10, market_price=0.05)
+        with patch.object(ExitManager, "_lead_time_hours", return_value=10.0):
+            reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+        assert reason == "edge_stop", f"expected edge_flip safety net, got {reason}"
+    finally:
+        cfg.MODULES["exit_edge_flip"] = orig_flip
+        cfg.MODULES["exit_ev_based"] = orig_ev
 
 
 def test_exit_ev_based_holds_when_ev_hold_exceeds_ev_close(mgr):
