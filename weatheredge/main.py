@@ -864,6 +864,17 @@ def _run_decision_cycle(state: AppState) -> None:
     llm_skipped = 0
     position_skipped = 0
 
+    # Per-market freshness gate: the global gate above tests the newest row
+    # across ALL markets, so a single liquid market with a fresh tick masks
+    # stale rows on illiquid ones. Check each market's own price_timestamp
+    # against market_data_ttl_minutes so a stale illiquid market is skipped
+    # instead of feeding phantom edge into strategies. When opp is None here,
+    # exit_manager's `opp is None → hold` branch keeps any open position open
+    # until fresh data arrives — the correct conservative behavior.
+    per_market_ttl = state.settings.market_data_ttl_minutes
+    _now_utc = datetime.now(timezone.utc)
+    stale_market_count = 0
+
     # H5 fix: Pre-pass — build ALL opportunities before running any strategy.
     # Previously _opps_by_city was populated mid-loop, so the first market in a
     # city saw 0 companions while later ones saw all predecessors (asymmetric ladder).
@@ -878,6 +889,24 @@ def _run_decision_cycle(state: AppState) -> None:
                 if not _ok:
                     log.debug("run_decision_loop: skipping %s — %s (vol=%.0f spread=%.4f)", market_id, _reason, _vol, _spread)
                     continue
+
+        # Per-market freshness check. Missing timestamp is treated as
+        # "freshness unknown" and not blocking — the global gate already
+        # ensured at least one row is fresh, and test fixtures pass dicts
+        # without a timestamp. This check only rejects rows we can
+        # confidently prove stale.
+        _ts = price_data.get("timestamp")
+        if isinstance(_ts, datetime):
+            if _ts.tzinfo is None:
+                _ts = _ts.replace(tzinfo=timezone.utc)
+            _age_minutes = (_now_utc - _ts).total_seconds() / 60.0
+            if _age_minutes > per_market_ttl:
+                log.info(
+                    "run_decision_loop: skipping %s — price_age=%.1fm > %dm TTL (per-market stale)",
+                    market_id, _age_minutes, per_market_ttl,
+                )
+                stale_market_count += 1
+                continue
 
         try:
             opp = _build_opportunity(market_id, price_data, forecasts)
@@ -1087,9 +1116,10 @@ def _run_decision_cycle(state: AppState) -> None:
 
     log.info(
         "run_decision_loop: built %d opportunities from %d markets, %d with signals "
-        "(rules_qual=%d, skipped=%d edge<%d%%, %d already open)",
+        "(rules_qual=%d, skipped=%d edge<%d%%, %d already open, %d stale)",
         built_count, len(market_prices), len(signals_by_market),
         llm_calls, llm_skipped, int(LLM_EDGE_THRESHOLD * 100), position_skipped,
+        stale_market_count,
     )
 
     # Collect recent fills for VPIN toxic flow detection (C5 fix)
@@ -2262,6 +2292,7 @@ def _build_opportunity(
         bucket_high=bucket_high,
         bucket_invalidated_for_yes=_bucket_invalidated_for_yes,
         bucket_metar_high=_bucket_metar_high,
+        market_price_timestamp=price_data.get("timestamp"),
     )
 
 

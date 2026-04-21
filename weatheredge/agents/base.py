@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from datetime import datetime
 
 @dataclass
 class Signal:
@@ -62,3 +63,7 @@ class MarketOpportunity:
     # YES resolution physically impossible — exit_manager uses this to force close buy_yes.
     bucket_invalidated_for_yes: bool = False
     bucket_metar_high: float | None = None  # Observed daily_high °F when invalidation detected
+    # Per-market price freshness: timestamp of the price row used to build this
+    # opportunity. Used by the per-market freshness gate so an illiquid market
+    # with a stale row is skipped even when the global newest-row age is fresh.
+    market_price_timestamp: datetime | None = None

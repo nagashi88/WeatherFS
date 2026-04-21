@@ -372,6 +372,109 @@ class TestGetMarketPriceDataAgeMinutes:
             assert main_module._get_market_price_data_age_minutes() is None
 
 
+class TestDecisionLoopPerMarketFreshness:
+    """STEP 3 per-market freshness gate. The global gate checks the newest
+    row across ALL markets, so an illiquid market's stale row slips through
+    when any other market updates recently. This gate filters each market
+    by its own timestamp against market_data_ttl_minutes."""
+
+    def test_stale_per_market_row_skipped_when_global_gate_passes(self):
+        """Global gate fresh, one market's own row stale → that market is
+        not passed to _build_opportunity (fresh market still processed)."""
+        state = _make_app_state()
+        state.rules_qualitative_engine = MagicMock()
+        state.rules_qualitative_engine.analyze.return_value = MagicMock(side="no_trade")
+
+        ttl_minutes = state.settings.market_data_ttl_minutes
+        stale_ts = datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes + 10)
+        fresh_ts = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+        market_prices = {
+            "KXHIGHNY-STALE": {"yes_price": 0.5, "timestamp": stale_ts},
+            "KXHIGHNY-FRESH": {"yes_price": 0.6, "timestamp": fresh_ts},
+        }
+
+        build_calls: list[str] = []
+
+        def _spy_build(market_id, price_data, forecasts):
+            build_calls.append(market_id)
+            return None  # skip downstream for this test
+
+        with _patch_state(state):
+            with patch.object(main_module, "_get_weather_data_age_minutes", return_value=5):
+                with patch.object(main_module, "_get_market_price_data_age_minutes", return_value=5):
+                    with patch.object(main_module, "_read_latest_forecasts", return_value={}):
+                        with patch.object(
+                            main_module, "_read_latest_market_prices",
+                            return_value=market_prices,
+                        ):
+                            with patch.object(main_module, "_build_opportunity", side_effect=_spy_build):
+                                run_decision_loop()
+
+        assert "KXHIGHNY-STALE" not in build_calls
+        assert "KXHIGHNY-FRESH" in build_calls
+
+    def test_missing_timestamp_does_not_block_market(self):
+        """Backward-compat: price dicts lacking 'timestamp' must not be
+        blocked — legacy rows and test fixtures may omit it."""
+        state = _make_app_state()
+        state.rules_qualitative_engine = MagicMock()
+        state.rules_qualitative_engine.analyze.return_value = MagicMock(side="no_trade")
+
+        market_prices = {"KXHIGHNY": {"yes_price": 0.5}}  # no 'timestamp'
+        build_calls: list[str] = []
+
+        def _spy_build(market_id, price_data, forecasts):
+            build_calls.append(market_id)
+            return None
+
+        with _patch_state(state):
+            with patch.object(main_module, "_get_weather_data_age_minutes", return_value=5):
+                with patch.object(main_module, "_get_market_price_data_age_minutes", return_value=5):
+                    with patch.object(main_module, "_read_latest_forecasts", return_value={}):
+                        with patch.object(
+                            main_module, "_read_latest_market_prices",
+                            return_value=market_prices,
+                        ):
+                            with patch.object(main_module, "_build_opportunity", side_effect=_spy_build):
+                                run_decision_loop()
+
+        assert build_calls == ["KXHIGHNY"]
+
+    def test_naive_timestamp_is_treated_as_utc(self):
+        """Legacy DB rows are stored timezone-naive. The gate must coerce
+        to UTC the same way _get_market_price_data_age_minutes does, so a
+        stale naive row is still filtered."""
+        state = _make_app_state()
+        state.rules_qualitative_engine = MagicMock()
+        state.rules_qualitative_engine.analyze.return_value = MagicMock(side="no_trade")
+
+        ttl_minutes = state.settings.market_data_ttl_minutes
+        stale_naive_ts = (
+            datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes + 10)
+        ).replace(tzinfo=None)
+
+        market_prices = {"KXHIGHNY": {"yes_price": 0.5, "timestamp": stale_naive_ts}}
+        build_calls: list[str] = []
+
+        def _spy_build(market_id, price_data, forecasts):
+            build_calls.append(market_id)
+            return None
+
+        with _patch_state(state):
+            with patch.object(main_module, "_get_weather_data_age_minutes", return_value=5):
+                with patch.object(main_module, "_get_market_price_data_age_minutes", return_value=5):
+                    with patch.object(main_module, "_read_latest_forecasts", return_value={}):
+                        with patch.object(
+                            main_module, "_read_latest_market_prices",
+                            return_value=market_prices,
+                        ):
+                            with patch.object(main_module, "_build_opportunity", side_effect=_spy_build):
+                                run_decision_loop()
+
+        assert build_calls == []
+
+
 # ---------------------------------------------------------------------------
 # Gap 7: Decision loop — processes markets with fresh data
 # ---------------------------------------------------------------------------
@@ -2600,6 +2703,35 @@ class TestBuildOpportunityEdgePaths:
                 )
 
         assert opp is None
+
+    def test_market_price_timestamp_stamped_from_price_data(self):
+        """STEP 3: per-market freshness gate depends on this field being
+        preserved on the MarketOpportunity."""
+        state = self._make_state()
+        forecasts = self._base_forecasts("KNYC")
+        ts = datetime.now(timezone.utc) - timedelta(minutes=3)
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.5, "timestamp": ts}, forecasts
+            )
+
+        assert opp is not None
+        assert opp.market_price_timestamp == ts
+
+    def test_market_price_timestamp_none_when_missing(self):
+        """STEP 3: missing timestamp leaves the field None — legacy
+        callers and fixtures that omit 'timestamp' must not crash."""
+        state = self._make_state()
+        forecasts = self._base_forecasts("KNYC")
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.5}, forecasts
+            )
+
+        assert opp is not None
+        assert opp.market_price_timestamp is None
 
 
 # ---------------------------------------------------------------------------
