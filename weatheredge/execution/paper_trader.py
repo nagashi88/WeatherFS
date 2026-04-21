@@ -393,12 +393,21 @@ class PaperTrader:
                 still_pending.append(o)
                 continue
 
-            # Fill at limit_price
+            # Fill at limit_price.
+            # For buy_yes the limit_price is on the YES-leg (already canonical).
+            # For buy_no the limit_price is on the NO-leg — convert to canonical
+            # YES-price before persisting so downstream readers of pos["price"]
+            # (exit_manager entry_price, main.py close fallback) see a consistent
+            # YES-price across both market and limit fills.
             fill_price = limit_price
             if o["side"] == "buy_no":
                 cost = fill_price * o["amount"]
+                stored_price = 1.0 - fill_price
+                fill_no_price: float | None = fill_price
             else:
                 cost = fill_price * o["amount"]
+                stored_price = fill_price
+                fill_no_price = None
 
             if cost > self.bankroll:
                 still_pending.append(o)
@@ -408,7 +417,8 @@ class PaperTrader:
             trade = {
                 "market_id": market_id,
                 "side": o["side"],
-                "price": fill_price,
+                "price": stored_price,
+                "fill_no_price": fill_no_price,
                 "amount": o["amount"],
                 "cost": cost,
                 "agent_name": o.get("agent_name", ""),

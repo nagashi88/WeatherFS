@@ -971,6 +971,63 @@ class TestLimitOrderBranches:
         assert filled == 0
         assert len(trader.open_orders) == 1
 
+    def test_buy_no_limit_fill_stores_canonical_yes_price(self):
+        # STEP 1 fix: limit fill must normalize buy_no trade["price"] to YES-side
+        # so downstream readers (exit_manager entry_price, main.py close fallback)
+        # see the same semantic as a market-filled buy_no (which stores YES-price).
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(Order(
+            market_id="bn_canonical", side="buy_no", price=0.80, amount=10.0,
+            market_date="2030-05-01", order_type="limit",
+        ))
+        filled = trader.check_limit_fills({"bn_canonical": 0.85})
+        assert filled == 1
+        pos = trader.open_positions[0]
+        assert pos["side"] == "buy_no"
+        # limit_price ≈ 0.20 - offset (no-leg). YES-canonical ≈ 0.80 + offset.
+        assert pos["price"] > 0.5, f"expected YES-canonical > 0.5, got {pos['price']}"
+        assert abs(pos["price"] + pos["fill_no_price"] - 1.0) < 1e-9
+        # Cost still on the NO leg (fill_no_price * amount).
+        assert abs(pos["cost"] - pos["fill_no_price"] * pos["amount"]) < 1e-9
+
+    def test_buy_no_limit_fill_pnl_matches_market_fill_equivalent(self):
+        # STEP 1 fix regression: a buy_no limit fill closed at the same YES-price
+        # must produce the same PnL as a buy_no market fill closed at that price.
+        from weatheredge import config
+        # Disable temporal guard so tests don't need timestamp plumbing.
+        trader_limit = PaperTrader(initial_bankroll=1000.0)
+        trader_market = PaperTrader(initial_bankroll=1000.0)
+
+        # Limit fill path: place limit, trigger at yes=0.85 → no-leg fills ~0.15.
+        trader_limit.place_order(Order(
+            market_id="pnl_limit", side="buy_no", price=0.80, amount=10.0,
+            market_date="2030-05-01", order_type="limit",
+        ))
+        trader_limit.check_limit_fills({"pnl_limit": 0.85})
+        pos_limit = trader_limit.open_positions[0]
+        yes_price_at_fill = pos_limit["price"]  # should be YES-canonical ~0.85
+
+        # Market fill path: place market order at the SAME YES-price.
+        trader_market.place_order(Order(
+            market_id="pnl_market", side="buy_no",
+            price=yes_price_at_fill, amount=10.0,
+            market_date="2030-05-01",
+        ))
+        pos_market = trader_market.open_positions[0]
+
+        # Cost should match within floating tolerance.
+        assert abs(pos_limit["cost"] - pos_market["cost"]) < 1e-9
+
+        # Close both at yes=0.60 — buy_no profits when YES falls.
+        trader_limit.close_position("pnl_limit", current_yes_price=0.60, reason="edge_stop")
+        trader_market.close_position("pnl_market", current_yes_price=0.60, reason="edge_stop")
+
+        limit_pnl = trader_limit.trade_history[-1]["pnl"]
+        market_pnl = trader_market.trade_history[-1]["pnl"]
+        assert abs(limit_pnl - market_pnl) < 1e-9, (
+            f"buy_no limit PnL {limit_pnl} != market PnL {market_pnl} — semantics diverged"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Temporal guard (lookahead leakage protection)
