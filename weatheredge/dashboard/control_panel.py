@@ -212,7 +212,7 @@ interval = st.sidebar.slider("Refresh (sec)", 5, 60, 15)
 
 # ── Stats ────────────────────────────────────────────────────────────────
 
-_CLOSED = "('won','lost','edge_stop','capital_protect','time_decay','ev_based','abandoned')"
+_CLOSED = "('won','lost','edge_stop','capital_protect','time_decay','ev_based','bucket_invalidated','abandoned')"
 total_trades = _scalar("SELECT COUNT(*) FROM trades")
 open_trades = _scalar("SELECT COUNT(*) FROM trades WHERE status='open'")
 won = _scalar("SELECT COUNT(*) FROM trades WHERE status='won'")
@@ -389,7 +389,7 @@ else:
     if not prices_df.empty:
         prices_df["timestamp"] = pd.to_datetime(prices_df["timestamp"], utc=True, errors="coerce")
         prices_df = prices_df.dropna(subset=["timestamp"]).sort_values("timestamp")
-    closed_set = {"won", "lost", "edge_stop", "capital_protect", "time_decay", "ev_based", "abandoned"}
+    closed_set = {"won", "lost", "edge_stop", "capital_protect", "time_decay", "ev_based", "bucket_invalidated", "abandoned"}
 
     # Hourly grid: from earliest trade open to now
     start_ts = trades_df["created_at"].min()
@@ -622,7 +622,7 @@ else:
 st.subheader("Recent Resolved Trades")
 recent = _query_db(
     "SELECT market_id, side, price, amount, cost, pnl, status, platform, agent_name, resolved_at "
-    "FROM trades WHERE status IN ('won','lost','edge_stop','capital_protect','time_decay','ev_based') "
+    "FROM trades WHERE status IN ('won','lost','edge_stop','capital_protect','time_decay','ev_based','bucket_invalidated') "
     "ORDER BY resolved_at DESC LIMIT 15"
 )
 if recent:

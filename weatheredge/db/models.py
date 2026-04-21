@@ -101,6 +101,8 @@ class Trade(Base):
         'capital_protect' — early risk stop-loss exit
         'time_decay' — time-based early exit near market close
         'ev_based'  — early exit when EV(close) > EV(hold)
+        'bucket_invalidated' — early exit when METAR daily_high exceeds bucket_high
+                               (YES resolution physically impossible)
         'cancelled' — unfilled order cancelled (TTL expired or kill switch)
         'abandoned' — filled position abandoned during emergency exit
     """

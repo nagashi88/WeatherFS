@@ -58,3 +58,7 @@ class MarketOpportunity:
     timesfm_error_adj: float | None = None  # TimesFM NWP error correction (degrees)
     volume: float | None = None  # Market volume for slippage modeling (US-205)
     raw_model_prob: float | None = None  # Pre-clamp blended (audit only, not used for decisions)
+    # Structural invalidation: daily_high already exceeded bucket_high via observed METAR.
+    # YES resolution physically impossible — exit_manager uses this to force close buy_yes.
+    bucket_invalidated_for_yes: bool = False
+    bucket_metar_high: float | None = None  # Observed daily_high °F when invalidation detected

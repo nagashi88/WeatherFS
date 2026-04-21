@@ -88,6 +88,30 @@ class ExitManager:
         lead_time_hours = self._lead_time_hours(market_id, market_metadata, pos)
 
         # ================================================================
+        # EXIT 0: Structural bucket invalidation (pre-empts all other rules)
+        # When METAR observes daily_high > bucket_high, YES resolution becomes
+        # physically impossible (daily_high is monotone non-decreasing intra-day).
+        # Standard exits (edge_flip, ev_based, time_decay) fail to close buy_yes
+        # positions in this state because market≈0 and model≈0 leave no edge to
+        # trigger on and make "hold" marginally better than "close" in EV terms.
+        # This rule is intentionally asymmetric: buy_no does NOT need it because
+        # when METAR shows temp in-range the daily_high can still climb out, and
+        # the large (1-model) shift handles buy_no via edge_flip naturally.
+        # ================================================================
+        if (
+            getattr(opp, "bucket_invalidated_for_yes", False)
+            and side == "buy_yes"
+        ):
+            log.info(
+                "EXIT bucket_invalidated: market=%s side=buy_yes metar_high=%.1f "
+                "bucket_high=%s → YES physically impossible",
+                market_id,
+                opp.bucket_metar_high if opp.bucket_metar_high is not None else -999.0,
+                f"{opp.bucket_high:.0f}" if opp.bucket_high is not None else "?",
+            )
+            return "bucket_invalidated"
+
+        # ================================================================
         # EXIT 1: Edge-Based Trailing Stop
         # Gated by MODULES flag — disabled in Phase 1+ in favour of EV-based exit.
         # ================================================================

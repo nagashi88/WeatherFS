@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 # arithmetic so an open position cannot artificially deflate the day's stats.
 _RESOLVED_STATUSES = {
     "won", "lost", "edge_stop", "capital_protect", "time_decay",
-    "ev_based", "abandoned",
+    "ev_based", "bucket_invalidated", "abandoned",
 }
 
 

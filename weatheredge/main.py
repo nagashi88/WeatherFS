@@ -1972,6 +1972,9 @@ def _build_opportunity(
     _timesfm_error_adj = None
     # Bucket audit: raw pre-clamp probability, carried into raw_model_prob/MarketOpportunity.
     _raw_bucket_prob: float | None = None
+    # Structural invalidation flag: METAR shows daily_high > bucket_high → YES impossible.
+    _bucket_invalidated_for_yes: bool = False
+    _bucket_metar_high: float | None = None
 
     # BugFix C6: Use bucket_probability for bucket markets instead of midpoint "above"
     if bucket_low is not None and bucket_high is not None:
@@ -2029,6 +2032,11 @@ def _build_opportunity(
                         )
                         probability = adjusted
                         model_used = "metar_bucket_exceeded"
+                        # Structural kill: YES is now physically impossible. Exit manager
+                        # consumes this flag to close open buy_yes positions regardless of
+                        # price (edge/EV rules can't catch it when market≈0 and model≈0).
+                        _bucket_invalidated_for_yes = True
+                        _bucket_metar_high = metar_high
         except Exception as exc:
             log.warning("_build_opportunity: bucket_probability failed for %s: %s", market_id, exc)
             return None
@@ -2252,6 +2260,8 @@ def _build_opportunity(
         timesfm_error_adj=_timesfm_error_adj,
         bucket_low=bucket_low,
         bucket_high=bucket_high,
+        bucket_invalidated_for_yes=_bucket_invalidated_for_yes,
+        bucket_metar_high=_bucket_metar_high,
     )
 
 
@@ -2385,6 +2395,7 @@ def _get_resolution_candidate_markets() -> list[str]:
         "capital_protect",
         "time_decay",
         "ev_based",
+        "bucket_invalidated",
         "abandoned",
     ]
 
@@ -2422,6 +2433,7 @@ def _record_calibration_for_market(
         "capital_protect",
         "time_decay",
         "ev_based",
+        "bucket_invalidated",
         "abandoned",
     ]
 
@@ -2755,7 +2767,7 @@ def check_phase1_gate() -> bool:
     """Phase 1 gate: 40+ trades, calibration gap < 15%, Baseline B profitable."""
     _CALIBRATION_GAP_MAX = 0.15
     _MIN_BUCKET_SAMPLES = 5
-    closed_statuses = ["won", "lost", "edge_stop", "capital_protect", "time_decay", "ev_based"]
+    closed_statuses = ["won", "lost", "edge_stop", "capital_protect", "time_decay", "ev_based", "bucket_invalidated"]
 
     try:
         with get_session() as session:

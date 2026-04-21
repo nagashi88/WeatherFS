@@ -125,7 +125,7 @@ def query_per_agent_pnl(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END)               AS losses,
             COALESCE(SUM(pnl), 0)                                   AS total_pnl
         FROM trades
-        WHERE status IN ('won','lost','edge_stop','capital_protect','time_decay','ev_based','abandoned')
+        WHERE status IN ('won','lost','edge_stop','capital_protect','time_decay','ev_based','bucket_invalidated','abandoned')
           AND pnl IS NOT NULL
         GROUP BY COALESCE(agent_name, 'unknown')
         ORDER BY total_pnl DESC
@@ -149,7 +149,7 @@ def query_recent_trades(conn: sqlite3.Connection, limit: int = 20) -> list[sqlit
 
 def query_performance(conn: sqlite3.Connection) -> dict:
     # All non-open statuses count as resolved (includes edge_stop, won, lost, etc.)
-    CLOSED_STATUSES = "('won','lost','edge_stop','capital_protect','time_decay','ev_based')"
+    CLOSED_STATUSES = "('won','lost','edge_stop','capital_protect','time_decay','ev_based','bucket_invalidated')"
     won_final = int(_scalar(conn, "SELECT COUNT(*) FROM trades WHERE status='won'"))
     lost_final = int(_scalar(conn, "SELECT COUNT(*) FROM trades WHERE status='lost'"))
     total_pnl = _scalar(conn, f"SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status IN {CLOSED_STATUSES}")
@@ -337,7 +337,7 @@ def query_daily_pnl(conn: sqlite3.Connection) -> list[tuple[str, float]]:
         FROM trades
         WHERE pnl IS NOT NULL
           AND resolved_at IS NOT NULL
-          AND status IN ('won','lost','edge_stop','capital_protect','time_decay','ev_based')
+          AND status IN ('won','lost','edge_stop','capital_protect','time_decay','ev_based','bucket_invalidated')
         GROUP BY day
         ORDER BY day ASC
         LIMIT 30
@@ -471,6 +471,7 @@ def _status_style(status: str) -> str:
         "capital_protect": "magenta",
         "time_decay": "blue",
         "ev_based": "blue",
+        "bucket_invalidated": "bright_cyan",
         "cancelled": "dim",
     }
     return mapping.get(status.lower(), "white")

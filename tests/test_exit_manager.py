@@ -33,11 +33,20 @@ from weatheredge.execution.exit_manager import (
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
 
-def make_opp(model_probability: float = 0.65, market_price: float = 0.60) -> MagicMock:
-    """Return a mock MarketOpportunity with the two attributes ExitManager reads."""
+def make_opp(
+    model_probability: float = 0.65,
+    market_price: float = 0.60,
+    bucket_invalidated_for_yes: bool = False,
+    bucket_metar_high: float | None = None,
+    bucket_high: float | None = None,
+) -> MagicMock:
+    """Return a mock MarketOpportunity with the attributes ExitManager reads."""
     opp = MagicMock()
     opp.model_probability = model_probability
     opp.market_price = market_price
+    opp.bucket_invalidated_for_yes = bucket_invalidated_for_yes
+    opp.bucket_metar_high = bucket_metar_high
+    opp.bucket_high = bucket_high
     return opp
 
 
@@ -711,6 +720,120 @@ def test_exit_ev_based_triggers_when_ev_close_exceeds_ev_hold(mgr):
     finally:
         cfg.MODULES["exit_edge_flip"] = orig_flip
         cfg.MODULES["exit_ev_based"] = orig_ev
+
+
+# ---------------------------------------------------------------------------
+# EXIT 0: Bucket invalidation (structural kill — YES physically impossible)
+# ---------------------------------------------------------------------------
+
+def test_exit0_bucket_invalidated_triggers_for_buy_yes(mgr):
+    """flag=True + side=buy_yes → bucket_invalidated."""
+    pos = make_pos(side="buy_yes", price=0.50, amount=100, cost=50)
+    opp = make_opp(
+        model_probability=0.05,
+        market_price=0.01,
+        bucket_invalidated_for_yes=True,
+        bucket_metar_high=86.0,
+        bucket_high=84.0,
+    )
+    reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    assert reason == "bucket_invalidated"
+
+
+def test_exit0_bucket_invalidated_does_not_trigger_for_buy_no(mgr):
+    """flag=True but side=buy_no → rule is asymmetric, must NOT trigger."""
+    # buy_no: price=0.01 YES means NO value=(1-0.01)*100=99, cost=40 → huge profit → hold
+    pos = make_pos(side="buy_no", price=0.60, amount=100, cost=40)
+    opp = make_opp(
+        model_probability=0.05,
+        market_price=0.01,
+        bucket_invalidated_for_yes=True,  # flag is set
+        bucket_metar_high=86.0,
+        bucket_high=84.0,
+    )
+    reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    # buy_no with YES collapsed is deeply profitable; no exit rule should fire
+    assert reason != "bucket_invalidated"
+
+
+def test_exit0_bucket_invalidated_does_not_trigger_when_flag_false(mgr):
+    """flag=False → rule must NOT fire even for buy_yes."""
+    pos = make_pos(side="buy_yes", price=0.65, amount=100, cost=65)
+    opp = make_opp(
+        model_probability=0.72,
+        market_price=0.65,
+        bucket_invalidated_for_yes=False,
+    )
+    reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    assert reason != "bucket_invalidated"
+
+
+def test_exit0_has_priority_over_edge_flip(mgr):
+    """Even if edge < -3% would trigger edge_stop, bucket_invalidated wins."""
+    # edge = 0.05 - 0.60 = -0.55 → would trigger edge_stop
+    pos = make_pos(side="buy_yes", price=0.60, amount=100, cost=60)
+    opp = make_opp(
+        model_probability=0.05,
+        market_price=0.60,
+        bucket_invalidated_for_yes=True,
+        bucket_metar_high=86.0,
+        bucket_high=84.0,
+    )
+    reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    assert reason == "bucket_invalidated"
+
+
+def test_exit0_has_priority_over_time_decay_force_exit(mgr):
+    """Even if <1h to close would trigger time_decay, bucket_invalidated wins."""
+    pos = make_pos(side="buy_yes", price=0.50, amount=100, cost=50)
+    opp = make_opp(
+        model_probability=0.05,
+        market_price=0.01,
+        bucket_invalidated_for_yes=True,
+        bucket_metar_high=86.0,
+        bucket_high=84.0,
+    )
+    with patch.object(ExitManager, "_lead_time_hours", return_value=0.3):
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    assert reason == "bucket_invalidated"
+
+
+def test_exit0_has_priority_over_ev_based(mgr):
+    """Even if EV-based would fire, bucket_invalidated wins (structural kill first)."""
+    import weatheredge.config as cfg
+    orig_flip = cfg.MODULES.get("exit_edge_flip", True)
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_edge_flip"] = False
+    cfg.MODULES["exit_ev_based"] = True
+    try:
+        # Any buy_yes position with invalidation flag should short-circuit to EXIT 0
+        pos = make_pos(side="buy_yes", price=0.60, amount=100, cost=60)
+        opp = make_opp(
+            model_probability=0.65,
+            market_price=0.80,
+            bucket_invalidated_for_yes=True,
+            bucket_metar_high=86.0,
+            bucket_high=84.0,
+        )
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+        assert reason == "bucket_invalidated"
+    finally:
+        cfg.MODULES["exit_edge_flip"] = orig_flip
+        cfg.MODULES["exit_ev_based"] = orig_ev
+
+
+def test_exit0_handles_missing_bucket_metadata_gracefully(mgr):
+    """flag=True but bucket_metar_high/bucket_high are None → still fires, logging safe."""
+    pos = make_pos(side="buy_yes", price=0.50, amount=100, cost=50)
+    opp = make_opp(
+        model_probability=0.05,
+        market_price=0.01,
+        bucket_invalidated_for_yes=True,
+        bucket_metar_high=None,
+        bucket_high=None,
+    )
+    reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    assert reason == "bucket_invalidated"
 
 
 def test_exit_ev_based_holds_when_ev_hold_exceeds_ev_close(mgr):

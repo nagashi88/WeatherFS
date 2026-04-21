@@ -122,7 +122,8 @@ class PaperTrader:
                 select(Trade).where(
                     Trade.mode == "paper",
                     Trade.status.in_(["won", "lost", "cancelled", "abandoned",
-                                      "edge_stop", "capital_protect", "time_decay", "ev_based"]),
+                                      "edge_stop", "capital_protect", "time_decay", "ev_based",
+                                      "bucket_invalidated"]),
                 )
             ).scalars().all()
 
