@@ -2213,15 +2213,31 @@ def _build_opportunity(
                     # boundary. Match settlement: in-range uses `<` on high,
                     # invalidation uses `>=`.
                     if bucket_low <= metar_high < bucket_high:
-                        # Already inside the bucket — strong YES baseline.
-                        adjusted = max(probability, 0.85)
-                        log.info(
-                            "BUCKET METAR override %s: observed daily high %.1f in [%.0f,%.0f) → prob %.2f→%.2f",
-                            market_id, metar_high, bucket_low, bucket_high,
-                            probability, adjusted,
-                        )
-                        probability = adjusted
-                        model_used = "metar_bucket_in_range"
+                        # CCG-bug-7: running max inside the bucket is NOT a
+                        # YES signal — temp can still climb past bucket_high
+                        # before close. Trade #28 lost $2.85 because this
+                        # branch fired at mid-day. Gate on "day effectively
+                        # closed" (≤2h before station-local 23:59) so the
+                        # remaining-day tail is negligible.
+                        _hrs_to_close = hours_until_market_close(market_date, station)
+                        if _hrs_to_close is not None and _hrs_to_close <= 2.0:
+                            adjusted = max(probability, 0.85)
+                            log.info(
+                                "BUCKET METAR override %s: observed daily high %.1f in [%.0f,%.0f) "
+                                "hrs_to_close=%.1f → prob %.2f→%.2f",
+                                market_id, metar_high, bucket_low, bucket_high,
+                                _hrs_to_close, probability, adjusted,
+                            )
+                            probability = adjusted
+                            model_used = "metar_bucket_in_range_near_close"
+                        else:
+                            log.debug(
+                                "BUCKET METAR in-range (day open): %s obs_high=%.1f "
+                                "in [%.0f,%.0f) hrs_to_close=%s — NOT overriding "
+                                "(running max can still exit bucket)",
+                                market_id, metar_high, bucket_low, bucket_high,
+                                f"{_hrs_to_close:.1f}" if _hrs_to_close is not None else "?",
+                            )
                     elif metar_high >= bucket_high:
                         # Already past the bucket — daily max can only stay or climb.
                         adjusted = min(probability, 0.05)

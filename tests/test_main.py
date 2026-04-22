@@ -3503,24 +3503,57 @@ class TestBucketMetarOverride:
             }
         }
 
-    def test_metar_in_bucket_lifts_probability_to_yes_baseline(self):
-        """Observed daily_high inside the bucket → bucket is on track to resolve YES."""
+    def test_metar_in_bucket_near_close_lifts_probability_to_yes_baseline(self):
+        """Observed daily_high inside bucket AND day nearly closed → lift prob to YES."""
         state = self._make_state_with_tracker(daily_high_f=86.5, market_date=self.TODAY)
-        market_id = "bucket_in_range"
+        market_id = "bucket_in_range_near_close"
         state.market_metadata[market_id] = self._bucket_market_metadata(
             market_id, "KNYC", self.TODAY, low=86.0, high=87.0,
         )
 
         # Forecast says max ~89°F → bucket_probability ≈ floor (0.10) without override.
-        with _patch_state(state), patch.object(main_module, "station_local_today_str", return_value=self.TODAY):
+        # Patch hours_until_market_close to 1.0h → inside the 2h gating window.
+        with _patch_state(state), \
+             patch.object(main_module, "station_local_today_str", return_value=self.TODAY), \
+             patch.object(main_module, "hours_until_market_close", return_value=1.0):
             opp = main_module._build_opportunity(
                 market_id, {"yes_price": 0.5}, self._forecasts("KNYC", 89.0),
             )
 
         assert opp is not None
         assert opp.model_probability >= 0.85, (
-            f"METAR-in-bucket override should lift prob to >=0.85, got {opp.model_probability}"
+            f"METAR-in-bucket override (near close) should lift prob to >=0.85, got {opp.model_probability}"
         )
+
+    def test_metar_in_bucket_day_open_does_not_override(self):
+        """Observed daily_high inside bucket but many hours until close → do NOT override.
+
+        Regression for CCG-bug-7 (trade #28, -$2.85): the in-range branch used to
+        unconditionally boost YES to 0.85, treating running max as final max.
+        With the gate, mid-day observations inside the bucket no longer trigger
+        the YES-baseline lift — bucket_probability from the forecast stands.
+        """
+        state = self._make_state_with_tracker(daily_high_f=86.5, market_date=self.TODAY)
+        market_id = "bucket_in_range_day_open"
+        state.market_metadata[market_id] = self._bucket_market_metadata(
+            market_id, "KNYC", self.TODAY, low=86.0, high=87.0,
+        )
+
+        # Forecast says max ~89°F → bucket_probability ≈ floor.
+        # 8h until close → well outside the 2h gating window; no override.
+        with _patch_state(state), \
+             patch.object(main_module, "station_local_today_str", return_value=self.TODAY), \
+             patch.object(main_module, "hours_until_market_close", return_value=8.0):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.5}, self._forecasts("KNYC", 89.0),
+            )
+
+        # Market forecast (~89°F) vs bucket [86, 87) → model_prob at PROB_FLOOR (0.10).
+        # No boost to 0.85 because the day is still open.
+        if opp is not None:
+            assert opp.model_probability < 0.85, (
+                f"METAR in-range with day open should NOT boost to 0.85, got {opp.model_probability}"
+            )
 
     def test_metar_above_bucket_caps_probability_low(self):
         """Observed daily_high already above bucket_high → daily max stays/climbs above → NO."""
