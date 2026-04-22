@@ -2172,14 +2172,35 @@ def _build_opportunity(
     if bucket_low is not None and bucket_high is not None:
         try:
             from weatheredge.probability.bucket import bucket_probability
+            # CCG-bug-8: narrow buckets (≤1°F wide) are hyper-sensitive to σ. A
+            # static, station/model/lead-aggregated RMSE underestimates predictive
+            # uncertainty on high-spread days, producing 4× overconfident raw probs
+            # (empirical: 14 resolved narrow-bucket trades, predicted YES=5.3%,
+            # observed YES=21.4%). Use ensemble spread as day-specific σ when
+            # wider than static RMSE — widens only when the forecast itself signals
+            # uncertainty, leaves tight-spread days unchanged.
+            bucket_rmse = rmse
+            if (
+                (bucket_high - bucket_low) <= 1.0
+                and ensemble_members is not None
+                and len(ensemble_members) >= 20
+            ):
+                import statistics as _stats
+                _spread = _stats.pstdev(ensemble_members)
+                if _spread > rmse:
+                    log.debug(
+                        "_build_opportunity: narrow bucket %s — widening σ %.2f→%.2f via ensemble spread",
+                        market_id, rmse, _spread,
+                    )
+                    bucket_rmse = _spread
             _raw_bucket_prob = bucket_probability(
-                forecast_temp, bucket_low, bucket_high, rmse, clamp=False,
+                forecast_temp, bucket_low, bucket_high, bucket_rmse, clamp=False,
             )
-            probability = bucket_probability(forecast_temp, bucket_low, bucket_high, rmse)
+            probability = bucket_probability(forecast_temp, bucket_low, bucket_high, bucket_rmse)
             model_used = "bucket_gaussian"
             log.debug(
-                "_build_opportunity: bucket market %s — P(%.0f<=T<=%.0f)=%.3f (raw=%.3f)",
-                market_id, bucket_low, bucket_high, probability, _raw_bucket_prob,
+                "_build_opportunity: bucket market %s — P(%.0f<=T<=%.0f)=%.3f (raw=%.3f) σ=%.2f",
+                market_id, bucket_low, bucket_high, probability, _raw_bucket_prob, bucket_rmse,
             )
 
             # BugFix P0-5: METAR reality check on bucket markets.

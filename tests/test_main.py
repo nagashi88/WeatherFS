@@ -3662,6 +3662,182 @@ class TestBucketMetarOverride:
         assert opp.model_probability < 0.20  # floor — no METAR data to override
 
 
+class TestNarrowBucketDynamicSigma:
+    """CCG-bug-8: narrow bucket (≤1°F) σ should widen to ensemble spread when
+    spread > static RMSE. Protects against the empirical 4× overconfidence
+    observed in narrow-bucket resolved trades (5.3% predicted vs 21.4% observed).
+    """
+
+    TODAY = "2030-05-01"  # far future → no METAR override interference
+
+    @staticmethod
+    def _state_no_tracker():
+        state = _make_app_state()
+        state.conditions_tracker = MagicMock()
+        state.conditions_tracker.metar_probability_override.return_value = None
+        state.conditions_tracker.get_tracker.return_value = None
+        return state
+
+    @staticmethod
+    def _bucket_metadata(market_id, station, date, low, high):
+        mock_parsed = MagicMock()
+        mock_parsed.threshold = (low + high) / 2.0
+        mock_parsed.direction = "above"
+        mock_parsed.market_type = "daily_high"
+        mock_parsed.date = date
+        mock_parsed.threshold_low = low
+        mock_parsed.threshold_high = high
+        return {
+            "resolution_source": {"station": station, "type": "daily_high"},
+            "platform": "polymarket",
+            "parsed": mock_parsed,
+        }
+
+    @staticmethod
+    def _forecast_with_ensemble(station, temp, ensemble):
+        return {
+            station: {
+                "temperature_forecast": temp,
+                "ecmwf_temp": None,
+                "hrrr_temp": None,
+                "ensemble_members": ensemble,
+                "model": "gfs",
+                "forecast_timestamp": datetime.now(timezone.utc),
+            }
+        }
+
+    def test_narrow_bucket_wide_ensemble_widens_sigma(self):
+        """Narrow bucket (1°F) + ensemble spread > static RMSE → raw_prob uses spread.
+
+        Simulates trade #27's pattern: forecast close to bucket edge with a
+        small static RMSE. Widening σ via ensemble spread shifts probability
+        *away* from the near-peak, reducing the overconfidence that caused
+        raw_prob=0.0143 on a bucket only 1°F from the forecast.
+        """
+        state = self._state_no_tracker()
+        market_id = "narrow_wide"
+        state.market_metadata[market_id] = self._bucket_metadata(
+            market_id, "KNYC", self.TODAY, low=50.0, high=51.0,
+        )
+
+        # Patch static RMSE to a small value (simulates trade #27: tight σ ≈ 0.5).
+        # With forecast=52.5 (1.5°F above bucket top), small σ → sharp Student-T
+        # peak near 52.5 and raw P(T ∈ [50,51]) near zero. Wide ensemble (σ ≈ 3)
+        # smears the peak and boosts bucket probability.
+        wide_ensemble = [52.5 + (i - 10) * 0.5 for i in range(21)]  # σ ≈ 3.0
+
+        with _patch_state(state), \
+             patch("weatheredge.probability.bias_correction.get_rmse", return_value=0.5):
+            opp_wide = main_module._build_opportunity(
+                market_id,
+                {"yes_price": 0.5},
+                self._forecast_with_ensemble("KNYC", 52.5, wide_ensemble),
+            )
+
+        state2 = self._state_no_tracker()
+        market_id2 = "narrow_no_ensemble"
+        state2.market_metadata[market_id2] = self._bucket_metadata(
+            market_id2, "KNYC", self.TODAY, low=50.0, high=51.0,
+        )
+        with _patch_state(state2), \
+             patch("weatheredge.probability.bias_correction.get_rmse", return_value=0.5):
+            opp_static = main_module._build_opportunity(
+                market_id2,
+                {"yes_price": 0.5},
+                self._forecast_with_ensemble("KNYC", 52.5, None),
+            )
+
+        assert opp_wide is not None and opp_static is not None
+        assert opp_wide.raw_model_prob is not None
+        assert opp_static.raw_model_prob is not None
+        assert opp_wide.raw_model_prob > opp_static.raw_model_prob, (
+            f"Wide ensemble σ should lift narrow-bucket raw_prob above static-RMSE baseline. "
+            f"wide={opp_wide.raw_model_prob:.4f} static={opp_static.raw_model_prob:.4f}"
+        )
+
+    def test_narrow_bucket_tight_ensemble_keeps_static_sigma(self):
+        """Narrow bucket + ensemble spread < static RMSE → σ stays at static RMSE.
+
+        If the ensemble is tight, the bot's calibrated RMSE still dominates;
+        the fix only widens, never narrows.
+        """
+        state = self._state_no_tracker()
+        market_id = "narrow_tight"
+        state.market_metadata[market_id] = self._bucket_metadata(
+            market_id, "KNYC", self.TODAY, low=86.0, high=87.0,
+        )
+
+        # Tight ensemble: σ ≈ 0.3°F (much tighter than any plausible static RMSE).
+        tight_ensemble = [89.0 + (i - 10) * 0.05 for i in range(21)]  # range 88.5-89.5
+
+        with _patch_state(state):
+            opp_tight = main_module._build_opportunity(
+                market_id,
+                {"yes_price": 0.5},
+                self._forecast_with_ensemble("KNYC", 89.0, tight_ensemble),
+            )
+
+        state2 = self._state_no_tracker()
+        market_id2 = "narrow_no_ensemble_b"
+        state2.market_metadata[market_id2] = self._bucket_metadata(
+            market_id2, "KNYC", self.TODAY, low=86.0, high=87.0,
+        )
+        with _patch_state(state2):
+            opp_static = main_module._build_opportunity(
+                market_id2,
+                {"yes_price": 0.5},
+                self._forecast_with_ensemble("KNYC", 89.0, None),
+            )
+
+        assert opp_tight is not None and opp_static is not None
+        assert opp_tight.raw_model_prob is not None
+        assert opp_static.raw_model_prob is not None
+        # Tight ensemble does NOT narrow σ — raw_prob stays close to static.
+        assert abs(opp_tight.raw_model_prob - opp_static.raw_model_prob) < 1e-6, (
+            f"Tight ensemble must not narrow σ below static RMSE. "
+            f"tight={opp_tight.raw_model_prob:.4f} static={opp_static.raw_model_prob:.4f}"
+        )
+
+    def test_wide_bucket_ignores_ensemble_spread(self):
+        """Bucket > 1°F uses static RMSE unchanged — widening is narrow-only."""
+        state = self._state_no_tracker()
+        market_id = "wide_bucket"
+        # 5°F-wide bucket — should skip the narrow-bucket σ widening.
+        state.market_metadata[market_id] = self._bucket_metadata(
+            market_id, "KNYC", self.TODAY, low=82.0, high=87.0,
+        )
+
+        wide_ensemble = [89.0 + (i - 10) * 1.2 for i in range(21)]
+
+        with _patch_state(state):
+            opp_wide = main_module._build_opportunity(
+                market_id,
+                {"yes_price": 0.5},
+                self._forecast_with_ensemble("KNYC", 89.0, wide_ensemble),
+            )
+
+        state2 = self._state_no_tracker()
+        market_id2 = "wide_bucket_no_ensemble"
+        state2.market_metadata[market_id2] = self._bucket_metadata(
+            market_id2, "KNYC", self.TODAY, low=82.0, high=87.0,
+        )
+        with _patch_state(state2):
+            opp_static = main_module._build_opportunity(
+                market_id2,
+                {"yes_price": 0.5},
+                self._forecast_with_ensemble("KNYC", 89.0, None),
+            )
+
+        assert opp_wide is not None and opp_static is not None
+        assert opp_wide.raw_model_prob is not None
+        assert opp_static.raw_model_prob is not None
+        # 5°F bucket — widening logic gated on ≤1°F; ensemble ignored for σ.
+        assert abs(opp_wide.raw_model_prob - opp_static.raw_model_prob) < 1e-6, (
+            f"Wide bucket should not trigger ensemble-σ widening. "
+            f"wide={opp_wide.raw_model_prob:.4f} static={opp_static.raw_model_prob:.4f}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # BugFix P0-6: Phantom-edge guard on clamped bucket markets
 # ---------------------------------------------------------------------------
