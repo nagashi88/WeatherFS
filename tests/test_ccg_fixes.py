@@ -574,10 +574,12 @@ class TestKellyCriterion:
             market_price=0.50,
             bankroll=1000.0,
         )
-        # Kelly = (bp - q)/b where b=1.0, p=0.7, q=0.3
-        # = (1.0*0.7 - 0.3)/1.0 = 0.4
-        # size = 0.4 * 0.15 * 1000 = 60, capped at 8% = 80
-        assert size == pytest.approx(60.0)
+        # Net-of-fees Kelly on Kalshi at p=0.50:
+        #   fee(0.50) = 0.02, half-spread = 0.01 → exit_cost = 0.03
+        #   net_stake = 0.52, net_win = 0.50 - 0.02 - 0.03 = 0.45
+        #   b = 0.45/0.52 ≈ 0.8654; kelly ≈ 0.3533
+        #   size ≈ 0.3533 * 0.15 * 1000 ≈ 53.00, below 8% cap (80).
+        assert size == pytest.approx(53.00, abs=0.02)
 
     def test_kelly_no_edge(self):
         settings = _make_settings()
@@ -622,6 +624,80 @@ class TestKellyCriterion:
             bankroll=1000.0,
         )
         assert size <= 1000.0 * 0.08
+
+    def test_kelly_net_of_fees_mid_price(self):
+        """At contested prices (p≈0.5), gross Kelly over-sizes materially.
+
+        Gross (buggy, pre-fix):
+          b = 0.5/0.5 = 1.0, kelly = (1.0*0.6 - 0.4)/1.0 = 0.20
+          size = 0.20 * 1.0 * 10000 = 2000.00
+        Net-of-fees Kalshi (post-fix):
+          fee(0.5)=0.02, exit_cost=0.03 (taker fee + half-spread)
+          Win profit = 1 - price - entry_fee - exit_cost = 0.45
+          Loss = price + entry_fee = 0.52 (losers held to $0 expiry)
+          b = 0.45/0.52 ≈ 0.8654, kelly ≈ 0.1378
+          size ≈ 1377.78 — ~31% smaller than gross.
+        """
+        settings = _make_settings(
+            kelly_fraction=1.0,
+            max_single_market_exposure=1.0,
+            max_cost_per_trade_fraction=1.0,
+        )
+        rm = RiskManager(settings)
+        rm.set_resolved_trade_count(100)
+        size = rm.calculate_position_size(
+            win_probability=0.60,
+            market_price=0.50,
+            bankroll=10000.0,
+        )
+        assert size == pytest.approx(1377.78, abs=0.05)
+        assert size < 2000.0, "net Kelly must sit strictly below gross at p≈0.5"
+
+    def test_kelly_net_of_fees_low_price(self):
+        """At floor prices (p≈0.1) haircut is small but still reduces Kelly.
+
+        Gross: b = 9, kelly = 1/9 ≈ 0.1111 → size ≈ 1111.11
+        Net:   fee(0.1)=0.01, exit_cost=0.02
+               Win profit = 0.90 - 0.01 - 0.02 = 0.87
+               Loss = 0.10 + 0.01 = 0.11
+               b = 0.87/0.11 ≈ 7.909, kelly ≈ 0.0989
+               size ≈ 988.51
+        """
+        settings = _make_settings(
+            kelly_fraction=1.0,
+            max_single_market_exposure=1.0,
+            max_cost_per_trade_fraction=1.0,
+        )
+        rm = RiskManager(settings)
+        rm.set_resolved_trade_count(100)
+        size = rm.calculate_position_size(
+            win_probability=0.20,
+            market_price=0.10,
+            bankroll=10000.0,
+        )
+        assert size == pytest.approx(988.51, abs=0.05)
+        assert size < 1111.12, "net Kelly must sit below gross even at floor prices"
+
+    def test_kelly_polymarket_fallback_also_net_of_fees(self):
+        """Non-Kalshi fallback splits estimated_round_trip evenly per leg.
+
+        Polymarket rt=0.015, per-leg=0.0075:
+          Win profit = 0.50 - 0.0075 - 0.0075 = 0.485
+          Loss = 0.50 + 0.0075 = 0.5075
+          b = 0.485/0.5075 ≈ 0.9557, kelly ≈ 0.3861
+          size ≈ 0.3861 * 0.15 * 1000 ≈ 57.91 (vs 60 under old gross Kelly).
+        """
+        settings = _make_settings(kelly_fraction=0.15)
+        rm = RiskManager(settings)
+        rm.set_resolved_trade_count(100)
+        size = rm.calculate_position_size(
+            win_probability=0.70,
+            market_price=0.50,
+            bankroll=1000.0,
+            platform="polymarket",
+        )
+        assert size == pytest.approx(57.91, abs=0.05)
+        assert size < 60.0
 
 
 # ===========================================================================

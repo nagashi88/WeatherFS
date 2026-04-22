@@ -300,6 +300,7 @@ class PortfolioManager:
                 bankroll=capital_base,
                 side=majority_side,
                 volume=volume,
+                platform=platform or "kalshi",
             )
 
             # Risk checks consume exposure in dollars (cost), while position sizing
@@ -337,6 +338,7 @@ class PortfolioManager:
                 bankroll=capital_base,
                 side=majority_side,
                 volume=volume,
+                platform=platform or "kalshi",
             )
 
             # Step 5: VPIN reduction

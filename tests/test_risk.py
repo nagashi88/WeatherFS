@@ -39,7 +39,12 @@ def make_settings(**overrides) -> Settings:
 
 
 def test_kelly_small_edge_approx_4_84():
-    """model_prob=0.70, market_price=0.69 → tiny edge → ~$4.84."""
+    """model_prob=0.70, market_price=0.69 → 1-point gross edge.
+
+    Post-fee-fix: entry=0.02, exit=0.03, net_win = 0.31 - 0.05 = 0.26
+    b = 0.26/0.71 ≈ 0.366; kelly = 0.7 - 0.3/0.366 < 0 → 0.
+    Net Kelly correctly rejects sub-fee edges.
+    """
     rm = RiskManager(make_settings())
     rm.set_resolved_trade_count(100)  # bypass warmup Kelly
     size = rm.calculate_position_size(
@@ -47,16 +52,20 @@ def test_kelly_small_edge_approx_4_84():
         market_price=0.69,
         bankroll=1000.0,
     )
-    assert 4.50 < size < 5.20, f"Expected ~$4.84, got {size}"
+    assert size == 0.0, f"Expected $0 (sub-fee edge), got {size}"
 
 
 def test_kelly_large_edge_capped_at_80():
-    """model_prob=0.70, market_price=0.35 → large edge → capped at 8% = $80."""
+    """model_prob=0.70, market_price=0.25 → large edge → capped at 8% = $80.
+
+    Post-fee-fix: entry=0.02, exit=0.03, net_win=0.70, b=0.70/0.27≈2.593
+    kelly ≈ 0.584 → raw size = 87.64 → capped to $80.
+    """
     rm = RiskManager(make_settings())
     rm.set_resolved_trade_count(100)  # bypass warmup Kelly
     size = rm.calculate_position_size(
         win_probability=0.70,
-        market_price=0.35,
+        market_price=0.25,
         bankroll=1000.0,
     )
     assert size == pytest.approx(80.0, abs=0.10), f"Expected $80.00, got {size}"

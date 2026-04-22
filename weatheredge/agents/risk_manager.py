@@ -57,10 +57,11 @@ class RiskManager:
         contract_vol: float | None = None,
         side: str = "buy_yes",
         volume: float | None = None,
+        platform: str = "kalshi",
     ) -> float:
         """Two-layer sizing per addendum Gap 1.
 
-        Layer 1: Corrected Kelly — b = (1-market_price)/market_price
+        Layer 1: Net-of-fees Kelly — b = (1-price-exit_cost)/(price+entry_fee)
         Layer 2: Volatility targeting (if vol data available)
         Layer 3: Slippage modeling (US-205) — volume-based scaling and cap
         Final = min(kelly_size, vol_size, hard_caps)
@@ -68,6 +69,8 @@ class RiskManager:
         For buy_no trades, flip to NO-side probabilities:
         win_prob_no = 1 - win_probability, price_no = 1 - market_price.
         """
+        from weatheredge.probability.edge import kalshi_taker_fee, PLATFORM_FEES
+
         # Flip to NO-side perspective for buy_no trades
         if side == "buy_no":
             win_probability = 1.0 - win_probability
@@ -79,8 +82,28 @@ class RiskManager:
         if market_price <= 0.0:
             return 0.0
 
-        # Layer 1: Corrected Kelly
-        b = (1.0 - market_price) / market_price
+        # Layer 1: Net-of-fees Kelly. Gross b = (1-p)/p ignored platform
+        # fees, systematically over-sizing by ~2% on Kalshi (worst at p≈0.5).
+        # Net b treats fees as a haircut on the win and a premium on the stake.
+        if platform == "kalshi":
+            entry_fee = kalshi_taker_fee(market_price)
+            half_spread = PLATFORM_FEES["kalshi"]["avg_spread"] / 2.0
+            # Conservative: assume round-trip (entry now, close before resolution).
+            exit_cost = kalshi_taker_fee(market_price) + half_spread
+        else:
+            fees = PLATFORM_FEES.get(platform, {"estimated_round_trip": 0.02})
+            rt = fees["estimated_round_trip"]
+            entry_fee = rt / 2.0
+            exit_cost = rt / 2.0
+
+        # Win profit = payout(1) - entry_cost(price + entry_fee) - exit_cost safety margin.
+        # Loss = entry_cost only (losers held to $0 expiry, no exit fee).
+        net_stake = market_price + entry_fee
+        net_win = (1.0 - market_price) - entry_fee - exit_cost
+        if net_win <= 0.0 or net_stake <= 0.0:
+            return 0.0
+
+        b = net_win / net_stake
         p = win_probability
         q = 1.0 - p
         kelly = (b * p - q) / b

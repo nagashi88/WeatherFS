@@ -34,7 +34,11 @@ class TestL1Unit:
         assert abs(p - 16/31) < 0.01
 
     def test_kelly_correct_small_edge(self):
-        """model_prob=0.70, market=0.69 -> ~$4.84 (NOT ~$80)"""
+        """model_prob=0.70, market=0.69 -> sub-fee edge → $0.
+
+        Post-fee-fix: 1-point gross edge is consumed by fees
+        (entry=0.02, exit=0.03). Net Kelly correctly returns 0.
+        """
         settings = MagicMock(spec=Settings)
         settings.kelly_fraction = 0.15
         settings.target_volatility = 0.10
@@ -44,10 +48,13 @@ class TestL1Unit:
         settings.max_single_market_exposure = 0.08
         rm = RiskManager(settings)
         size = rm.calculate_position_size(0.70, 0.69, 1000.0)
-        assert 3.0 < size < 7.0, f"Expected ~$4.84, got ${size}"
+        assert size == 0.0, f"Expected $0 (sub-fee edge), got ${size}"
 
     def test_kelly_large_edge_capped(self):
-        """model_prob=0.70, market=0.35 -> capped at $80"""
+        """model_prob=0.70, market=0.25 -> capped at $80.
+
+        Post-fee-fix: b=0.70/0.27≈2.593, kelly≈0.584, raw=87.64 → capped to 80.
+        """
         settings = MagicMock(spec=Settings)
         settings.kelly_fraction = 0.15
         settings.target_volatility = 0.10
@@ -59,7 +66,7 @@ class TestL1Unit:
         rm = RiskManager(settings)
         # Warm-up period uses reduced Kelly (0.10); set resolved trades past threshold
         rm.set_resolved_trade_count(50)
-        size = rm.calculate_position_size(0.70, 0.35, 1000.0)
+        size = rm.calculate_position_size(0.70, 0.25, 1000.0)
         assert size == 80.0, f"Expected $80 cap, got ${size}"
 
     def test_kelly_no_edge(self):
