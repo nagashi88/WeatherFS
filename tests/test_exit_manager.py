@@ -1119,3 +1119,117 @@ def test_exit_time_decay_default_is_on(mgr):
     finally:
         cfg.MODULES["exit_ev_based"] = orig_ev
         cfg.MODULES["exit_edge_flip"] = orig_flip
+
+
+# ---------------------------------------------------------------------------
+# CCG-bughunt2 G8: edge_stop log must show comparable units.
+# Prior log paired `entry_edge` (net) with `current_edge` (gross) under
+# identical "%" formatting — operators post-mortem'ing a stop would read
+# a delta that undercounted the true edge decay by the round-trip fee.
+# Decision semantics remain gross (calibrated against gross); the fix is
+# purely in the log content so on-call engineers and dashboards consuming
+# these lines see apples-to-apples values.
+# ---------------------------------------------------------------------------
+
+
+def _opp_with_net_edge(*, model_probability, market_price, net_edge, net_edge_no=0.0):
+    """Like make_opp but with explicit net_edge/net_edge_no floats.
+
+    Plain make_opp returns a MagicMock, whose auto-generated net_edge
+    attribute would pass %.1f%% formatting with a garbage value — hiding
+    whether the production code actually read the correct field.
+    """
+    opp = make_opp(model_probability=model_probability, market_price=market_price)
+    opp.net_edge = net_edge
+    opp.net_edge_no = net_edge_no
+    return opp
+
+
+def test_edge_stop_log_uses_net_current_edge_for_entry_comparison(mgr, caplog):
+    """When edge_stop fires, the log must include a NET current edge
+    so it is directly comparable to the stored entry_edge (also net).
+    Asserts against the new format; a regression to the old format
+    (bare `current_edge=%`) would not carry `current_edge_net=`."""
+    import logging
+    caplog.set_level(logging.INFO, logger="weatheredge.execution.exit_manager")
+
+    import weatheredge.config as cfg
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_ev_based"] = False  # isolate edge_stop
+    try:
+        # buy_yes: gross = 0.56 - 0.60 = -0.04 → triggers edge_stop.
+        # Net = gross - round-trip fees (≈ 0.03 Kalshi @ p=0.60).
+        pos = make_pos(side="buy_yes", price=0.60, amount=100, cost=60,
+                       edge_at_entry=0.08)
+        opp = _opp_with_net_edge(
+            model_probability=0.56, market_price=0.60,
+            net_edge=-0.07,
+        )
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    finally:
+        cfg.MODULES["exit_ev_based"] = orig_ev
+
+    assert reason == "edge_stop"
+    records = [r for r in caplog.records if "edge_stop" in r.getMessage()]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    # Net entry AND net current both present with unambiguous labels.
+    assert "entry_edge_net=8.0%" in msg, msg
+    assert "current_edge_net=-7.0%" in msg, msg
+    # Gross value that actually triggered the decision is visible alongside.
+    assert "gross=-4.0%" in msg, msg
+    # Threshold value is shown so the exit condition is self-documenting.
+    assert "-3%" in msg, msg
+
+
+def test_edge_stop_log_buy_no_uses_net_edge_no(mgr, caplog):
+    """buy_no side must read opp.net_edge_no for the net figure so the
+    log matches the position's directional edge."""
+    import logging
+    caplog.set_level(logging.INFO, logger="weatheredge.execution.exit_manager")
+
+    import weatheredge.config as cfg
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_ev_based"] = False
+    try:
+        # buy_no: gross edge = price - model = 0.60 - 0.65 = -0.05 → triggers.
+        pos = make_pos(side="buy_no", price=0.60, amount=100, cost=40,
+                       edge_at_entry=0.09)
+        opp = _opp_with_net_edge(
+            model_probability=0.65, market_price=0.60,
+            net_edge=0.05,          # YES-side (irrelevant for buy_no)
+            net_edge_no=-0.08,      # NO-side is what should be logged
+        )
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    finally:
+        cfg.MODULES["exit_ev_based"] = orig_ev
+
+    assert reason == "edge_stop"
+    records = [r for r in caplog.records if "edge_stop" in r.getMessage()]
+    msg = records[-1].getMessage()
+    # buy_no side must log net_edge_no, not net_edge.
+    assert "current_edge_net=-8.0%" in msg, msg
+    assert "current_edge_net=5.0%" not in msg, msg
+
+
+def test_edge_stop_decision_threshold_still_gross(mgr):
+    """G8 fix is strictly observational — decision must still compare
+    gross current_edge to EDGE_STOP_THRESHOLD, so calibration is stable."""
+    import weatheredge.config as cfg
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_ev_based"] = False
+    try:
+        # Gross edge = -0.02 (above threshold). If the fix accidentally
+        # flipped the decision to use net_edge, this would trigger.
+        pos = make_pos(side="buy_yes", price=0.70, amount=100, cost=70,
+                       edge_at_entry=0.05)
+        opp = _opp_with_net_edge(
+            model_probability=0.68, market_price=0.70,
+            net_edge=-0.05,  # net says "stop", gross says "hold"
+        )
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    finally:
+        cfg.MODULES["exit_ev_based"] = orig_ev
+
+    # Gross = -0.02 > -0.03 threshold → MUST hold.
+    assert reason != "edge_stop"

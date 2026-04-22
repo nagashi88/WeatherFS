@@ -155,16 +155,22 @@ class RiskManager:
         # and keeps the downstream `cost = contracts × price` identity true.
         position = stake_dollars / market_price
 
-        # Layer 5: Slippage cap — estimated_slippage must be ≤ edge × 0.5.
+        # Layer 5: Slippage cap — estimated_slippage must be ≤ NET edge × 0.5.
         # Model: slippage = (contracts × 0.005) / volume_contracts (unitless).
+        # CCG-bughunt2 G7: gross edge (win_prob - price) ignores round-trip
+        # fees. On Kalshi, fees can consume most of the gross edge — so
+        # allowing slippage up to 50% of gross is effectively allowing it
+        # to exceed the entire net edge, guaranteeing a loss once fees and
+        # slippage compound. Use (gross_edge - fees) so the cap scales
+        # with real profitability.
         # CCG-bug-3: reuse volume_clean (NaN-safe) instead of raw volume so
         # bad upstream values disable trading rather than the cap.
         if volume is not None:
-            edge = win_probability - market_price
-            if edge > 0:
+            net_edge = (win_probability - market_price) - (entry_fee + exit_cost)
+            if net_edge > 0:
                 vol_for_slip = max(volume_clean, 1.0)
                 estimated_slippage = (position * 0.005) / vol_for_slip
-                max_slippage = edge * 0.5
+                max_slippage = net_edge * 0.5
                 if estimated_slippage > max_slippage:
                     # Cap contracts so slippage == max_slippage (never grow).
                     position = min(position, (max_slippage * vol_for_slip) / 0.005)

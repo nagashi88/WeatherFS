@@ -88,11 +88,19 @@ class ExitManager:
         pnl_pct = unrealized_pnl / cost if cost > 0 else 0.0
 
         # --- Current edge (model vs market, from our position's perspective) ---
+        # CCG-bughunt2 G8: carry a side-aware NET current edge alongside the
+        # gross value so the edge_stop log shows units that match the stored
+        # entry_edge (which is net). Decision still uses gross (threshold is
+        # calibrated against gross), but operators reading logs need apples-
+        # to-apples values — mixing net entry_edge with gross current_edge
+        # silently understates how much edge has actually decayed.
         if side == "buy_yes":
             current_edge = model_prob - current_price
+            current_edge_net = getattr(opp, "net_edge", current_edge)
         else:
             # buy_no: we profit when YES price falls; edge = (1-model) - (1-price) = price - model
             current_edge = (1.0 - model_prob) - (1.0 - current_price)
+            current_edge_net = getattr(opp, "net_edge_no", current_edge)
 
         # --- Lead time ---
         lead_time_hours = self._lead_time_hours(market_id, market_metadata, pos)
@@ -142,14 +150,23 @@ class ExitManager:
         # ================================================================
         # EXIT 2: Edge-Based Trailing Stop (fallback when EV says hold but
         # current edge has flipped hard against our position).
-        # NOTE: current_edge is gross (model - price) side-aware;
-        # entry_edge stored on pos is NET of fees (see portfolio_manager).
-        # The asymmetry is kept for now — threshold is calibrated on gross.
+        # CCG-bughunt2 G8: EDGE_STOP_THRESHOLD is calibrated against GROSS
+        # current_edge, so the decision intentionally uses gross. But the
+        # prior log line pasted `entry_edge` (net) next to `current_edge`
+        # (gross) with identical "%%" formatting, silently understating
+        # edge decay by the round-trip fee. Log now shows both the gross
+        # value that triggered and the NET value that's comparable to
+        # entry_edge — operators can read the real delta at a glance.
         # ================================================================
         if MODULES.get("exit_edge_flip", True) and current_edge < EDGE_STOP_THRESHOLD:
             log.info(
-                "EXIT edge_stop: market=%s entry_edge=%.1f%% current_edge=%.1f%% → selling",
-                market_id, entry_edge * 100, current_edge * 100,
+                "EXIT edge_stop: market=%s entry_edge_net=%.1f%% "
+                "current_edge_net=%.1f%% (gross=%.1f%% < %.0f%% threshold) → selling",
+                market_id,
+                entry_edge * 100,
+                current_edge_net * 100,
+                current_edge * 100,
+                EDGE_STOP_THRESHOLD * 100,
             )
             return "edge_stop"
 

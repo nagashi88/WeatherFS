@@ -266,10 +266,12 @@ def test_slippage_cap_limits_large_orders_in_thin_markets():
         bankroll=10000.0,
         volume=10,  # Very thin market
     )
-    # edge = 0.90 - 0.10 = 0.80; max_slippage = 0.40
-    # slippage_cap_size = (0.40 * 10) / 0.005 = 800.0
+    # CCG-bughunt2 G7: cap now uses NET edge (gross - fees). For Kalshi
+    # p=0.10: fees = entry(0.01) + exit(0.01+0.01) = 0.03, so
+    # net_edge = 0.80 - 0.03 = 0.77, max_slippage = 0.385,
+    # slippage_cap_size = (0.385 * 10) / 0.005 = 770.
     # After 0.25 scaling for volume<100, uncapped Kelly would be huge;
-    # slippage cap should limit to <= 800
+    # slippage cap should limit to <= 770 (strictly under legacy 800 bound).
     assert size <= 800.01, f"Slippage cap should limit size to ≤800, got {size}"
 
 
@@ -290,3 +292,95 @@ def test_slippage_cap_does_not_reduce_when_unnecessary():
     )
     # With high volume, no slippage adjustment expected
     assert size_with_volume == size_without_volume
+
+
+# ---------------------------------------------------------------------------
+# CCG-bughunt2 G7: slippage cap must use NET edge (gross - fees), not gross.
+# On Kalshi, taker fee + half-spread can consume most of the gross edge —
+# so allowing slippage up to 50% of gross is effectively permitting it to
+# exceed the entire net edge, guaranteeing a loss after fees + slippage
+# compound.
+# ---------------------------------------------------------------------------
+
+
+def test_slippage_cap_tightens_when_fees_eat_edge():
+    """Thin edge + Kalshi fees: cap must scale with NET edge, not gross.
+
+    p=0.50, win=0.58, volume=500:
+      Kalshi fees = entry(0.02) + exit(0.02 + 0.01 half-spread) = 0.05
+      gross_edge = 0.08, net_edge = 0.03
+      Old (gross):  max_slip = 0.04  →  size cap = (0.04 × 500) / 0.005 = 4000
+      New (net):    max_slip = 0.015 →  size cap = (0.015 × 500) / 0.005 = 1500
+    Uncapped Kelly (kelly_fraction=1.0, post-warmup) lands above 1500 for
+    this scenario, so only the net-edge cap binds — proving the bug fix
+    is the active gate (not Kelly itself).
+    """
+    rm = RiskManager(make_settings(
+        kelly_fraction=1.0,
+        max_single_market_exposure=1.0,
+        max_cost_per_trade_fraction=1.0,
+    ))
+    rm.set_resolved_trade_count(100)  # skip warmup so cap is the true gate
+    size = rm.calculate_position_size(
+        win_probability=0.58,
+        market_price=0.50,
+        bankroll=100_000.0,
+        volume=500,
+    )
+    # Old bug would return ~ min(uncapped_kelly, gross_cap=4000).
+    # New fix must return ≤ net_cap = 1500.
+    assert size <= 1500.01, (
+        f"Slippage cap must use NET edge (0.03), not gross (0.08); "
+        f"expected ≤1500, got {size}"
+    )
+    # And the cap must actually bind — otherwise the test isn't exercising G7.
+    assert size > 1000, (
+        f"Uncapped Kelly should exceed 1500 (so the cap binds), got {size}"
+    )
+
+
+def test_slippage_cap_does_not_block_when_fees_small():
+    """Sanity: when fees are small relative to edge (low volume still matters
+    but gross ≈ net), old and new caps land close together and the trade is
+    not spuriously throttled further than necessary."""
+    rm = RiskManager(make_settings(
+        kelly_fraction=1.0,
+        max_single_market_exposure=1.0,
+        max_cost_per_trade_fraction=1.0,
+    ))
+    # Big edge (fees tiny as a fraction): cap should still permit a large
+    # position proportional to net edge.
+    # p=0.10, win=0.90, Kalshi fees = 0.01 + 0.02 = 0.03, gross=0.80, net=0.77.
+    size = rm.calculate_position_size(
+        win_probability=0.90,
+        market_price=0.10,
+        bankroll=10000.0,
+        volume=10,
+    )
+    # Net cap: (0.77 * 0.5 * 10) / 0.005 = 770. Still generous.
+    assert size <= 770.01, f"Expected ≤770 (net-edge cap), got {size}"
+    # And materially above the tight-fee case — not thrown away.
+    assert size >= 100
+
+
+def test_slippage_cap_consistent_with_kelly_net_edge():
+    """Post-G7, the slippage cap refuses trades whose slippage would exceed
+    half the net edge. When uncapped-Kelly slippage already < net×0.5, no
+    additional tightening occurs (same as high-volume baseline)."""
+    rm = RiskManager(make_settings(kelly_fraction=0.25))
+    # Volume high enough that (position × 0.005 / volume) << net×0.5.
+    large_vol_size = rm.calculate_position_size(
+        win_probability=0.65,
+        market_price=0.50,
+        bankroll=1000.0,
+        volume=10000,
+    )
+    no_vol_size = rm.calculate_position_size(
+        win_probability=0.65,
+        market_price=0.50,
+        bankroll=1000.0,
+        volume=None,
+    )
+    # Volume this high → book_depth_scalar clamps to 1.0 AND slippage cap
+    # inactive → same answer as the volume=None path.
+    assert large_vol_size == no_vol_size
