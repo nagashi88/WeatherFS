@@ -2391,7 +2391,10 @@ def _build_opportunity(
         )
         gaussian_prob = max(_p_above_low - _p_above_high, 0.0)
         if ensemble_members and len(ensemble_members) >= 20:
-            _in_bucket = sum(1 for t in ensemble_members if bucket_low <= t <= bucket_high)
+            # CCG-bug-8: settlement is upper-exclusive (`low <= actual < high`,
+            # see _determine_market_outcome). Ensemble audit-prob must use the
+            # same boundary — `t == bucket_high` is a NO outcome, not YES.
+            _in_bucket = sum(1 for t in ensemble_members if bucket_low <= t < bucket_high)
             ensemble_prob = _in_bucket / len(ensemble_members)
     else:
         gaussian_prob = gaussian_probability(forecast_temp, threshold, rmse, direction)

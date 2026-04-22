@@ -4023,6 +4023,46 @@ class TestBucketPhantomEdgeGuard:
             f"in-band bucket gaussian_prob too low: {opp.gaussian_prob:.3f}"
         )
 
+    def test_ensemble_audit_prob_respects_upper_exclusive_boundary(self):
+        """CCG-bug-8: ensemble audit-prob must use `low <= t < high`, matching
+        settlement semantics (_determine_market_outcome). An ensemble member
+        exactly at bucket_high is a NO outcome, not YES — the upper-inclusive
+        form (`<=`) inflates audit prob and misaligns with resolution.
+        """
+        state = self._state_no_metar()
+        market_id = "bucket_boundary"
+        bucket_low, bucket_high = 86.0, 87.0
+        state.market_metadata[market_id] = self._bucket_meta(
+            market_id, low=bucket_low, high=bucket_high, date=self.TODAY,
+        )
+
+        # 20 members: 15 strictly inside, 5 exactly at bucket_high (boundary).
+        ensemble = [86.5] * 15 + [bucket_high] * 5
+        forecast = {
+            "KNYC": {
+                "temperature_forecast": 86.5,
+                "ecmwf_temp": None,
+                "hrrr_temp": None,
+                "ensemble_members": ensemble,
+                "model": "gfs",
+                "forecast_timestamp": datetime.now(timezone.utc),
+            }
+        }
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.50}, forecast,
+            )
+
+        assert opp is not None
+        assert opp.ensemble_prob is not None
+        # Fixed: 15/20 = 0.75. Old buggy `<=`: 20/20 = 1.0.
+        assert abs(opp.ensemble_prob - 0.75) < 1e-6, (
+            f"boundary members must be excluded — ensemble_prob should be 0.75 "
+            f"(15 strictly inside / 20 total), got {opp.ensemble_prob:.4f}. "
+            f"Upper-inclusive boundary would have returned 1.0."
+        )
+
 
 # ---------------------------------------------------------------------------
 # PROBLEM #4: Adjacent-bucket correlation guard
