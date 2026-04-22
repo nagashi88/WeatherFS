@@ -182,8 +182,10 @@ class ExitManager:
 
         # ================================================================
         # EXIT 3: Time-Decay Exit
+        # CCG-bughunt2 Codex F8: honor MODULES["exit_time_decay"] so phases
+        # can turn the rule off without patching the code.
         # ================================================================
-        if lead_time_hours is not None:
+        if MODULES.get("exit_time_decay", True) and lead_time_hours is not None:
             if lead_time_hours < TIME_FORCE_EXIT_HOURS:
                 log.info(
                     "EXIT time_decay: market=%s lead_time=%.2fh pnl=%.1f%% → selling (wire)",

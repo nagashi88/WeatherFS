@@ -56,10 +56,11 @@ def test_kelly_small_edge_approx_4_84():
 
 
 def test_kelly_large_edge_capped_at_80():
-    """model_prob=0.70, market_price=0.25 → large edge → capped at 8% = $80.
+    """model_prob=0.70, market_price=0.25 → large edge → $80 stake cap = 320 contracts.
 
     Post-fee-fix: entry=0.02, exit=0.03, net_win=0.70, b=0.70/0.27≈2.593
-    kelly ≈ 0.584 → raw size = 87.64 → capped to $80.
+    kelly ≈ 0.584 → raw stake = $87.64 → capped to $80 → 320 contracts at $0.25.
+    (CCG-bughunt2 F-new-2: size is CONTRACTS, stake = size * price.)
     """
     rm = RiskManager(make_settings())
     rm.set_resolved_trade_count(100)  # bypass warmup Kelly
@@ -68,7 +69,7 @@ def test_kelly_large_edge_capped_at_80():
         market_price=0.25,
         bankroll=1000.0,
     )
-    assert size == pytest.approx(80.0, abs=0.10), f"Expected $80.00, got {size}"
+    assert size == pytest.approx(320.0, abs=0.40), f"Expected 320 contracts ($80 cap), got {size}"
 
 
 def test_kelly_zero_when_no_edge():

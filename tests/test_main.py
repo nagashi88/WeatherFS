@@ -2733,6 +2733,167 @@ class TestBuildOpportunityEdgePaths:
         assert opp is not None
         assert opp.market_price_timestamp is None
 
+    def test_celsius_market_converts_threshold_to_fahrenheit(self):
+        """CCG-bughunt2 Codex F2: parsed.unit='C' must convert threshold to °F.
+
+        Forecasts, METAR, and RMSE are all in °F. A '30°C' London market was
+        previously treated as 30°F and silently rejected as unwinnable.
+        """
+        state = self._make_state()
+
+        mock_parsed = MagicMock()
+        mock_parsed.threshold = 30.0  # 30°C = 86°F
+        mock_parsed.direction = "above"
+        mock_parsed.market_type = "daily_high"
+        mock_parsed.date = "2026-04-30"
+        mock_parsed.threshold_low = None
+        mock_parsed.threshold_high = None
+        mock_parsed.unit = "C"
+
+        market_id = "0xlondon_celsius"
+        state.market_metadata[market_id] = {
+            "resolution_source": {"station": "EGLC", "type": "daily_high"},
+            "platform": "polymarket",
+            "parsed": mock_parsed,
+        }
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.5}, self._base_forecasts("EGLC")
+            )
+
+        assert opp is not None
+        assert opp.threshold == pytest.approx(86.0, abs=1e-6)
+
+    def test_celsius_bucket_market_converts_bounds_to_fahrenheit(self):
+        """CCG-bughunt2 Codex F2: bucket_low/high on a °C market also convert."""
+        state = self._make_state()
+
+        mock_parsed = MagicMock()
+        mock_parsed.threshold = None
+        mock_parsed.direction = "above"
+        mock_parsed.market_type = "daily_high"
+        mock_parsed.date = "2026-04-30"
+        mock_parsed.threshold_low = 20.0   # 20°C = 68°F
+        mock_parsed.threshold_high = 25.0  # 25°C = 77°F
+        mock_parsed.unit = "C"
+
+        market_id = "0xlondon_celsius_bucket"
+        state.market_metadata[market_id] = {
+            "resolution_source": {"station": "EGLC", "type": "daily_high"},
+            "platform": "polymarket",
+            "parsed": mock_parsed,
+        }
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.5}, self._base_forecasts("EGLC")
+            )
+
+        assert opp is not None
+        assert opp.bucket_low == pytest.approx(68.0, abs=1e-6)
+        assert opp.bucket_high == pytest.approx(77.0, abs=1e-6)
+
+    def test_extreme_yes_price_dropped_for_entry(self):
+        """CCG-bughunt2 F-new-3: entry path keeps the 0.10/0.90 guard."""
+        state = self._make_state()
+        forecasts = self._base_forecasts("KNYC")
+
+        with _patch_state(state):
+            low = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.05}, forecasts
+            )
+            high = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.95}, forecasts
+            )
+
+        assert low is None
+        assert high is None
+
+    def test_extreme_yes_price_allowed_for_exit_mark(self):
+        """CCG-bughunt2 F-new-3: allow_extreme_price=True bypasses the entry
+        filter so ExitManager can mark-to-market open positions whose price
+        has drifted into the 0.10/0.90 tails.
+        """
+        state = self._make_state()
+        forecasts = self._base_forecasts("KNYC")
+
+        with _patch_state(state):
+            low = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.05}, forecasts,
+                allow_extreme_price=True,
+            )
+            high = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.95}, forecasts,
+                allow_extreme_price=True,
+            )
+
+        assert low is not None
+        assert low.market_price == pytest.approx(0.05)
+        assert high is not None
+        assert high.market_price == pytest.approx(0.95)
+
+
+class TestGetForecastForDate:
+    """CCG-bughunt2 F4 / Gemini #2: live-mode must not silently fall back
+    to a future/latest forecast when the requested date is missing.
+    """
+
+    def test_strict_returns_none_when_date_missing(self):
+        forecasts = {
+            "KNYC": {
+                "2026-04-23": {"temperature_forecast": 72.0},
+            }
+        }
+        result = main_module._get_forecast_for_date(forecasts, "KNYC", "2026-04-22")
+        assert result is None, (
+            "strict mode must reject tomorrow's forecast for today's market"
+        )
+
+    def test_strict_default(self):
+        """Default is strict — positional-only call must reject future fallback."""
+        forecasts = {
+            "KNYC": {
+                "2026-04-23": {"temperature_forecast": 72.0},
+                "2026-04-25": {"temperature_forecast": 80.0},
+            }
+        }
+        result = main_module._get_forecast_for_date(forecasts, "KNYC", "2026-04-22")
+        assert result is None
+
+    def test_strict_exact_match_still_works(self):
+        forecasts = {
+            "KNYC": {
+                "2026-04-22": {"temperature_forecast": 75.0},
+                "2026-04-23": {"temperature_forecast": 72.0},
+            }
+        }
+        result = main_module._get_forecast_for_date(forecasts, "KNYC", "2026-04-22")
+        assert result is not None
+        assert result["temperature_forecast"] == 75.0
+
+    def test_non_strict_falls_back_to_future(self):
+        """strict=False preserves legacy offline/analytics behavior."""
+        forecasts = {
+            "KNYC": {
+                "2026-04-23": {"temperature_forecast": 72.0},
+            }
+        }
+        result = main_module._get_forecast_for_date(
+            forecasts, "KNYC", "2026-04-22", strict=False,
+        )
+        assert result is not None
+        assert result["temperature_forecast"] == 72.0
+
+    def test_strict_flat_dict_backward_compat(self):
+        """Flat {station: {fields}} dicts (used in tests) still resolve."""
+        forecasts = {
+            "KNYC": {"temperature_forecast": 75.0, "ensemble_members": None},
+        }
+        result = main_module._get_forecast_for_date(forecasts, "KNYC", "2026-04-22")
+        assert result is not None
+        assert result["temperature_forecast"] == 75.0
+
 
 # ---------------------------------------------------------------------------
 # Coverage gaps: _evaluate_market edge paths (lines 973, 1003-1005, 1010-1012)
@@ -3330,6 +3491,36 @@ class TestBucketMetarOverride:
         assert opp is not None
         assert opp.model_probability <= 0.05, (
             f"METAR-exceeds-bucket should cap prob to <=0.05, got {opp.model_probability}"
+        )
+
+    def test_metar_at_bucket_high_boundary_resolves_as_no(self):
+        """metar_high == bucket_high must invalidate YES (settlement uses `actual < high`).
+
+        Regression for Finding-new-4 (HIGH): prior code used
+        `bucket_low <= metar_high <= bucket_high` for the in-range YES-boost,
+        but settlement resolves `low <= actual < high` (upper-exclusive). A
+        metar_high exactly at bucket_high would boost YES to 0.85 while
+        settlement resolved NO — systematic YES-bias on the boundary.
+        """
+        state = self._make_state_with_tracker(daily_high_f=87.0, market_date=self.TODAY)
+        market_id = "bucket_boundary"
+        state.market_metadata[market_id] = self._bucket_market_metadata(
+            market_id, "KNYC", self.TODAY, low=86.0, high=87.0,
+        )
+
+        with _patch_state(state), patch.object(main_module, "station_local_today_str", return_value=self.TODAY):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.30}, self._forecasts("KNYC", 86.5),
+            )
+
+        assert opp is not None
+        assert opp.model_probability <= 0.05, (
+            f"metar_high == bucket_high must be treated as bucket-exceeded (prob<=0.05), "
+            f"got {opp.model_probability}"
+        )
+        assert getattr(opp, "bucket_invalidated_for_yes", False), (
+            "metar_high == bucket_high must set bucket_invalidated_for_yes "
+            "so ExitManager can close buy_yes positions."
         )
 
     def test_metar_below_bucket_does_not_override(self):

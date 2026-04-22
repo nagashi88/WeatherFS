@@ -374,6 +374,57 @@ class TestResolutionPipeline:
 
         assert outcome is None
 
+    def test_determine_market_outcome_waits_for_station_local_close(self, resolution_engine):
+        """Resolution must wait until station-local day has ended, not host-local.
+
+        Regression for Finding-new-1 (CRITICAL): using datetime.date.today() on a
+        non-US host (e.g. Europe/Rome) at just-past-midnight local wrongly classifies
+        US markets as 'past' while the station-local day is still ~5h in progress,
+        causing premature resolution before the daily high is realized.
+        """
+        with get_session(resolution_engine) as session:
+            session.add(Market(
+                id="MKT-STILL-LIVE", platform="kalshi", city="New York",
+                station="KNYC", date="2026-04-22", market_type="daily_high",
+                threshold_high=70.0,
+            ))
+            session.add(Forecast(
+                station="KNYC", target_date="2026-04-22", model="gfs",
+                forecast_timestamp=datetime(2026, 4, 21, tzinfo=timezone.utc),
+                lead_time_hours=24, temperature_forecast=72.0, actual_temp=75.0,
+            ))
+
+        from weatheredge.main import _determine_market_outcome
+        state = MagicMock()
+
+        with patch("weatheredge.main.get_session", lambda: get_session(resolution_engine)), \
+             patch("weatheredge.main.hours_until_market_close", return_value=5.5):
+            outcome = _determine_market_outcome(state, "MKT-STILL-LIVE")
+
+        assert outcome is None, "Should not resolve while station-local day is still live"
+
+    def test_determine_market_outcome_unknown_station_timezone_holds_off(self, resolution_engine):
+        """When station timezone is unknown (helper returns None), defer resolution.
+
+        Resolving with an unknown close time risks firing at the wrong wall-clock;
+        safer to wait until we have a timezone mapping.
+        """
+        with get_session(resolution_engine) as session:
+            session.add(Market(
+                id="MKT-UNK-TZ", platform="kalshi", city="UnknownCity",
+                station="XXXX", date="2026-03-01", market_type="daily_high",
+                threshold_high=70.0,
+            ))
+
+        from weatheredge.main import _determine_market_outcome
+        state = MagicMock()
+
+        with patch("weatheredge.main.get_session", lambda: get_session(resolution_engine)), \
+             patch("weatheredge.main.hours_until_market_close", return_value=None):
+            outcome = _determine_market_outcome(state, "MKT-UNK-TZ")
+
+        assert outcome is None
+
     def test_determine_market_outcome_bucket_market(self, resolution_engine):
         """Bucket market: yes if threshold_low <= actual < threshold_high."""
         with get_session(resolution_engine) as session:

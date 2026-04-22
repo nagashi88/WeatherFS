@@ -1049,3 +1049,73 @@ def test_kalshi_pnl_pct_net_of_exit_fee_holds_where_poly_would_sell(mgr):
         f"Kalshi: exit fee wipes the paper profit, profit-lock must NOT fire. "
         f"Got reason={reason}"
     )
+
+
+# ---------------------------------------------------------------------------
+# CCG-bughunt2 Codex F8: MODULES["exit_time_decay"] gate
+# ---------------------------------------------------------------------------
+
+def test_exit_time_decay_gate_suppresses_force_exit(mgr):
+    """exit_time_decay=False in MODULES must prevent time_decay from firing
+    on the <1h force-exit branch. Default was True (unconditional) before
+    the gate was added in CCG-bughunt2 F8.
+    """
+    import weatheredge.config as cfg
+    orig_td = cfg.MODULES.get("exit_time_decay", True)
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    orig_flip = cfg.MODULES.get("exit_edge_flip", True)
+    cfg.MODULES["exit_time_decay"] = False
+    cfg.MODULES["exit_ev_based"] = False
+    cfg.MODULES["exit_edge_flip"] = False
+    try:
+        pos = make_pos(side="buy_yes", price=0.65, amount=100, cost=65)
+        opp = make_opp(model_probability=0.70, market_price=0.65)
+        with patch.object(ExitManager, "_lead_time_hours", return_value=0.5):
+            reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+        assert reason is None
+    finally:
+        cfg.MODULES["exit_time_decay"] = orig_td
+        cfg.MODULES["exit_ev_based"] = orig_ev
+        cfg.MODULES["exit_edge_flip"] = orig_flip
+
+
+def test_exit_time_decay_gate_suppresses_profit_lock(mgr):
+    """exit_time_decay=False also suppresses the in-window profit-lock branch."""
+    import weatheredge.config as cfg
+    orig_td = cfg.MODULES.get("exit_time_decay", True)
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    orig_flip = cfg.MODULES.get("exit_edge_flip", True)
+    cfg.MODULES["exit_time_decay"] = False
+    cfg.MODULES["exit_ev_based"] = False
+    cfg.MODULES["exit_edge_flip"] = False
+    try:
+        pos = make_pos(side="buy_yes", price=0.50, amount=200, cost=100)
+        opp = make_opp(model_probability=0.70, market_price=0.60)  # pnl ~ +20%
+        with patch.object(ExitManager, "_lead_time_hours", return_value=2.0):
+            reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+        assert reason is None
+    finally:
+        cfg.MODULES["exit_time_decay"] = orig_td
+        cfg.MODULES["exit_ev_based"] = orig_ev
+        cfg.MODULES["exit_edge_flip"] = orig_flip
+
+
+def test_exit_time_decay_default_is_on(mgr):
+    """Default (no override) keeps time_decay active — regression guard
+    that the F8 gate default True matches historical unconditional behavior.
+    """
+    import weatheredge.config as cfg
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    orig_flip = cfg.MODULES.get("exit_edge_flip", True)
+    cfg.MODULES["exit_ev_based"] = False
+    cfg.MODULES["exit_edge_flip"] = False
+    # intentionally do NOT touch exit_time_decay — default must remain ON
+    try:
+        pos = make_pos(side="buy_yes", price=0.65, amount=100, cost=65)
+        opp = make_opp(model_probability=0.70, market_price=0.65)
+        with patch.object(ExitManager, "_lead_time_hours", return_value=0.5):
+            reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+        assert reason == "time_decay"
+    finally:
+        cfg.MODULES["exit_ev_based"] = orig_ev
+        cfg.MODULES["exit_edge_flip"] = orig_flip

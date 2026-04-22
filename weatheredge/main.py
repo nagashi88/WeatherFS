@@ -978,6 +978,33 @@ def _run_decision_cycle(state: AppState) -> None:
         opportunities[market_id] = opp
         _opps_by_city.setdefault(opp.city, []).append(opp)
 
+    # CCG-bughunt2 F-new-3: ensure every open position has an exit-side opp
+    # even when its price has drifted into the 0.10/0.90 entry-band tails.
+    # These opps are marked and only flow to ExitManager — not to the
+    # entry strategy pass (which already skips markets with open positions).
+    for _pos in state.paper_trader.open_positions:
+        _mid = _pos.get("market_id")
+        if not _mid or _mid in opportunities:
+            continue
+        _pd = market_prices.get(_mid)
+        if not _pd:
+            continue
+        try:
+            _exit_opp = _build_opportunity(
+                _mid, _pd, forecasts, allow_extreme_price=True,
+            )
+        except Exception as exc:
+            log.error(
+                "run_decision_loop: failed to build exit-side opp for %s: %s",
+                _mid, exc, exc_info=True,
+            )
+            continue
+        if _exit_opp is None:
+            continue
+        opportunities[_mid] = _exit_opp
+        # Intentionally NOT adding to _opps_by_city: ladder/city aggregation
+        # is for entry sizing and these are mark-to-market only.
+
     # Strategy pass — all opportunities and city buckets are now fully populated
     for market_id, opp in opportunities.items():
         price_data = market_prices.get(market_id, {})
@@ -1654,13 +1681,24 @@ def _get_forecast_for_date(
     forecasts: dict[str, dict[str, dict]],
     station: str,
     market_date: str | None,
+    *,
+    strict: bool = True,
 ) -> dict | None:
     """Return the forecast entry for a specific station and market date.
 
-    Lookup order:
+    Lookup order when ``strict=True`` (default, live-decision safe):
+    1. Exact (station, market_date) match — else return None.
+
+    When ``strict=False`` (offline analytics / backtest):
     1. Exact (station, market_date) match
     2. Nearest future date for that station (earliest date >= market_date)
     3. Most recent available date for that station (last resort)
+
+    CCG-bughunt2 F4 / Gemini #2: the live decision path must never silently
+    trade today's market on tomorrow's (or yesterday's) forecast — tomorrow's
+    daily max has no causal link to today's settlement. Live code relies on
+    the strict default; backtests and audits can opt into fallbacks.
+
     Also tries the city-name key if station code not found.
     """
     station_forecasts = forecasts.get(station)
@@ -1678,6 +1716,13 @@ def _get_forecast_for_date(
 
     if market_date and market_date in station_forecasts:
         return station_forecasts[market_date]
+
+    if strict:
+        log.debug(
+            "_get_forecast_for_date: no exact forecast for %s/%s (strict mode) — returning None",
+            station, market_date,
+        )
+        return None
 
     # Nearest future date
     if market_date:
@@ -1832,6 +1877,8 @@ def _build_opportunity(
     market_id: str,
     price_data: dict,
     forecasts: dict[str, dict],
+    *,
+    allow_extreme_price: bool = False,
 ) -> MarketOpportunity | None:
     """Build a MarketOpportunity from DB data for a known market.
 
@@ -1841,6 +1888,11 @@ def _build_opportunity(
     1. Cached metadata from the scanning pipeline (has parsed data)
     2. Kalshi prefix match against RESOLUTION_SOURCES (e.g. KXHIGHDEN-26MAR30-T76 → KXHIGHDEN)
     3. Exact match in RESOLUTION_SOURCES (legacy fallback)
+
+    When ``allow_extreme_price=True`` the 0.10/0.90 entry-band filter is
+    skipped so we can mark-to-market open positions whose price has drifted
+    into the tails (CCG-bughunt2 F-new-3). Entry-side callers keep the
+    default; exit-side callers pass True.
     """
     state = get_state()
 
@@ -1888,6 +1940,19 @@ def _build_opportunity(
         # actual probability is calculated below using bucket_probability()
         if bucket_low is not None and bucket_high is not None and parsed.threshold is None:
             threshold = (bucket_low + bucket_high) / 2.0  # used only as fallback
+
+        # CCG-bughunt2 Codex F2: convert °C thresholds to °F before any
+        # probability/METAR/edge logic. Forecasts, METAR, and RMSE are all in °F,
+        # so a "30°C" London market was previously treated as "30°F" and silently
+        # rejected as unwinnable.
+        if getattr(parsed, "unit", "F") == "C":
+            def _c_to_f(c: float) -> float:
+                return c * 9.0 / 5.0 + 32.0
+            threshold = _c_to_f(threshold)
+            if bucket_low is not None:
+                bucket_low = _c_to_f(bucket_low)
+            if bucket_high is not None:
+                bucket_high = _c_to_f(bucket_high)
     else:
         # Kalshi markets: extract threshold from market_id if possible
         # e.g. KXHIGHDEN-26MAR30-T76 → threshold=76, KXHIGHDEN-26MAR30-B76.5 → threshold=76.5
@@ -1922,12 +1987,17 @@ def _build_opportunity(
 
     # FIX 3: Never trade contracts priced below $0.10 — below that we have no edge over market consensus
     # Applies symmetrically: skip YES under $0.10 AND NO under $0.10 (i.e. yes_price > $0.90)
-    if yes_price < 0.10:
-        log.debug("_build_opportunity: %s skipped — yes_price=%.3f < $0.10 minimum", market_id, yes_price)
-        return None
-    if yes_price > 0.90:
-        log.debug("_build_opportunity: %s skipped — NO price=%.3f < $0.10 minimum", market_id, 1.0 - yes_price)
-        return None
+    # CCG-bughunt2 F-new-3: the entry-band filter must not silence exit-side
+    # mark-to-market. Callers building opps for an already-open position pass
+    # `allow_extreme_price=True` so ExitManager still gets a current opp when
+    # the price has drifted to 0.05 / 0.95.
+    if not allow_extreme_price:
+        if yes_price < 0.10:
+            log.debug("_build_opportunity: %s skipped — yes_price=%.3f < $0.10 minimum", market_id, yes_price)
+            return None
+        if yes_price > 0.90:
+            log.debug("_build_opportunity: %s skipped — NO price=%.3f < $0.10 minimum", market_id, 1.0 - yes_price)
+            return None
 
     gfs_temp = forecast.get("temperature_forecast")
     ecmwf_temp = forecast.get("ecmwf_temp")
@@ -2107,17 +2177,24 @@ def _build_opportunity(
                     and tracker.daily_high_f > -900.0
                 ):
                     metar_high = tracker.daily_high_f
-                    if bucket_low <= metar_high <= bucket_high:
+                    # Bucket semantics are upper-exclusive at settlement
+                    # (see _determine_market_outcome: `low <= actual < high`).
+                    # Using `<=` on both bounds here would boost YES for
+                    # metar_high == bucket_high while settlement resolves that
+                    # exact value as NO — a systematic YES-bias at the
+                    # boundary. Match settlement: in-range uses `<` on high,
+                    # invalidation uses `>=`.
+                    if bucket_low <= metar_high < bucket_high:
                         # Already inside the bucket — strong YES baseline.
                         adjusted = max(probability, 0.85)
                         log.info(
-                            "BUCKET METAR override %s: observed daily high %.1f in [%.0f,%.0f] → prob %.2f→%.2f",
+                            "BUCKET METAR override %s: observed daily high %.1f in [%.0f,%.0f) → prob %.2f→%.2f",
                             market_id, metar_high, bucket_low, bucket_high,
                             probability, adjusted,
                         )
                         probability = adjusted
                         model_used = "metar_bucket_in_range"
-                    elif metar_high > bucket_high:
+                    elif metar_high >= bucket_high:
                         # Already past the bucket — daily max can only stay or climb.
                         adjusted = min(probability, 0.05)
                         log.info(
@@ -2212,8 +2289,12 @@ def _build_opportunity(
 
     # FIX 2: Hard cap — gross edge >40% means our model is almost certainly wrong, not the market.
     # Tightened from 50% → 40% (Phase 0 evidence: 3 out of 4 losses had gross_edge 28-41%).
+    # CCG-bughunt2 F-new-3: skip when building for an already-open position —
+    # when the price drifts to 0.05/0.95 the gross edge vs. our earlier model is
+    # almost tautologically >40%, and dropping the opp would make the position
+    # unexitable. Exit-side callers accept whatever edge the mark reports.
     _gross_edge = abs(probability - yes_price)
-    if _gross_edge > 0.40:
+    if _gross_edge > 0.40 and not allow_extreme_price:
         log.warning(
             "Unrealistic edge %.1f%% for %s: model=%.3f market=%.3f — likely model error. Skipping.",
             _gross_edge * 100, market_id, probability, yes_price,
@@ -2671,7 +2752,6 @@ def _determine_market_outcome(state: "AppState", market_id: str) -> str | None:
     """
     from sqlalchemy import select
     from weatheredge.db.models import Market as MarketModel, Forecast as ForecastModel
-    from datetime import date as date_type
 
     try:
         with get_session() as session:
@@ -2687,13 +2767,18 @@ def _determine_market_outcome(state: "AppState", market_id: str) -> str | None:
             if not station or not market_date:
                 return None
 
-            # Only resolve markets whose date has passed
+            # Only resolve after the market's station-local day has actually
+            # ended. Using host-local date.today() would fire prematurely on
+            # non-US hosts: at 00:30 Europe/Rome on 2026-04-23, a KNYC
+            # 2026-04-22 market would resolve while NYC was still 18:30 on
+            # 2026-04-22 — hours before the daily high is realized.
             try:
-                mdate = datetime.strptime(market_date, "%Y-%m-%d").date()
+                datetime.strptime(market_date, "%Y-%m-%d")
             except (ValueError, TypeError):
                 return None
 
-            if mdate >= date_type.today():
+            hours_to_close = hours_until_market_close(market_date, station)
+            if hours_to_close is None or hours_to_close > 0:
                 return None
 
             # Primary: ask Polymarket directly (works for polymarket markets)

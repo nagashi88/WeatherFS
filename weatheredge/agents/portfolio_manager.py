@@ -127,23 +127,32 @@ class PortfolioManager:
                 )
                 continue
             majority_distinct = len(side_distinct_agents.get(majority_side, set()))
-            weighted_score = sum(side_scores.values())
+            # total_score kept for telemetry only — the gate below uses
+            # majority_side_score (see CCG-bughunt2 F-new-7).
+            total_score = sum(side_scores.values())
 
             opp = opportunities.get(market_id)
             log.info(
-                "Voting: market=%s edge_yes=%s edge_no=%s score=%.2f majority=%s majority_score=%.2f distinct_majority=%d threshold=%.2f",
+                "Voting: market=%s edge_yes=%s edge_no=%s total=%.2f majority=%s majority_score=%.2f distinct_majority=%d threshold=%.2f",
                 market_id,
                 f"{opp.net_edge:.1%}" if opp else "n/a",
                 f"{opp.net_edge_no:.1%}" if opp else "n/a",
-                weighted_score,
+                total_score,
                 majority_side,
                 majority_side_score,
                 majority_distinct,
                 self.TRADE_THRESHOLD,
             )
 
-            # BugFix N11: Use < instead of <= so SellNO (weight=0.20) can trade at threshold
-            if weighted_score < self.TRADE_THRESHOLD:
+            # CCG-bughunt2 F-new-7: gate on the MAJORITY side's score, not the
+            # sum of both sides. The prior `weighted_score = sum(side_scores)`
+            # counted opposing votes as additional evidence for *trading*,
+            # letting two weak disagreeing signals clear the threshold even
+            # though neither side had conviction (e.g. Conservative buy_yes
+            # at 0.15 + Aggressive buy_no at 0.125 → sum 0.275 > 0.25, but
+            # the winning side was only 0.15). Preserving `<` (not `<=`) so
+            # a single full-weight vote exactly at the threshold still trades.
+            if majority_side_score < self.TRADE_THRESHOLD:
                 continue
 
             # CCG-bug-1: A2 distinct-agent gate is now SIDE-AWARE.
@@ -189,16 +198,18 @@ class PortfolioManager:
                     "bucket_low": bucket_low,
                     "bucket_high": bucket_high,
                     "effective_edge": effective_edge,
-                    "weighted_score": weighted_score,
+                    "majority_score": majority_side_score,
                     "side_margin": majority_side_score - minority_side_score,
                 }
             )
 
         # Prioritize strongest opportunities first; this matters when risk caps
-        # stop processing before all candidates can be accepted.
+        # stop processing before all candidates can be accepted. Rank by the
+        # majority side's score (what the gate above also checks) so the
+        # strongest-conviction market wins the slot, not the noisiest one.
         candidates.sort(
             key=lambda c: (
-                c["weighted_score"],
+                c["majority_score"],
                 c["effective_edge"],
                 c["side_margin"],
             ),
@@ -370,7 +381,16 @@ class PortfolioManager:
             # CCG-bug-8: hard-cap by remaining free cash so cumulative orders within
             # one cycle cannot deploy more than the user actually has. Round DOWN
             # to nearest 0.01 contract to avoid floating-point overshoot.
-            per_contract_cost = (1.0 - market_price) if majority_side == "buy_no" else market_price
+            # CCG-bughunt2 Codex F9: PaperTrader charges Kalshi taker fees on top
+            # of the raw contract price, so the cap must include that fee per
+            # contract, otherwise the cash-capped order still overshoots and
+            # gets rejected downstream.
+            base_contract_cost = (1.0 - market_price) if majority_side == "buy_no" else market_price
+            fee_per_contract = 0.0
+            if (platform or "kalshi") == "kalshi":
+                from weatheredge.probability.edge import kalshi_taker_fee
+                fee_per_contract = kalshi_taker_fee(market_price)
+            per_contract_cost = base_contract_cost + fee_per_contract
             cash_capped = False
             if per_contract_cost > 0 and remaining_cash < amount * per_contract_cost:
                 cap_amount = remaining_cash / per_contract_cost

@@ -131,6 +131,45 @@ def test_weighted_voting_below_threshold():
     rm.pre_trade_check.assert_not_called()
 
 
+def test_opposing_weak_votes_do_not_inflate_past_threshold():
+    """Regression for CCG-bughunt2 F-new-7: the gate must use the MAJORITY
+    side's score, not sum(side_scores.values()). Two weak opposing votes
+    (neither side reaching TRADE_THRESHOLD=0.25) used to clear the gate
+    because their combined total exceeded threshold, trading on the winning
+    side even though that winning side had sub-threshold conviction.
+
+    Setup: Conservative(0.30) × 0.5 = 0.15 for buy_yes,
+           Aggressive(0.25)   × 0.5 = 0.125 for buy_no.
+    sum = 0.275 > 0.25 (old gate would pass); majority_side_score = 0.15 <
+    0.25 (new gate correctly skips).
+    """
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-WEAK", side="buy_yes", confidence=0.5, agent_name="Conservative"),
+        Signal(market_id="MKT-WEAK", side="buy_no",  confidence=0.5, agent_name="Aggressive"),
+    ]
+    opp = make_opportunity("MKT-WEAK")
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-WEAK": signals},
+        opportunities={"MKT-WEAK": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == [], (
+        "Two weak opposing votes (0.15 vs 0.125) must not inflate past "
+        "TRADE_THRESHOLD — neither side has conviction"
+    )
+    rm.pre_trade_check.assert_not_called()
+
+
 def test_risk_veto_blocks_trade():
     """Weighted score above threshold but risk_manager blocks → no order."""
     rm = MagicMock()

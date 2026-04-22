@@ -59,12 +59,16 @@ class RiskManager:
         volume: float | None = None,
         platform: str = "kalshi",
     ) -> float:
-        """Two-layer sizing per addendum Gap 1.
+        """Sizing pipeline. Returns position size in CONTRACTS (not dollars).
 
-        Layer 1: Net-of-fees Kelly — b = (1-price-exit_cost)/(price+entry_fee)
-        Layer 2: Volatility targeting (if vol data available)
-        Layer 3: Slippage modeling (US-205) — volume-based scaling and cap
-        Final = min(kelly_size, vol_size, hard_caps)
+        Layer 1: Net-of-fees Kelly dollar stake.
+        Layer 2: Volatility targeting dollar allocation.
+        Layer 3: Dollar caps (max_single_market_exposure, max_cost_per_trade_fraction).
+        Layer 4: Convert dollar stake → contracts via market_price.
+        Layer 5: Contract-native caps (slippage, min_trade_cost floor).
+
+        Downstream callers (paper_trader, portfolio_manager) compute cost as
+        `contracts × market_price`; they assume this function returns contracts.
 
         For buy_no trades, flip to NO-side probabilities:
         win_prob_no = 1 - win_probability, price_no = 1 - market_price.
@@ -108,47 +112,53 @@ class RiskManager:
         q = 1.0 - p
         kelly = (b * p - q) / b
         kelly = max(0.0, kelly)
-        kelly_size = kelly * self._effective_kelly_fraction() * bankroll
+        # Kelly fraction × bankroll = DOLLAR stake to wager.
+        kelly_stake = kelly * self._effective_kelly_fraction() * bankroll
 
-        # Layer 2: Volatility targeting
+        # Layer 2: Volatility targeting (dollars).
         if contract_vol and contract_vol > 0:
             raw_leverage = self.settings.target_volatility / contract_vol
             leverage = min(raw_leverage, self.settings.max_leverage)
             leverage = max(leverage, self.settings.min_allocation)
-            vol_size = leverage * bankroll * (1 / self.settings.max_open_positions)
+            vol_stake = leverage * bankroll * (1 / self.settings.max_open_positions)
         else:
-            vol_size = kelly_size
+            vol_stake = kelly_stake
 
-        # Layer 3: Book-depth scalar (Gemini #8b — smooth sqrt impact model).
-        # Replaces the prior step-tier scaler ({<100: 0.25, <1000: 0.50, else 1.0})
-        # with a continuous function so similar volumes get similar haircuts and
-        # tightens sizing in the [1000, 2000) band where step jumped to full size.
-        # Formula: scalar = clamp(sqrt(volume / 2000), 0.15, 1.0)
-        # Reference points (matches prior tests): vol=50→0.158, vol=500→0.500,
-        # vol=2000→1.000. Floor 0.15 prevents over-hedge zero on rounding.
+        # Book-depth scalar (Gemini #8b — smooth sqrt impact model).
+        # Multiplicative haircut: scalar = clamp(sqrt(volume / 2000), 0.15, 1.0).
+        # Reference: vol=50→0.158, vol=500→0.500, vol=2000→1.000.
         # CCG-bug-3: sanitize NaN/negative volume — bare max(NaN, 0) returns NaN,
         # which propagates through sqrt and silently disables both haircut and
         # the slippage cap below.
         if volume is not None:
             volume_clean = 0.0 if (not math.isfinite(volume) or volume < 0) else float(volume)
             book_depth_scalar = max(0.15, min(1.0, math.sqrt(volume_clean / 2000.0)))
-            kelly_size *= book_depth_scalar
-            vol_size *= book_depth_scalar
+            kelly_stake *= book_depth_scalar
+            vol_stake *= book_depth_scalar
 
-        position = min(kelly_size, vol_size)
-        position = min(position, bankroll * self.settings.max_single_market_exposure)
-
-        # BugFix P0-2: Cap dollar cost per trade.
-        # position * market_price = dollar cost (market_price is already the "bet side" price
-        # after any buy_no flip, so cost = contracts * no_price or contracts * yes_price).
+        # Layer 3: Dollar-denominated caps.
+        stake_dollars = min(kelly_stake, vol_stake)
+        stake_dollars = min(stake_dollars, bankroll * self.settings.max_single_market_exposure)
+        # BugFix P0-2: per-trade dollar-cost cap.
         max_cost = bankroll * getattr(self.settings, "max_cost_per_trade_fraction", 0.025)
-        cost = position * market_price
-        if cost > max_cost and market_price > 0:
-            position = max_cost / market_price
+        stake_dollars = min(stake_dollars, max_cost)
 
-        # Slippage cap: estimated_slippage must be < edge * 0.5
-        # CCG-bug-3: reuse volume_clean (NaN-safe) instead of raw volume so that
-        # bad upstream values disable trading rather than silently disabling the cap.
+        # Layer 4: Convert dollar stake → contracts.
+        # CCG-bughunt2 F-new-2 / Gemini G1: the Kelly formula returns a dollar
+        # stake (fraction of bankroll to WAGER), not a contract count. Prior
+        # code returned the dollar value directly, and downstream callers
+        # (paper_trader, portfolio_manager — see portfolio_manager.py:307
+        # "position sizing returns contract amount") treated it as contracts.
+        # Cost was then computed as `dollars × price`, which on a $0.25
+        # contract silently deployed only 25% of the intended Kelly stake.
+        # Dividing by market_price here restores the intended contract count
+        # and keeps the downstream `cost = contracts × price` identity true.
+        position = stake_dollars / market_price
+
+        # Layer 5: Slippage cap — estimated_slippage must be ≤ edge × 0.5.
+        # Model: slippage = (contracts × 0.005) / volume_contracts (unitless).
+        # CCG-bug-3: reuse volume_clean (NaN-safe) instead of raw volume so
+        # bad upstream values disable trading rather than the cap.
         if volume is not None:
             edge = win_probability - market_price
             if edge > 0:
@@ -156,7 +166,7 @@ class RiskManager:
                 estimated_slippage = (position * 0.005) / vol_for_slip
                 max_slippage = edge * 0.5
                 if estimated_slippage > max_slippage:
-                    # Cap position so slippage == max_slippage (never grow position)
+                    # Cap contracts so slippage == max_slippage (never grow).
                     position = min(position, (max_slippage * vol_for_slip) / 0.005)
 
         # Minimum trade cost floor (€100 bankroll Option 2):
