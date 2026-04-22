@@ -28,6 +28,16 @@ def _parse_dollar_price(value: object) -> float | None:
     return price
 
 
+def _parse_float(value: object, default: float = 0.0) -> float:
+    """Parse a Kalshi numeric-string field (e.g. volume_24h_fp='807.88') into a float."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 async def fetch_kalshi_weather_markets(
     session: aiohttp.ClientSession | None = None,
     series_tickers: list[str] | None = None,
@@ -58,6 +68,13 @@ async def fetch_kalshi_weather_markets(
                         # in `yes_ask_dollars`/`no_ask_dollars`. None / 0 / out-of-range → None.
                         yes_price = _parse_dollar_price(m.get("yes_ask_dollars"))
                         no_price = _parse_dollar_price(m.get("no_ask_dollars"))
+                        # Kalshi returns volume/open_interest as stringified floats in
+                        # `*_fp` fields (e.g. volume_24h_fp='807.88'). Expose both
+                        # `volume` and `volume_24h` so downstream (main.fetch_market_data)
+                        # matches the pmxt path which reads `volume_24h` first.
+                        volume_24h = _parse_float(m.get("volume_24h_fp"))
+                        volume_total = _parse_float(m.get("volume_fp"))
+                        open_interest = _parse_float(m.get("open_interest_fp"))
                         all_markets.append({
                             "ticker": series,
                             "market_id": m.get("ticker", ""),
@@ -65,8 +82,9 @@ async def fetch_kalshi_weather_markets(
                             "subtitle": m.get("subtitle", ""),
                             "yes_price": yes_price,
                             "no_price": no_price,
-                            "volume": m.get("volume", 0),
-                            "open_interest": m.get("open_interest", 0),
+                            "volume_24h": volume_24h,
+                            "volume": volume_total,
+                            "open_interest": open_interest,
                             "close_time": m.get("close_time", ""),
                             "status": m.get("status", ""),
                         })

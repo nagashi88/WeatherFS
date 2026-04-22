@@ -49,6 +49,9 @@ def _sample_market(
     ticker: str = "KXHIGHNY-26MAR29",
     yes_ask_dollars: str = "0.4500",
     no_ask_dollars: str = "0.5500",
+    volume_24h_fp: str = "807.88",
+    volume_fp: str = "988.94",
+    open_interest_fp: str = "909.94",
 ) -> dict:
     return {
         "ticker": ticker,
@@ -56,8 +59,9 @@ def _sample_market(
         "subtitle": "Daily high temperature",
         "yes_ask_dollars": yes_ask_dollars,
         "no_ask_dollars": no_ask_dollars,
-        "volume": 1000,
-        "open_interest": 500,
+        "volume_24h_fp": volume_24h_fp,
+        "volume_fp": volume_fp,
+        "open_interest_fp": open_interest_fp,
         "close_time": "2026-03-29T23:59:00Z",
         "status": "open",
     }
@@ -129,7 +133,7 @@ async def test_fetch_multiple_series():
 
 @pytest.mark.asyncio
 async def test_market_data_has_expected_fields():
-    """Every returned dict must contain ticker, market_id, title, yes_price."""
+    """Every returned dict must contain ticker, market_id, title, yes_price, volumes."""
     resp_cm = _make_mock_response(200, {"markets": [_sample_market()]})
     session = _make_mock_session([resp_cm])
 
@@ -139,8 +143,15 @@ async def test_market_data_has_expected_fields():
 
     assert len(results) == 1
     r = results[0]
-    for field in ("ticker", "market_id", "title", "yes_price", "no_price", "volume"):
+    for field in (
+        "ticker", "market_id", "title", "yes_price", "no_price",
+        "volume", "volume_24h", "open_interest",
+    ):
         assert field in r, f"Missing field: {field}"
+    # Volumes must be parsed from *_fp string fields
+    assert r["volume_24h"] == pytest.approx(807.88)
+    assert r["volume"] == pytest.approx(988.94)
+    assert r["open_interest"] == pytest.approx(909.94)
 
 
 # ---------------------------------------------------------------------------
