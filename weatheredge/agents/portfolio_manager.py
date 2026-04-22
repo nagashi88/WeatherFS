@@ -427,10 +427,12 @@ class PortfolioManager:
 
             # Reserve this order in projected exposure so subsequent markets in the
             # same cycle cannot exceed position-count or exposure caps.
-            projected_cost = (
-                (1.0 - market_price) * amount if majority_side == "buy_no"
-                else market_price * amount
-            )
+            # CCG-bughunt3 G4-new: the free-cash cap (line 395) uses per_contract_cost
+            # (fee-inclusive) but this reservation used only raw contract cost. On
+            # multi-candidate cycles the second+ order got an inflated budget and
+            # was rejected downstream by paper_trader, whose `cost = stake + entry_fee`
+            # matches per_contract_cost. Use the same fee-inclusive value here.
+            projected_cost = per_contract_cost * amount
             projected_open_positions.append(
                 {
                     "market_id": market_id,

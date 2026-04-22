@@ -88,6 +88,81 @@ def test_conservative_confidence_scales_with_edge():
     assert sig_high.confidence == pytest.approx(1.0, abs=0.05)
 
 
+def test_conservative_vote_and_solo_thresholds_self_consistent():
+    """CCG-bughunt3 G5-new: resolve the documented-vs-actual edge paradox.
+
+    The file-level docstring used to say `min_edge: 20%` without explaining
+    that a solo Conservative vote actually needs ≈40% edge to clear
+    PortfolioManager.CONVICTION_THRESHOLD. That asymmetry is intentional
+    (vote-floor vs solo-trade-floor), but callers were surprised. This
+    test pins the invariant in code so silent drift of the weight or the
+    conviction threshold is caught:
+
+      * at the vote floor, Conservative's weighted score is BELOW
+        CONVICTION_THRESHOLD (a partner is required);
+      * at SOLO_CONFIDENCE_EDGE, confidence saturates at 1.0 and the
+        weighted score REACHES CONVICTION_THRESHOLD (solo trade allowed).
+    """
+    from weatheredge.agents.portfolio_manager import PortfolioManager
+    from weatheredge.agents.strategies.conservative import SOLO_CONFIDENCE_EDGE
+
+    weight = PortfolioManager.AGENT_WEIGHTS["Conservative"]
+    conviction = PortfolioManager.CONVICTION_THRESHOLD
+
+    # Invariant 1: a solo Conservative vote can reach conviction at all.
+    assert weight >= conviction - 1e-9, (
+        f"AGENT_WEIGHTS['Conservative']={weight} < CONVICTION_THRESHOLD={conviction}: "
+        "no edge can produce a solo-trade Conservative vote."
+    )
+
+    vote_floor = 0.20  # mirrors Settings.conservative_min_edge default
+    vote_opp = make_opportunity(net_edge=vote_floor, gaussian_prob=0.70, ensemble_prob=0.72)
+    solo_opp = make_opportunity(
+        net_edge=SOLO_CONFIDENCE_EDGE, gaussian_prob=0.70, ensemble_prob=0.72
+    )
+    vote_sig = conservative_strategy(vote_opp, make_conservative_settings())
+    solo_sig = conservative_strategy(solo_opp, make_conservative_settings())
+
+    vote_weighted = weight * vote_sig.confidence
+    solo_weighted = weight * solo_sig.confidence
+
+    # Invariant 2: at the vote floor, Conservative alone cannot clear conviction.
+    assert vote_weighted < conviction, (
+        f"vote-floor weighted score {vote_weighted:.3f} >= CONVICTION_THRESHOLD "
+        f"{conviction}: Conservative could solo-trade at the vote floor, "
+        "the vote/solo distinction is lost."
+    )
+
+    # Invariant 3: at SOLO_CONFIDENCE_EDGE, Conservative alone DOES clear conviction.
+    assert solo_weighted >= conviction - 1e-9, (
+        f"solo-edge weighted score {solo_weighted:.3f} < CONVICTION_THRESHOLD "
+        f"{conviction}: solo-trade threshold unreachable — lower "
+        "CONVICTION_THRESHOLD or raise AGENT_WEIGHTS['Conservative']."
+    )
+
+    # Invariant 4: SOLO_CONFIDENCE_EDGE is the *exact* saturation point. Just
+    # below it, confidence must be strictly < 1.0 (so the solo-trade
+    # property appears AT that edge, not earlier). This catches silent
+    # widening of the saturation curve that would make the documented
+    # "solo-trade floor: 40%" an understatement of the real requirement.
+    just_below = SOLO_CONFIDENCE_EDGE - 1e-3
+    near_opp = make_opportunity(net_edge=just_below, gaussian_prob=0.70, ensemble_prob=0.72)
+    near_sig = conservative_strategy(near_opp, make_conservative_settings())
+    assert near_sig.confidence < 1.0, (
+        f"confidence saturated before SOLO_CONFIDENCE_EDGE={SOLO_CONFIDENCE_EDGE}: "
+        f"at edge {just_below} confidence is already {near_sig.confidence}. "
+        "Either the saturation formula or the constant drifted."
+    )
+
+    # Invariant 5: SOLO_CONFIDENCE_EDGE matches the value advertised in the
+    # module docstring (`solo-trade floor: 40% edge`). Pinning this keeps
+    # code and prose synchronised — any future rescaling must update both.
+    assert SOLO_CONFIDENCE_EDGE == pytest.approx(0.40), (
+        f"SOLO_CONFIDENCE_EDGE={SOLO_CONFIDENCE_EDGE} drifted from documented 0.40. "
+        "Update the conservative_strategy docstring if this change is intentional."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Aggressive tests
 # ---------------------------------------------------------------------------

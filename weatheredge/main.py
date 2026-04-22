@@ -1336,8 +1336,10 @@ def _run_decision_cycle(state: AppState) -> None:
                 cash_capped=trade_order.cash_capped,
             )
             result = state.paper_trader.place_order(order)
-            if result.get("filled") or result.get("pending"):
-                action = "filled" if result.get("filled") else "pending limit"
+            filled = bool(result.get("filled"))
+            pending = bool(result.get("pending"))
+            if filled or pending:
+                action = "filled" if filled else "pending limit"
                 log.info(
                     "run_decision_loop: %s paper trade — market=%s side=%s size=%.2f price=%.3f",
                     action,
@@ -1346,43 +1348,51 @@ def _run_decision_cycle(state: AppState) -> None:
                     trade_order.amount,
                     trade_order.price,
                 )
-                trades_placed += 1
 
-                # --- (h) Record fill via fill_monitor ---
-                if state.fill_monitor is not None:
-                    try:
-                        fill = FillRecord(
-                            # BugFix L3: Use actual DB id, not Python memory address
-                            trade_id=result.get("trade", {}).get("db_id", 0),
-                            fill_price=trade_order.price,
-                            market_mid_at_fill=trade_order.price,
-                            side=trade_order.side,
-                        )
-                        state.fill_monitor.record_fill(fill)
-                    except Exception as exc:
-                        log.warning(
-                            "fill_monitor.record_fill failed for %s: %s",
-                            trade_order.market_id, exc,
-                        )
-                if result.get("filled"):
+                # CCG-bughunt3 G6-new: only ACTUAL fills count as trades.
+                # Pending limit orders have no trade row (paper_trader returns
+                # {"filled": False, "pending": True} without a "trade" key),
+                # so fill_monitor.record_fill would write a FillQuality row
+                # with trade_id=0, and trades_placed would advance the
+                # learning cadence (dynamic weight updates, calibration
+                # triggers) for unexecuted orders.
+                if filled:
+                    trades_placed += 1
+
+                    # --- (h) Record fill via fill_monitor ---
+                    if state.fill_monitor is not None:
+                        try:
+                            fill = FillRecord(
+                                # BugFix L3: Use actual DB id, not Python memory address
+                                trade_id=result.get("trade", {}).get("db_id", 0),
+                                fill_price=trade_order.price,
+                                market_mid_at_fill=trade_order.price,
+                                side=trade_order.side,
+                            )
+                            state.fill_monitor.record_fill(fill)
+                        except Exception as exc:
+                            log.warning(
+                                "fill_monitor.record_fill failed for %s: %s",
+                                trade_order.market_id, exc,
+                            )
                     _record_phase2_drift_entry(
                         state,
                         result.get("trade"),
                         source="market_fill",
                     )
-                # Back-link the signals from this cycle to the trade row so
-                # losing trades can be audited against the per-agent votes
-                # that produced them. Best-effort, never blocks trading.
-                try:
-                    _db_id = int(result.get("trade", {}).get("db_id", 0) or 0)
-                    _sig_ids = _signal_ids_by_market.get(trade_order.market_id, [])
-                    if _db_id and _sig_ids:
-                        _link_signals_to_trade(_db_id, _sig_ids)
-                except Exception as exc:
-                    log.debug(
-                        "run_decision_loop: signal back-link failed for %s: %s",
-                        trade_order.market_id, exc,
-                    )
+                    # Back-link the signals from this cycle to the trade row so
+                    # losing trades can be audited against the per-agent votes
+                    # that produced them. Best-effort, never blocks trading.
+                    try:
+                        _db_id = int(result.get("trade", {}).get("db_id", 0) or 0)
+                        _sig_ids = _signal_ids_by_market.get(trade_order.market_id, [])
+                        if _db_id and _sig_ids:
+                            _link_signals_to_trade(_db_id, _sig_ids)
+                    except Exception as exc:
+                        log.debug(
+                            "run_decision_loop: signal back-link failed for %s: %s",
+                            trade_order.market_id, exc,
+                        )
             else:
                 log.warning(
                     "run_decision_loop: order rejected for %s: %s",

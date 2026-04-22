@@ -1187,6 +1187,52 @@ class TestDecisionLoopDataFlow:
 
         state.fill_monitor.record_fill.assert_called_once()
 
+    def test_pending_limit_order_does_not_record_fill_or_drift(self):
+        """CCG-bughunt3 G6-new: pending limit orders must not trigger fill-side effects.
+
+        Before the fix, `if result.get("filled") or result.get("pending"):` entered
+        the trade branch for limit orders that had merely been *placed* but not yet
+        filled, incrementing trades_placed and writing a FillQuality row with
+        trade_id=0 (because pending results have no "trade" key). That polluted
+        the learning cadence and calibration stream with phantom fills.
+
+        Regression: a pending-only result must leave fill_monitor.record_fill
+        untouched and not invoke the phase-2 drift recorder.
+        """
+        from weatheredge.agents.base import TradeOrder as _TradeOrder
+
+        state = _make_app_state()
+        state.fill_monitor = MagicMock()
+        fresh_age = 10
+
+        trade_order = _TradeOrder(
+            market_id="KXHIGHNY", side="buy_yes", price=0.35, amount=50.0,
+            agent_name="PM", model_probability=0.99, edge_at_entry=0.63,
+            city="KNYC", platform="kalshi",
+        )
+        state.portfolio_manager.aggregate_signals.return_value = [trade_order]
+        # paper_trader.place_order for a limit order returns pending without a "trade".
+        state.paper_trader.place_order.return_value = {
+            "filled": False,
+            "pending": True,
+            "limit_price": 0.35,
+        }
+
+        with _patch_state(state):
+            with patch.object(main_module, "_get_weather_data_age_minutes", return_value=fresh_age):
+                with patch.object(main_module, "_read_latest_forecasts", return_value={}):
+                    with patch.object(main_module, "_read_latest_market_prices", return_value={}):
+                        with patch.object(main_module, "_record_phase2_drift_entry") as drift_mock:
+                            run_decision_loop()
+
+        state.fill_monitor.record_fill.assert_not_called()
+        # _record_phase2_drift_entry is still allowed for limit fills picked up
+        # at loop start, but must not be called for a newly-placed pending order.
+        for call in drift_mock.call_args_list:
+            assert call.kwargs.get("source") != "market_fill", (
+                "pending order must not trigger market_fill drift entry"
+            )
+
     def test_order_rejection_logged_no_crash(self):
         """When paper_trader rejects an order, loop continues without crashing."""
         from weatheredge.agents.base import TradeOrder as _TradeOrder

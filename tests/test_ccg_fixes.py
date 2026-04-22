@@ -579,8 +579,9 @@ class TestKellyCriterion:
         #   net_stake = 0.52, net_win = 0.50 - 0.02 - 0.03 = 0.45
         #   b = 0.45/0.52 ≈ 0.8654; kelly ≈ 0.3533
         #   stake ≈ 0.3533 * 0.15 * 1000 ≈ $53.00, below 8% cap (80).
-        # CCG-bughunt2 F-new-2: return is CONTRACTS → 53.00 / 0.50 = 106.00.
-        assert size == pytest.approx(106.00, abs=0.04)
+        # CCG-bughunt3 G3-new: contracts = stake / (price + kalshi_fee)
+        # = 53.00 / 0.52 ≈ 101.92 (fee-inclusive divisor preserves the cash cap).
+        assert size == pytest.approx(101.92, abs=0.04)
 
     def test_kelly_no_edge(self):
         settings = _make_settings()
@@ -639,7 +640,8 @@ class TestKellyCriterion:
           Loss = price + entry_fee = 0.52 (losers held to $0 expiry)
           b = 0.45/0.52 ≈ 0.8654, kelly ≈ 0.1378
           stake ≈ $1377.78 — ~31% smaller than gross.
-        CCG-bughunt2 F-new-2: return is CONTRACTS → 1377.78 / 0.50 = 2755.56.
+        CCG-bughunt3 G3-new: contracts = stake / (price + kalshi_fee)
+        = 1377.78 / 0.52 ≈ 2649.57.
         """
         settings = _make_settings(
             kelly_fraction=1.0,
@@ -653,8 +655,12 @@ class TestKellyCriterion:
             market_price=0.50,
             bankroll=10000.0,
         )
-        assert size == pytest.approx(2755.56, abs=0.10)
+        assert size == pytest.approx(2649.57, abs=0.10)
         assert size * 0.50 < 2000.0, "net Kelly stake must sit strictly below gross at p≈0.5"
+        # Invariant: realized cash outlay matches the intended $1377.78 stake.
+        assert size * (0.50 + 0.02) <= 1377.79, (
+            f"Realized cost {size * 0.52:.2f} exceeds Kelly-intended stake $1377.78"
+        )
 
     def test_kelly_net_of_fees_low_price(self):
         """At floor prices (p≈0.1) haircut is small but still reduces Kelly.
@@ -665,7 +671,8 @@ class TestKellyCriterion:
                Loss = 0.10 + 0.01 = 0.11
                b = 0.87/0.11 ≈ 7.909, kelly ≈ 0.0989
                stake ≈ $988.51
-        CCG-bughunt2 F-new-2: return is CONTRACTS → 988.51 / 0.10 = 9885.10.
+        CCG-bughunt3 G3-new: contracts = stake / (price + kalshi_fee)
+        = 988.51 / 0.11 ≈ 8986.42 (fee-inclusive divisor).
         """
         settings = _make_settings(
             kelly_fraction=1.0,
@@ -679,8 +686,12 @@ class TestKellyCriterion:
             market_price=0.10,
             bankroll=10000.0,
         )
-        assert size == pytest.approx(9885.10, abs=0.50)
+        assert size == pytest.approx(8986.42, abs=0.50)
         assert size * 0.10 < 1111.12, "net Kelly stake must sit below gross even at floor prices"
+        # Invariant: realized cash outlay matches the intended $988.51 stake.
+        assert size * (0.10 + 0.01) <= 988.52, (
+            f"Realized cost {size * 0.11:.2f} exceeds Kelly-intended stake $988.51"
+        )
 
     def test_kelly_polymarket_fallback_also_net_of_fees(self):
         """Non-Kalshi fallback splits estimated_round_trip evenly per leg.

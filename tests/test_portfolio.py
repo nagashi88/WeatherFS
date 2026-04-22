@@ -734,3 +734,67 @@ def test_yes_guard_rail_disabled_also_skips_haircut():
 
     assert len(orders) == 1
     assert orders[0].amount == 100.0  # Full size, no haircut
+
+
+def test_cash_cap_reservation_is_fee_inclusive_on_kalshi():
+    """CCG-bughunt3 G4-new regression: cross-cycle cash reservation must include
+    Kalshi per-contract fee, otherwise the second candidate gets an inflated
+    budget and paper_trader rejects it at fill time (cost = stake + entry_fee).
+
+    Scenario: bankroll=$20, two Kalshi bucket markets at price=$0.25
+    (fee=$0.02 ⇒ per_contract_cost=$0.27). RiskManager mocked to return 80
+    contracts each. First order is cash-capped to 74.07 contracts (=$20.00
+    fee-incl). With fix: remaining_cash drops to $0, second cash-capped to 0
+    → skipped, total cost = $20. Without fix: first reserves only $18.52
+    (raw 0.25), remaining=$1.48, second cash-capped to 5.48 contracts →
+    emitted, total fee-incl cost = $21.48, breaching bankroll.
+    """
+    from weatheredge.probability.edge import kalshi_taker_fee
+
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 80.0  # large; cash cap must bind
+    pm = make_pm(rm)
+
+    bankroll = 20.0
+    price = 0.25
+    fee = kalshi_taker_fee(price)
+
+    signals_by_market: dict[str, list[Signal]] = {}
+    opportunities: dict[str, MarketOpportunity] = {}
+    for i, (city, lo, hi) in enumerate([("NYC", 70.0, 75.0), ("Chicago", 80.0, 85.0)]):
+        mid = f"KALSHI-{i}"
+        signals_by_market[mid] = [
+            Signal(market_id=mid, side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+            Signal(market_id=mid, side="buy_yes", confidence=1.0, agent_name="MeanReversion"),
+        ]
+        opportunities[mid] = MarketOpportunity(
+            market_id=mid,
+            platform="kalshi",
+            city=city,
+            station=f"KC{i}",
+            threshold=75.0,
+            direction="above",
+            market_price=price,
+            model_probability=0.40,  # sub-haircut gate so YES guard does not fire; bucket markets are exempt anyway
+            net_edge=0.15,
+            bucket_low=lo,
+            bucket_high=hi,
+        )
+
+    orders = pm.aggregate_signals(
+        signals_by_market=signals_by_market,
+        opportunities=opportunities,
+        bankroll=bankroll,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    total_fee_incl_cost = sum(o.amount * (o.price + fee) for o in orders)
+    assert total_fee_incl_cost <= bankroll + 0.01, (
+        f"Total fee-inclusive cost {total_fee_incl_cost:.2f} exceeds bankroll "
+        f"{bankroll:.2f} — cash reservation is not fee-aware"
+    )
+    # With the fix, first order fully consumes the bankroll; second is skipped.
+    assert len(orders) == 1, f"Expected second order to be skipped (0-capped), got {len(orders)}"

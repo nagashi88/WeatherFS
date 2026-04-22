@@ -51,10 +51,11 @@ class TestL1Unit:
         assert size == 0.0, f"Expected $0 (sub-fee edge), got ${size}"
 
     def test_kelly_large_edge_capped(self):
-        """model_prob=0.70, market=0.25 -> $80 stake cap → 320 contracts.
+        """model_prob=0.70, market=0.25 → $80 stake cap.
 
         Post-fee-fix: b=0.70/0.27≈2.593, kelly≈0.584, raw stake=$87.64 → capped to $80.
-        After CCG-bughunt2 F-new-2 the return value is CONTRACTS: 80/0.25 = 320.
+        CCG-bughunt3 G3-new: contracts = stake / (price + kalshi_fee) = 80 / 0.27 ≈ 296.3.
+        Dividing by price alone would silently breach the $80 cash cap.
         """
         settings = MagicMock(spec=Settings)
         settings.kelly_fraction = 0.15
@@ -68,7 +69,9 @@ class TestL1Unit:
         # Warm-up period uses reduced Kelly (0.10); set resolved trades past threshold
         rm.set_resolved_trade_count(50)
         size = rm.calculate_position_size(0.70, 0.25, 1000.0)
-        assert size == pytest.approx(320.0, abs=0.40), f"Expected 320 contracts ($80 cap), got {size}"
+        assert size == pytest.approx(296.3, abs=0.40), f"Expected ≈296.3 contracts ($80 cap / 0.27), got {size}"
+        # Invariant: realized cash outlay must not exceed the dollar cap.
+        assert size * (0.25 + 0.02) <= 80.01, f"Realized cost {size * 0.27:.2f} exceeds $80 cap"
 
     def test_kelly_no_edge(self):
         """model_prob=0.40, market=0.50 -> $0"""

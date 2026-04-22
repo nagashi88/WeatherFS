@@ -56,11 +56,13 @@ def test_kelly_small_edge_approx_4_84():
 
 
 def test_kelly_large_edge_capped_at_80():
-    """model_prob=0.70, market_price=0.25 → large edge → $80 stake cap = 320 contracts.
+    """model_prob=0.70, market_price=0.25 → large edge → $80 stake cap.
 
-    Post-fee-fix: entry=0.02, exit=0.03, net_win=0.70, b=0.70/0.27≈2.593
-    kelly ≈ 0.584 → raw stake = $87.64 → capped to $80 → 320 contracts at $0.25.
-    (CCG-bughunt2 F-new-2: size is CONTRACTS, stake = size * price.)
+    Post-CCG-bughunt3 G3-new: Kelly converts stake→contracts via
+    (price + entry_fee), so $80 at $0.25 price with $0.02 Kalshi fee
+    yields 80 / 0.27 ≈ 296.3 contracts. Total cash outlay ≈ $80.
+    Previously converted via price alone → 320 contracts, but real
+    cost = 320 × 0.27 = $86.4, silently breaching the $80 cap.
     """
     rm = RiskManager(make_settings())
     rm.set_resolved_trade_count(100)  # bypass warmup Kelly
@@ -69,7 +71,10 @@ def test_kelly_large_edge_capped_at_80():
         market_price=0.25,
         bankroll=1000.0,
     )
-    assert size == pytest.approx(320.0, abs=0.40), f"Expected 320 contracts ($80 cap), got {size}"
+    assert size == pytest.approx(296.3, abs=0.40), f"Expected ≈296.3 contracts ($80 cap / 0.27), got {size}"
+    # Invariant: realized cash outlay must not exceed the dollar cap.
+    realized_cost = size * (0.25 + 0.02)
+    assert realized_cost <= 80.01, f"Realized cost {realized_cost:.2f} exceeds $80 cap"
 
 
 def test_kelly_zero_when_no_edge():
@@ -78,6 +83,52 @@ def test_kelly_zero_when_no_edge():
     assert rm.calculate_position_size(0.50, 0.50, 1000.0) == 0.0
     assert rm.calculate_position_size(0.49, 0.50, 1000.0) == 0.0
     assert rm.calculate_position_size(0.35, 0.70, 1000.0) == 0.0
+
+
+def test_kelly_kalshi_contracts_times_cost_matches_stake():
+    """CCG-bughunt3 G3-new regression: position × (price + fee) ≤ stake_dollars cap.
+
+    The Kelly math prices fees into net_stake = price + entry_fee. Layer 4
+    must use that same cost-per-contract as divisor, otherwise realized
+    cash outlay exceeds the Kelly-intended stake. Scan a grid of prices
+    where the Kalshi taker fee is non-zero and enforce the invariant.
+    """
+    from weatheredge.probability.edge import kalshi_taker_fee
+
+    rm = RiskManager(make_settings(max_cost_per_trade_fraction=0.10))
+    rm.set_resolved_trade_count(100)  # bypass warmup
+
+    # At each price, pick a win_probability giving a healthy edge so Kelly
+    # hits the per-trade dollar cap (= $100 on $1k bankroll).
+    cap_dollars = 100.0
+    for price in (0.15, 0.25, 0.35, 0.50, 0.65, 0.80):
+        fee = kalshi_taker_fee(price)
+        size = rm.calculate_position_size(
+            win_probability=price + 0.25,  # large edge → Kelly saturates cap
+            market_price=price,
+            bankroll=1000.0,
+        )
+        if size == 0.0:
+            continue  # price * fee leaves no net edge; not the case we're testing
+        realized_cost = size * (price + fee)
+        assert realized_cost <= cap_dollars + 0.01, (
+            f"price={price}: contracts={size} × (price+fee={price + fee:.3f}) = "
+            f"{realized_cost:.3f} exceeds cap ${cap_dollars}"
+        )
+
+
+def test_kelly_polymarket_unchanged_by_fee_fix():
+    """Polymarket has no per-contract fee, so the divisor is still price."""
+    rm = RiskManager(make_settings())
+    rm.set_resolved_trade_count(100)
+    size = rm.calculate_position_size(
+        win_probability=0.70,
+        market_price=0.25,
+        bankroll=1000.0,
+        platform="polymarket",
+    )
+    # Cap is max_single_market_exposure = 0.08 × $1000 = $80 → 320 contracts at $0.25.
+    assert size == pytest.approx(320.0, abs=0.40), f"Polymarket: expected 320 contracts, got {size}"
 
 
 # ---------------------------------------------------------------------------

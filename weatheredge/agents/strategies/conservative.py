@@ -1,13 +1,38 @@
 from weatheredge.agents.base import Signal, MarketOpportunity
+from weatheredge.agents.portfolio_manager import PortfolioManager
 from weatheredge.config import Settings
+
+# CCG-bughunt3 G5-new: Conservative has two distinct edge thresholds and the
+# docstring used to mention only one, which was counterintuitive for callers
+# reading `min_edge: 20%` and expecting that to trigger trades on its own.
+#
+#   * vote floor = settings.conservative_min_edge (default 0.20)
+#       Below this, the agent abstains (no_trade). Above, it contributes a
+#       weighted vote but confidence is partial — the vote needs a partner
+#       agent on the same side for the market to trade.
+#   * solo-trade floor = SOLO_CONFIDENCE_EDGE (0.40)
+#       Edge at which confidence saturates to 1.0. A saturated Conservative
+#       vote alone clears PortfolioManager.CONVICTION_THRESHOLD because
+#       AGENT_WEIGHTS["Conservative"] * 1.0 ≥ CONVICTION_THRESHOLD.
+#
+# The invariant `AGENT_WEIGHTS["Conservative"] >= CONVICTION_THRESHOLD` is
+# what makes a solo Conservative vote possible at all; if CONVICTION_THRESHOLD
+# is raised above the Conservative weight, SOLO_CONFIDENCE_EDGE becomes
+# unreachable. Guarded by a unit test so silent drift is caught.
+SOLO_CONFIDENCE_EDGE: float = 0.40
+
 
 def conservative_strategy(opportunity: MarketOpportunity, settings: Settings) -> Signal:
     """
     Conservative "Ben Graham" strategy. Only trade when edge is overwhelming.
-    - min_edge: 20% net edge
-    - model_agreement: Gaussian and ensemble must agree within 10%
-    - lead_time: 1-day forecasts only
-    - Single bucket (not laddering)
+    - vote floor: `conservative_min_edge` (default 20%) — emits a partial-
+      confidence vote; requires a second agent on the same side to trade.
+    - solo-trade floor: 40% edge — confidence saturates at 1.0, letting a
+      single Conservative vote bypass PortfolioManager.MIN_DISTINCT_AGENTS
+      via the CONVICTION_THRESHOLD override.
+    - model_agreement: Gaussian and ensemble must agree within 10%.
+    - lead_time: same-day (with edge bonus) and 1-day forecasts only.
+    - Single bucket (not laddering).
     """
     market_id = opportunity.market_id
 
@@ -39,7 +64,10 @@ def conservative_strategy(opportunity: MarketOpportunity, settings: Settings) ->
         if agreement < 0.90:
             return Signal(market_id=market_id, side="no_trade", confidence=0.0, agent_name="Conservative", reasoning=f"Model agreement {agreement:.2f} < 0.90")
 
-    # Confidence scales with edge (0.20 edge -> 0.5 confidence, 0.40 edge -> 1.0)
-    confidence = min(effective_edge / 0.40, 1.0)
+    # Confidence ramps linearly from the vote floor up to SOLO_CONFIDENCE_EDGE:
+    # at the vote floor (0.20) confidence is ≈0.5 → weighted score 0.15
+    # (below CONVICTION_THRESHOLD, partner required); at SOLO_CONFIDENCE_EDGE
+    # (0.40) confidence saturates at 1.0 → weighted score 0.30 (solo OK).
+    confidence = min(effective_edge / SOLO_CONFIDENCE_EDGE, 1.0)
 
     return Signal(market_id=market_id, side=side, confidence=confidence, agent_name="Conservative", reasoning=f"Strong edge {effective_edge:.2f}, agreement OK")

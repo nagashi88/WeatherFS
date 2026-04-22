@@ -181,11 +181,12 @@ class TestKellySizingBuyNo:
         # kelly = (b*p - q) / b = (1.222*0.90 - 0.10) / 1.222 = 0.818
         # warmup_kelly (0.10): kelly_size = 0.818 * 0.10 * 1000 = 81.8
         # capped by max_single_market_exposure=0.08 → 80 contracts
-        # cost = 80 * 0.45 = 36 > max_cost (1000 * 0.015 = 15) → position = 15/0.45 = 33.33
+        # cost cap at max_cost = $15. CCG-bughunt3 G3-new: contracts =
+        # $15 / (price + kalshi_fee) = 15 / (0.45 + 0.02) = 15 / 0.47 ≈ 31.91.
         size = self.rm.calculate_position_size(
             win_probability=0.10, market_price=0.55, bankroll=1000.0, side="buy_no",
         )
-        assert size == pytest.approx(33.33, abs=0.1), f"Expected ~33.33, got {size}"
+        assert size == pytest.approx(31.91, abs=0.1), f"Expected ~31.91, got {size}"
 
     def test_buy_no_zero_when_no_real_edge(self):
         """buy_no returns 0 when model says event IS likely (no NO-side edge)."""

@@ -144,16 +144,16 @@ class RiskManager:
         stake_dollars = min(stake_dollars, max_cost)
 
         # Layer 4: Convert dollar stake → contracts.
-        # CCG-bughunt2 F-new-2 / Gemini G1: the Kelly formula returns a dollar
-        # stake (fraction of bankroll to WAGER), not a contract count. Prior
-        # code returned the dollar value directly, and downstream callers
-        # (paper_trader, portfolio_manager — see portfolio_manager.py:307
-        # "position sizing returns contract amount") treated it as contracts.
-        # Cost was then computed as `dollars × price`, which on a $0.25
-        # contract silently deployed only 25% of the intended Kelly stake.
-        # Dividing by market_price here restores the intended contract count
-        # and keeps the downstream `cost = contracts × price` identity true.
-        position = stake_dollars / market_price
+        # CCG-bughunt3 G3-new: paper_trader charges Kalshi per-contract fee on
+        # top of price (cost = amount × (price + fee)), so dividing the
+        # stake by price alone systematically over-sizes by ≈fee/price.
+        # Use the same per-contract cost the Kelly math already priced
+        # (net_stake above) so realized cash outlay matches stake_dollars.
+        if platform == "kalshi":
+            cost_per_contract = market_price + entry_fee
+        else:
+            cost_per_contract = market_price
+        position = stake_dollars / cost_per_contract
 
         # Layer 5: Slippage cap — estimated_slippage must be ≤ NET edge × 0.5.
         # Model: slippage = (contracts × 0.005) / volume_contracts (unitless).
@@ -183,13 +183,13 @@ class RiskManager:
         # where Kelly wanted <20% of the floor — meaning Kelly itself didn't think the
         # trade was worth meaningful capital.
         min_cost = getattr(self.settings, "min_trade_cost", 0.0)
-        if position > 0 and min_cost > 0 and market_price > 0:
-            current_cost = position * market_price
+        if position > 0 and min_cost > 0 and cost_per_contract > 0:
+            current_cost = position * cost_per_contract
             if current_cost < min_cost:
                 if current_cost < min_cost * 0.2:
                     return 0.0
                 if min_cost <= max_cost:
-                    position = min_cost / market_price
+                    position = min_cost / cost_per_contract
 
         return round(position, 2)
 
