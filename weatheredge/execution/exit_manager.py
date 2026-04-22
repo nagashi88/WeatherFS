@@ -195,32 +195,44 @@ class ExitManager:
     def _evaluate_exit_ev(self, pos: dict, current_price: float, model_prob: float) -> bool:
         """Phase 1 EV-based exit: exit only if closing has higher EV than holding.
 
-        On prediction markets, P&L drawdown without model change means better odds.
-        Only exit when the expected value of holding is negative vs closing now.
+        Per-contract exit cost is price-dependent on Kalshi (taker fee follows
+        ceil(0.07·p·(1-p)·100)/100, symmetric in p, plus one half-spread). A
+        flat 0.02 was accurate only at floor-bound prices (p≲0.10); at contested
+        prices (p≈0.5) it underestimated by ~33%, making EV-exit fire too
+        eagerly on Phase-1 trades entering at contested markets.
         """
-        entry_price = pos.get("price", 0.0)
+        from weatheredge.probability.edge import kalshi_taker_fee, PLATFORM_FEES
+
         side = pos.get("side", "buy_yes")
         cost = pos.get("cost", 0.0)
         amount = pos.get("amount", 0.0)
+        platform = pos.get("platform", "kalshi")
 
-        # Estimate spread cost to close (~2% round-trip)
-        exit_cost = 0.02 * amount
+        # One-leg cost to close now. Kalshi: taker fee at current price
+        # (symmetric in YES/NO because fee(p) == fee(1-p)) + half-spread.
+        # Non-Kalshi platforms retain the pre-existing flat 0.02 per contract
+        # — this bug is Kalshi-specific and non-Kalshi paths are out of scope.
+        if platform == "kalshi":
+            per_contract_exit_cost = kalshi_taker_fee(current_price) + (
+                PLATFORM_FEES["kalshi"]["avg_spread"] / 2.0
+            )
+        else:
+            per_contract_exit_cost = 0.02
+        exit_cost = per_contract_exit_cost * amount
 
-        # EV of holding to resolution
         if side == "buy_yes":
             ev_hold = model_prob * (amount - cost) - (1 - model_prob) * cost
         else:
             ev_hold = (1 - model_prob) * (amount - cost) - model_prob * cost
 
-        # EV of closing now (mark-to-market minus exit cost)
         if side == "buy_yes":
             current_value = current_price * amount
         else:
             current_value = (1.0 - current_price) * amount
         ev_close = current_value - cost - exit_cost
 
-        # Require meaningful EV advantage to close — avoid churn on tiny differences.
-        # Buffer = 5% of cost: e.g. on a $10 position, need $0.50 EV advantage to exit.
+        # Require meaningful EV advantage to close — avoid churn on tiny
+        # differences. Buffer = 5% of cost.
         ev_buffer = 0.05 * cost
         return ev_close > ev_hold + ev_buffer
 

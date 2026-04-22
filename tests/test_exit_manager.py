@@ -720,7 +720,8 @@ def test_exit_ev_based_triggers_when_ev_close_exceeds_ev_hold(mgr):
     Phase 1 context: exit_edge_flip=False, exit_ev_based=True.
     buy_yes, amount=100, cost=60, model_prob=0.65, current_price=0.80:
       ev_hold = 0.65*(100-60) - 0.35*60 = 26 - 21 = +5
-      ev_close = 0.80*100 - 60 - 0.02*100 = 80 - 62 = +18  →  18 > 5 → exit
+      kalshi fee(0.80)=0.02, half-spread=0.01 → exit=0.03/contract
+      ev_close = 0.80*100 - 60 - 0.03*100 = 80 - 63 = +17  →  17 > 5+3 → exit
     """
     import weatheredge.config as cfg
     orig_flip = cfg.MODULES.get("exit_edge_flip", True)
@@ -860,7 +861,8 @@ def test_ev_based_priority_over_edge_flip_when_both_would_fire(mgr):
     # buy_yes, cost=60, model=0.10, price=0.50:
     #   current_edge = 0.10 - 0.50 = -0.40 → edge_flip would fire
     #   ev_hold = 0.10*(100-60) - 0.90*60 = 4 - 54 = -50
-    #   ev_close = 0.50*100 - 60 - 2 = -12 → ev_close(-12) > ev_hold(-50)+0.05*60(3) → fire
+    #   kalshi fee(0.50)=0.02, exit=0.03 → ev_close = 50-60-3 = -13
+    #   -13 > -50 + 3 → fire
     import weatheredge.config as cfg
     orig_flip = cfg.MODULES.get("exit_edge_flip", True)
     orig_ev = cfg.MODULES.get("exit_ev_based", False)
@@ -911,7 +913,8 @@ def test_exit_ev_based_holds_when_ev_hold_exceeds_ev_close(mgr):
     Phase 1 context: exit_edge_flip=False, exit_ev_based=True.
     buy_yes, amount=100, cost=60, model_prob=0.65, current_price=0.60:
       ev_hold = +5
-      ev_close = 0.60*100 - 60 - 2 = -2  →  -2 < 5 → hold
+      kalshi fee(0.60)=0.02, exit=0.03 → ev_close = 60 - 60 - 3 = -3
+      -3 > 5 + 3 → False → hold
     """
     import weatheredge.config as cfg
     orig_flip = cfg.MODULES.get("exit_edge_flip", True)
@@ -924,6 +927,74 @@ def test_exit_ev_based_holds_when_ev_hold_exceeds_ev_close(mgr):
         with patch.object(ExitManager, "_lead_time_hours", return_value=10.0):
             reason = mgr._check_position(pos, {"MKT-1": opp}, {})
         assert reason is None
+    finally:
+        cfg.MODULES["exit_edge_flip"] = orig_flip
+        cfg.MODULES["exit_ev_based"] = orig_ev
+
+
+def test_exit_ev_price_dependent_exit_cost_holds_when_flat_would_fire(mgr):
+    """Regression for the hard-coded 0.02 flat exit-cost bug.
+
+    At contested mid-prices, the Kalshi taker fee is ~0.02/contract, so the
+    per-leg exit cost is 0.02 + 0.01 half-spread = 0.03/contract — NOT the
+    old flat 0.02. This test pins a boundary case whose decision flips:
+
+    Phase 1 context: exit_edge_flip=False, exit_ev_based=True.
+    buy_yes, amount=100, cost=50 (entry p=0.50), model=0.55, current=0.60:
+      ev_hold   = 0.55*50 - 0.45*50 = +5
+      ev_buffer = 0.05*50 = 2.5
+      Under OLD flat 0.02:  ev_close = 60 - 50 - 2 = +8
+                            8 > 5 + 2.5 = 7.5 → FIRES (bug: over-eager)
+      Under NEW kalshi:     fee(0.60)=0.02, per-leg=0.03
+                            ev_close = 60 - 50 - 3 = +7
+                            7 > 7.5 → FALSE → holds (correct)
+    """
+    import weatheredge.config as cfg
+    orig_flip = cfg.MODULES.get("exit_edge_flip", True)
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_edge_flip"] = False
+    cfg.MODULES["exit_ev_based"] = True
+    try:
+        pos = make_pos(side="buy_yes", price=0.50, amount=100, cost=50)
+        opp = make_opp(model_probability=0.55, market_price=0.60)
+        with patch.object(ExitManager, "_lead_time_hours", return_value=10.0):
+            reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+        assert reason is None, (
+            f"EV-exit must HOLD at mid-prices where the only margin comes from "
+            f"under-estimating Kalshi taker fees. Got reason={reason}"
+        )
+    finally:
+        cfg.MODULES["exit_edge_flip"] = orig_flip
+        cfg.MODULES["exit_ev_based"] = orig_ev
+
+
+def test_exit_ev_price_dependent_exit_cost_symmetric_for_buy_no(mgr):
+    """Kalshi fee(p) == fee(1-p) — exit cost for buy_no at YES=0.40 equals
+    exit cost for buy_yes at YES=0.60. This pins the symmetry so a future
+    regression (e.g. using (1-price) by mistake) can't sneak in.
+
+    buy_no, amount=100, cost=50 (entry NO=0.50), model_prob=0.45 → NO-side
+    model_conf = 0.55. Current YES=0.40, NO=0.60:
+      ev_hold   = 0.55*(100-50) - 0.45*50 = 27.5 - 22.5 = +5
+      kalshi fee(0.40) = ceil(0.07*0.40*0.60*100)/100 = 0.02, per-leg=0.03
+      current NO value = (1-0.40)*100 = 60
+      ev_close  = 60 - 50 - 3 = +7
+      ev_buffer = 0.05*50 = 2.5 → threshold = 7.5
+      7 > 7.5 → FALSE → holds
+    """
+    import weatheredge.config as cfg
+    orig_flip = cfg.MODULES.get("exit_edge_flip", True)
+    orig_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_edge_flip"] = False
+    cfg.MODULES["exit_ev_based"] = True
+    try:
+        pos = make_pos(side="buy_no", price=0.50, amount=100, cost=50)
+        opp = make_opp(model_probability=0.45, market_price=0.40)
+        with patch.object(ExitManager, "_lead_time_hours", return_value=10.0):
+            reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+        assert reason is None, (
+            f"buy_no mirror of buy_yes case must also HOLD. Got reason={reason}"
+        )
     finally:
         cfg.MODULES["exit_edge_flip"] = orig_flip
         cfg.MODULES["exit_ev_based"] = orig_ev
