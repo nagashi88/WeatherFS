@@ -209,3 +209,195 @@ def test_startup_bootstrap_continues_when_one_step_fails():
         main_module._startup_bootstrap_cycle(run_decision_loop_once=True)
 
     assert calls == ["market", "forecast", "decision"]
+
+
+# ---------------------------------------------------------------------------
+# Finding 5: atomic phase-file write + malformed-file warning
+# ---------------------------------------------------------------------------
+
+def test_activate_phase_persists_full_payload_and_no_tmp_leak(tmp_path, monkeypatch):
+    """activate_phase must persist phase + activated_at + modules atomically.
+
+    A direct `write_text` is not atomic: a crash mid-write would leave the
+    file empty and silently downgrade the bot to phase_0 on next start.
+    The tmp-file + rename path must write the full payload and leave no
+    `.tmp` sibling behind on success.
+    """
+    import json as _json
+    from weatheredge import phase_config
+
+    phase_file = tmp_path / "current_phase.json"
+    monkeypatch.setattr(phase_config, "PHASE_FILE", phase_file)
+
+    original_modules = dict(cfg.MODULES)
+    try:
+        phase_config.activate_phase("phase_1", persist=True)
+        assert phase_file.exists()
+        data = _json.loads(phase_file.read_text())
+        assert data["phase"] == "phase_1"
+        assert "activated_at" in data and data["activated_at"]
+        assert isinstance(data.get("modules"), dict) and data["modules"]
+        # No tmp leak after successful rename.
+        assert not (tmp_path / "current_phase.json.tmp").exists()
+    finally:
+        cfg.MODULES.clear()
+        cfg.MODULES.update(original_modules)
+
+
+def test_malformed_phase_file_logs_warning_and_falls_back_to_phase_0(
+    tmp_path, monkeypatch, caplog
+):
+    """A corrupted current_phase.json must log a WARNING, not silently
+    downgrade to phase_0. Silent downgrade was the Phase-1-never-activated
+    failure mode — future parse failures must be loud."""
+    import logging
+    from weatheredge import phase_config
+
+    phase_file = tmp_path / "current_phase.json"
+    phase_file.write_text("{not valid json")
+    monkeypatch.setattr(phase_config, "PHASE_FILE", phase_file)
+
+    caplog.set_level(logging.WARNING, logger="weatheredge.phase_config")
+    current = phase_config.get_current_phase()
+    assert current == "phase_0"
+    assert any(
+        "current_phase.json is malformed" in rec.message for rec in caplog.records
+    ), f"Expected malformed-file warning, got: {[r.message for r in caplog.records]}"
+
+
+def test_get_phase_activated_at_returns_none_on_malformed_file(
+    tmp_path, monkeypatch
+):
+    """Finding-3's phase-scoped dashboard filter depends on activated_at;
+    a corrupted file must return None (skip filter) rather than raise."""
+    from weatheredge import phase_config
+
+    phase_file = tmp_path / "current_phase.json"
+    phase_file.write_text("{broken")
+    monkeypatch.setattr(phase_config, "PHASE_FILE", phase_file)
+
+    assert phase_config.get_phase_activated_at() is None
+
+
+def test_atomic_write_uses_rename_not_truncate(tmp_path, monkeypatch):
+    """Directly verify the tmp + rename path: once _atomic_write_json
+    returns, the tmp sibling is gone and the target has the new payload.
+
+    Regression guard: if someone reintroduces `write_text(...)` directly,
+    this test passes, but the test_activate_phase_persists_full_payload
+    one still exercises the public API. This one documents the mechanism.
+    """
+    import json as _json
+    from weatheredge import phase_config
+
+    target = tmp_path / "nested" / "phase.json"
+    target.parent.mkdir(parents=True)
+    payload = {"phase": "phase_2", "activated_at": "2026-04-22T10:00:00+00:00"}
+    phase_config._atomic_write_json(target, payload)
+
+    assert target.exists()
+    # No stray `.tmp` sibling under the target directory.
+    leftovers = [p.name for p in target.parent.iterdir() if p.name.startswith(target.name)
+                 and p.suffix == ".tmp"]
+    assert leftovers == [], f"Unexpected tmp leak: {leftovers}"
+    assert _json.loads(target.read_text()) == payload
+
+
+def test_atomic_write_is_safe_under_concurrent_writers(tmp_path):
+    """Two threads calling `_atomic_write_json` on the same target must
+    both succeed. The previous implementation shared a single
+    `target.with_suffix('.tmp')` path, so the second writer raced into
+    the same filename and one `os.replace` would race with the other's
+    `open-truncate`, yielding FileNotFoundError. Using a unique tmp per
+    writer (tempfile.mkstemp) makes the write clean last-writer-wins.
+    """
+    import json as _json
+    import threading
+    from weatheredge import phase_config
+
+    target = tmp_path / "phase.json"
+    errors: list[Exception] = []
+    barrier = threading.Barrier(8)
+
+    def _worker(i: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            for k in range(10):
+                phase_config._atomic_write_json(
+                    target, {"phase": f"phase_{i}", "n": k}
+                )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert errors == [], f"Concurrent writers raised: {errors}"
+    # Final file must be valid JSON with the expected shape.
+    data = _json.loads(target.read_text())
+    assert "phase" in data and data["phase"].startswith("phase_")
+    # No leftover .tmp siblings.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == [], f"Unexpected tmp leak: {leftovers}"
+
+
+def test_atomic_write_cleans_up_tmp_on_rename_failure(tmp_path, monkeypatch):
+    """If os.replace fails (permissions, EXDEV), we must not leak a tmp
+    file into the target directory, and the exception propagates."""
+    from weatheredge import phase_config
+
+    target = tmp_path / "phase.json"
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(phase_config.os, "replace", _boom)
+
+    import pytest as _pytest
+    with _pytest.raises(OSError, match="simulated rename failure"):
+        phase_config._atomic_write_json(target, {"phase": "phase_1"})
+
+    leftovers = [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == [], f"Tmp leaked after rename failure: {leftovers}"
+
+
+def test_launch_status_mode_does_not_touch_phase_file(tmp_path, monkeypatch, capsys):
+    """Regression for Finding 5 Bug B: `launch.py --phase X --status` must
+    NOT persist anything to current_phase.json — it is an inspection mode.
+    Previously the truncated write at the top of main() clobbered the
+    file before the status check returned."""
+    import runpy
+    import sys
+    from weatheredge import phase_config
+
+    phase_file = tmp_path / "current_phase.json"
+    # Seed with a known-good payload; status mode must leave it untouched.
+    import json as _json
+    seed = {
+        "phase": "phase_1",
+        "activated_at": "2026-04-21T23:13:56+00:00",
+        "modules": {"bias_correction": True},
+    }
+    phase_file.write_text(_json.dumps(seed, indent=2))
+    monkeypatch.setattr(phase_config, "PHASE_FILE", phase_file)
+
+    argv_backup = list(sys.argv)
+    sys.argv = ["launch.py", "--phase", "phase_2", "--status"]
+    try:
+        runpy.run_path(
+            str(phase_config.PROJECT_ROOT / "launch.py"),
+            run_name="__main__",
+        )
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = argv_backup
+
+    # File must still contain the seed payload unchanged.
+    after = _json.loads(phase_file.read_text())
+    assert after == seed, (
+        f"--status clobbered current_phase.json. Expected {seed!r}, got {after!r}"
+    )

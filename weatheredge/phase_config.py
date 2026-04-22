@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +19,45 @@ log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PHASE_FILE = PROJECT_ROOT / "current_phase.json"
+
+
+def _atomic_write_json(target: Path, payload: dict) -> None:
+    """Write JSON to `target` via a unique tmp file + os.replace.
+
+    A crash between open-truncate and write-complete on a direct write
+    would leave current_phase.json empty, silently downgrading the bot
+    to phase_0 on next startup. Writing to a unique sibling tmp and
+    renaming is atomic within the same filesystem (POSIX rename
+    contract). Using a unique tmp name prevents two concurrent writers
+    (e.g. dashboard + CLI racing) from stomping on each other's temp
+    file and producing a FileNotFoundError for the losing writer.
+    """
+    text = json.dumps(payload, indent=2)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=target.name + ".",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                # fsync can fail on some filesystems (e.g. tmpfs on CI);
+                # the rename below still guarantees atomicity, durability
+                # is best-effort.
+                pass
+        os.replace(tmp_path, target)
+    except Exception:
+        # On any failure after mkstemp, remove the orphan so we don't
+        # leak tmp files into the project directory.
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 # ---------------------------------------------------------------------------
 # Phase definitions
@@ -167,27 +208,40 @@ PHASE_ORDER = ["phase_0", "phase_1", "phase_2", "phase_3", "phase_4"]
 # Phase activation
 # ---------------------------------------------------------------------------
 
+def _read_phase_file() -> dict | None:
+    """Return parsed phase-file contents, or None if missing/malformed.
+
+    Logs a warning on malformed JSON so a corrupted file does not silently
+    downgrade the bot to phase_0 on next startup.
+    """
+    if not PHASE_FILE.exists():
+        return None
+    try:
+        return json.loads(PHASE_FILE.read_text())
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "current_phase.json is malformed (%s) — falling back to phase_0. "
+            "Check the file or re-run `launch.py --phase <phase>`.",
+            exc,
+        )
+        return None
+
+
 def get_current_phase() -> str:
     """Read current phase from persistent file. Defaults to phase_0."""
-    if PHASE_FILE.exists():
-        try:
-            data = json.loads(PHASE_FILE.read_text())
-            return data.get("phase", "phase_0")
-        except (json.JSONDecodeError, KeyError):
-            pass
-    return "phase_0"
+    data = _read_phase_file()
+    if data is None:
+        return "phase_0"
+    return data.get("phase", "phase_0")
 
 
 def get_phase_activated_at() -> str | None:
     """Read ISO 8601 timestamp of the most recent phase activation, or None."""
-    if PHASE_FILE.exists():
-        try:
-            data = json.loads(PHASE_FILE.read_text())
-            ts = data.get("activated_at")
-            return str(ts) if ts else None
-        except (json.JSONDecodeError, KeyError):
-            pass
-    return None
+    data = _read_phase_file()
+    if data is None:
+        return None
+    ts = data.get("activated_at")
+    return str(ts) if ts else None
 
 
 def _merged_modules_for_phase(phase_name: str) -> dict[str, bool]:
@@ -227,12 +281,11 @@ def activate_phase(phase_name: str, persist: bool = True) -> dict[str, bool]:
         cfg.MODULES[key] = value
 
     if persist:
-        # Persist
-        PHASE_FILE.write_text(json.dumps({
+        _atomic_write_json(PHASE_FILE, {
             "phase": phase_name,
             "activated_at": datetime.now(timezone.utc).isoformat(),
             "modules": dict(cfg.MODULES),
-        }, indent=2))
+        })
 
     log.info(
         "Phase activated: %s (%s) [persist=%s]",

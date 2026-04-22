@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import subprocess
 import sys
@@ -46,12 +45,12 @@ def main():
         PHASE_CONFIGS, get_phase_modules,
     )
 
-    # Determine phase
+    # Determine phase. Persistence happens later via activate_phase(), which
+    # writes the full payload (phase + activated_at + modules) atomically.
+    # --status and --gate are inspection modes and should never touch the
+    # on-disk phase file.
     if args.phase:
         phase = args.phase
-        Path(PROJECT_ROOT / "current_phase.json").write_text(
-            json.dumps({"phase": phase})
-        )
     else:
         phase = get_current_phase()
 
