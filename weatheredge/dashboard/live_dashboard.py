@@ -49,6 +49,15 @@ def _open_db(db_path: Path) -> sqlite3.Connection | None:
         return None
 
 
+def _phase_activated_at() -> str | None:
+    """Deferred import so dashboard still loads if phase_config is unavailable."""
+    try:
+        from weatheredge.phase_config import get_phase_activated_at
+    except Exception:
+        return None
+    return get_phase_activated_at()
+
+
 def _safe_fetchall(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
     try:
         return conn.execute(sql, params).fetchall()
@@ -147,21 +156,48 @@ def query_recent_trades(conn: sqlite3.Connection, limit: int = 20) -> list[sqlit
     )
 
 
-def query_performance(conn: sqlite3.Connection) -> dict:
+def query_performance(
+    conn: sqlite3.Connection, activated_at: str | None = None
+) -> dict:
     # All non-open statuses count as resolved (includes edge_stop, won, lost, etc.)
     CLOSED_STATUSES = "('won','lost','edge_stop','capital_protect','time_decay','ev_based','bucket_invalidated')"
-    won_final = int(_scalar(conn, "SELECT COUNT(*) FROM trades WHERE status='won'"))
-    lost_final = int(_scalar(conn, "SELECT COUNT(*) FROM trades WHERE status='lost'"))
+
+    # Win-rate + per-phase counts filter by activation timestamp to avoid blending
+    # Phase 0 lottery-ticket history with the current calibrated regime.
+    # julianday() preserves sub-second precision across both 'T'-separated
+    # (phase_config) and space-separated (SQLAlchemy default) ISO timestamps,
+    # including timezone offsets. datetime() would truncate fractional seconds
+    # and leak pre-activation trades within the activation second.
+    # total_pnl stays all-time so the header bankroll (initial + realized + unrealized)
+    # remains the real cash position.
+    phase_clause = "AND julianday(created_at) >= julianday(?)" if activated_at else ""
+    phase_params: tuple = (activated_at,) if activated_at else ()
+
+    won_final = int(_scalar(
+        conn,
+        f"SELECT COUNT(*) FROM trades WHERE status='won' {phase_clause}",
+        phase_params,
+    ))
+    lost_final = int(_scalar(
+        conn,
+        f"SELECT COUNT(*) FROM trades WHERE status='lost' {phase_clause}",
+        phase_params,
+    ))
     total_pnl = _scalar(conn, f"SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status IN {CLOSED_STATUSES}")
     open_cost = _scalar(conn, "SELECT COALESCE(SUM(cost), 0) FROM trades WHERE status='open'")
 
-    # Resolved = all closed trades (edge_stop counts as resolved)
-    resolved = int(_scalar(conn, f"SELECT COUNT(*) FROM trades WHERE status IN {CLOSED_STATUSES}"))
-    # Win = any closed trade with pnl > 0
-    wins_all = int(_scalar(conn, f"SELECT COUNT(*) FROM trades WHERE status IN {CLOSED_STATUSES} AND pnl > 0"))
+    resolved = int(_scalar(
+        conn,
+        f"SELECT COUNT(*) FROM trades WHERE status IN {CLOSED_STATUSES} {phase_clause}",
+        phase_params,
+    ))
+    wins_all = int(_scalar(
+        conn,
+        f"SELECT COUNT(*) FROM trades WHERE status IN {CLOSED_STATUSES} AND pnl > 0 {phase_clause}",
+        phase_params,
+    ))
     win_rate = (wins_all / resolved * 100.0) if resolved > 0 else None
 
-    # best agent by win rate (min 3 trades, pnl > 0 = win)
     agent_rows = _safe_fetchall(
         conn,
         f"""
@@ -171,11 +207,13 @@ def query_performance(conn: sqlite3.Connection) -> dict:
         FROM trades
         WHERE status IN {CLOSED_STATUSES}
           AND agent_name IS NOT NULL
+          {phase_clause}
         GROUP BY agent_name
         HAVING total >= 3
         ORDER BY CAST(wins AS FLOAT) / total DESC
         LIMIT 1
         """,
+        phase_params,
     )
     best_agent: str | None = None
     best_agent_wr: float | None = None
@@ -195,6 +233,7 @@ def query_performance(conn: sqlite3.Connection) -> dict:
         "open_cost": open_cost,
         "best_agent": best_agent,
         "best_agent_wr": best_agent_wr,
+        "phase_since": activated_at,
     }
 
 
@@ -1154,7 +1193,13 @@ def build_model_performance_panel(
 
     lines.append("Win Rate: ", style="dim")
     lines.append(f"{wr_str}", style="bold green" if (win_rate or 0) >= 55 else "bold yellow")
-    lines.append(f"  ({wins_all}/{resolved} closed)\n", style="dim")
+    phase_since = perf.get("phase_since")
+    if phase_since:
+        # Show only the date portion; avoids cluttering the metric with microseconds.
+        since_date = str(phase_since)[:10]
+        lines.append(f"  ({wins_all}/{resolved} since {since_date})\n", style="dim")
+    else:
+        lines.append(f"  ({wins_all}/{resolved} closed)\n", style="dim")
 
     # Decisive win rate with binomial 95% CI — makes sample-size fragility visible.
     if decisive is not None:
@@ -1527,7 +1572,7 @@ class LiveDashboard:
                 # carries the columns the distance/RMSE column needs.
                 open_rows = query_open_positions_enriched(conn)
                 recent_rows = query_recent_trades(conn)
-                perf = query_performance(conn)
+                perf = query_performance(conn, activated_at=_phase_activated_at())
                 brier = query_brier_score(conn)
                 tf_corrections = query_timesfm_corrections(conn)
                 market_rows = query_active_markets(conn)

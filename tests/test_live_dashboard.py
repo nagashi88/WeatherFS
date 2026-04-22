@@ -24,6 +24,7 @@ from weatheredge.dashboard.live_dashboard import (
     build_per_agent_pnl_panel,
     query_open_positions,
     query_per_agent_pnl,
+    query_performance,
 )
 from weatheredge.db.database import init_db, make_engine
 
@@ -283,3 +284,86 @@ def test_build_layout_accepts_per_agent_panel():
     )
     from rich.console import Console
     Console(record=True, width=180).print(layout)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# query_performance — phase-scoped win rate (Finding 3)
+# ---------------------------------------------------------------------------
+
+
+def test_query_performance_all_time_when_no_activation(conn):
+    """Default (activated_at=None) behaves as before: aggregates everything."""
+    _insert_trade(conn, status="won", pnl=0.40, created_at=_now_iso(-48 * 60))
+    _insert_trade(conn, status="lost", pnl=-0.50, created_at=_now_iso(-36 * 60))
+    _insert_trade(conn, status="won", pnl=0.30, created_at=_now_iso(-1 * 60))
+
+    perf = query_performance(conn)
+    assert perf["resolved"] == 3
+    assert perf["wins_all"] == 2
+    assert perf["win_rate"] == pytest.approx(200.0 / 3.0)
+    assert perf["phase_since"] is None
+
+
+def test_query_performance_filters_wins_by_phase(conn):
+    """With activated_at, Phase 0 trades are excluded from wins/resolved/win_rate."""
+    activation = _now_iso(-24 * 60)
+    # Phase 0: 3 losses (lottery-ticket regime)
+    for _ in range(3):
+        _insert_trade(conn, status="lost", pnl=-0.50, created_at=_now_iso(-48 * 60))
+    # Phase 1: 2 wins (calibrated regime)
+    _insert_trade(conn, status="won", pnl=0.40, created_at=_now_iso(-12 * 60))
+    _insert_trade(conn, status="won", pnl=0.60, created_at=_now_iso(-6 * 60))
+
+    perf = query_performance(conn, activated_at=activation)
+    assert perf["resolved"] == 2, "only Phase 1 trades count toward resolved"
+    assert perf["wins_all"] == 2
+    assert perf["won"] == 2
+    assert perf["lost"] == 0
+    assert perf["win_rate"] == pytest.approx(100.0)
+    assert perf["phase_since"] == activation
+
+
+def test_query_performance_total_pnl_stays_all_time(conn):
+    """total_pnl MUST include Phase 0 so header bankroll matches real cash position."""
+    activation = _now_iso(-24 * 60)
+    _insert_trade(conn, status="lost", pnl=-10.0, created_at=_now_iso(-48 * 60))
+    _insert_trade(conn, status="won", pnl=3.0, created_at=_now_iso(-6 * 60))
+
+    perf = query_performance(conn, activated_at=activation)
+    # All-time P&L = -10 + 3 = -7 (Phase 0 loss still depresses bankroll)
+    assert perf["total_pnl"] == pytest.approx(-7.0)
+
+
+def test_query_performance_handles_t_separated_activation(conn):
+    """phase_config.json stores 'T'-separated ISO; created_at stores space-separated.
+
+    SQL must normalize both sides so comparison is correct across formats.
+    """
+    # Activation with 'T' and timezone offset — matches current_phase.json format.
+    activation = "2026-04-22T00:00:00+00:00"
+    # Trade after activation (space-separated — SQLAlchemy default).
+    _insert_trade(conn, status="won", pnl=0.50, created_at="2026-04-22 12:00:00")
+    # Trade before activation — must be excluded despite close numeric proximity.
+    _insert_trade(conn, status="lost", pnl=-0.50, created_at="2026-04-21 23:30:00")
+
+    perf = query_performance(conn, activated_at=activation)
+    assert perf["resolved"] == 1
+    assert perf["wins_all"] == 1
+
+
+def test_query_performance_preserves_sub_second_precision(conn):
+    """Activation timestamp has microseconds; trades in the same second must be
+    correctly partitioned pre/post. SQLite datetime() truncates fractional
+    seconds and would wrongly include pre-activation rows — julianday() must
+    preserve microsecond precision.
+    """
+    activation = "2026-04-21T23:13:56.475164+00:00"
+    # 100ms into that second — BEFORE activation (0.475s), should be excluded.
+    _insert_trade(conn, status="lost", pnl=-0.10, created_at="2026-04-21 23:13:56.100000")
+    # 900ms into that second — AFTER activation, should be included.
+    _insert_trade(conn, status="won", pnl=0.20, created_at="2026-04-21 23:13:56.900000")
+
+    perf = query_performance(conn, activated_at=activation)
+    assert perf["resolved"] == 1, "sub-second trades must not leak across activation boundary"
+    assert perf["wins_all"] == 1
+    assert perf["lost"] == 0

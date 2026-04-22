@@ -178,6 +178,18 @@ def get_current_phase() -> str:
     return "phase_0"
 
 
+def get_phase_activated_at() -> str | None:
+    """Read ISO 8601 timestamp of the most recent phase activation, or None."""
+    if PHASE_FILE.exists():
+        try:
+            data = json.loads(PHASE_FILE.read_text())
+            ts = data.get("activated_at")
+            return str(ts) if ts else None
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return None
+
+
 def _merged_modules_for_phase(phase_name: str) -> dict[str, bool]:
     """Return cumulative module config for a phase without mutating globals."""
     if phase_name not in PHASE_CONFIGS:
