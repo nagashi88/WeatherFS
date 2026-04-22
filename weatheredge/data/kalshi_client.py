@@ -15,6 +15,19 @@ KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 WEATHER_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHDEN"]
 
 
+def _parse_dollar_price(value: object) -> float | None:
+    """Parse a Kalshi dollar-string price field (e.g. '0.1600') into a float in (0,1)."""
+    if value is None:
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0.0 or price >= 1.0:
+        return None
+    return price
+
+
 async def fetch_kalshi_weather_markets(
     session: aiohttp.ClientSession | None = None,
     series_tickers: list[str] | None = None,
@@ -41,11 +54,10 @@ async def fetch_kalshi_weather_markets(
                     data = await resp.json()
                     markets = data.get("markets", [])
                     for m in markets:
-                        # BugFix M10: Sanity check Kalshi prices — API returns cents (0-100)
-                        raw_yes = m.get("yes_ask", 0) or 0
-                        raw_no = m.get("no_ask", 0) or 0
-                        yes_price = raw_yes / 100.0 if raw_yes > 1.0 else raw_yes if raw_yes > 0 else None
-                        no_price = raw_no / 100.0 if raw_no > 1.0 else raw_no if raw_no > 0 else None
+                        # Kalshi public API returns prices as dollar strings (e.g. '0.1600')
+                        # in `yes_ask_dollars`/`no_ask_dollars`. None / 0 / out-of-range → None.
+                        yes_price = _parse_dollar_price(m.get("yes_ask_dollars"))
+                        no_price = _parse_dollar_price(m.get("no_ask_dollars"))
                         all_markets.append({
                             "ticker": series,
                             "market_id": m.get("ticker", ""),

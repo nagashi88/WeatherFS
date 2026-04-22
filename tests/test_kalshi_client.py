@@ -45,13 +45,17 @@ def _make_mock_session(responses: list) -> MagicMock:
     return session
 
 
-def _sample_market(ticker: str = "KXHIGHNY-26MAR29", yes_ask: int = 45) -> dict:
+def _sample_market(
+    ticker: str = "KXHIGHNY-26MAR29",
+    yes_ask_dollars: str = "0.4500",
+    no_ask_dollars: str = "0.5500",
+) -> dict:
     return {
         "ticker": ticker,
         "title": f"Will NY high temp exceed 60F?",
         "subtitle": "Daily high temperature",
-        "yes_ask": yes_ask,
-        "no_ask": 55,
+        "yes_ask_dollars": yes_ask_dollars,
+        "no_ask_dollars": no_ask_dollars,
         "volume": 1000,
         "open_interest": 500,
         "close_time": "2026-03-29T23:59:00Z",
@@ -140,14 +144,13 @@ async def test_market_data_has_expected_fields():
 
 
 # ---------------------------------------------------------------------------
-# test_prices_converted_from_cents
+# test_prices_parsed_from_dollar_strings
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_prices_converted_from_cents():
-    """yes_ask=45 in API response → yes_price=0.45 in normalized dict."""
-    market = _sample_market(yes_ask=45)
-    market["no_ask"] = 55
+async def test_prices_parsed_from_dollar_strings():
+    """yes_ask_dollars='0.4500' in API response → yes_price=0.45 in normalized dict."""
+    market = _sample_market(yes_ask_dollars="0.4500", no_ask_dollars="0.5500")
     resp_cm = _make_mock_response(200, {"markets": [market]})
     session = _make_mock_session([resp_cm])
 
@@ -166,19 +169,28 @@ async def test_prices_converted_from_cents():
 
 @pytest.mark.asyncio
 async def test_prices_none_when_missing():
-    """yes_ask absent or 0 in API response → yes_price=None."""
+    """yes_ask_dollars absent, '0.0000', or '1.0000' → yes_price=None."""
+    # Case 1: fields absent
     market = _sample_market()
-    market["yes_ask"] = 0
-    market["no_ask"] = 0
+    del market["yes_ask_dollars"]
+    del market["no_ask_dollars"]
     resp_cm = _make_mock_response(200, {"markets": [market]})
     session = _make_mock_session([resp_cm])
-
     results = await fetch_kalshi_weather_markets(
         session=session, series_tickers=["KXHIGHNY"]
     )
-
     assert results[0]["yes_price"] is None
     assert results[0]["no_price"] is None
+
+    # Case 2: fields set to '0.0000' (no ask/bid on book)
+    market_zero = _sample_market(yes_ask_dollars="0.0000", no_ask_dollars="0.0000")
+    resp_cm2 = _make_mock_response(200, {"markets": [market_zero]})
+    session2 = _make_mock_session([resp_cm2])
+    results2 = await fetch_kalshi_weather_markets(
+        session=session2, series_tickers=["KXHIGHNY"]
+    )
+    assert results2[0]["yes_price"] is None
+    assert results2[0]["no_price"] is None
 
 
 # ---------------------------------------------------------------------------
