@@ -137,9 +137,18 @@ class PaperTrader:
 
             for t in resolved:
                 self.trade_history.append(self._trade_to_dict(t))
-                if t.pnl and t.resolved_at:
-                    day = t.resolved_at.strftime("%Y-%m-%d")
-                    self.daily_pnl[day] = self.daily_pnl.get(day, 0) + t.pnl
+                if t.pnl:
+                    # CCG-bughunt2 G3: match the live booking path (close_position /
+                    # resolution) which keys daily_pnl on market_date, not UTC
+                    # resolved_at. A cross-midnight resolution otherwise buckets
+                    # differently pre- vs post-restart, silently distorting the
+                    # daily circuit breaker and P&L attribution.
+                    day = (
+                        t.market_date
+                        or (t.resolved_at.strftime("%Y-%m-%d") if t.resolved_at else None)
+                    )
+                    if day:
+                        self.daily_pnl[day] = self.daily_pnl.get(day, 0) + t.pnl
                 resolved_pnl_total += (t.pnl or 0.0)
 
         # Reconstruct bankroll: initial + net resolved P&L - open position costs
@@ -149,7 +158,16 @@ class PaperTrader:
         # date). Prevents the re-entry guard from resetting at UTC midnight when
         # the market's local day is still active. Legacy trades without a stored
         # market_date fall back to the created_at date.
-        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_dt = datetime.now(timezone.utc)
+        today_utc = today_dt.strftime("%Y-%m-%d")
+        # CCG-bughunt2 G5: only rebuild buckets whose market_date is still
+        # potentially active. Past markets have already resolved and cannot
+        # be re-entered, so their counters are dead memory. Without this,
+        # _daily_entries grows to O(total_trades) on every restart because
+        # trade_history is never pruned (see append paths at lines 499/533/571).
+        # Cutoff = today-1 to cover overnight UTC windows where station-local
+        # market_date still lags behind today_utc by a few hours.
+        recent_floor = (today_dt - timedelta(days=1)).strftime("%Y-%m-%d")
         for t in list(self.open_positions) + list(self.trade_history):
             created = t.get("created_at")
             created_day: str | None = None
@@ -173,6 +191,12 @@ class PaperTrader:
             if not has_market_date and market_day != today_utc:
                 # Legacy row with no market_date that didn't happen "today UTC"
                 # → skip; counting it would inflate today's limit incorrectly.
+                continue
+            # Open positions always count (still active regardless of market_date).
+            # Resolved trades only count if market_date is recent enough to still
+            # be tradeable today.
+            is_open = t.get("status") == "open"
+            if has_market_date and not is_open and market_day < recent_floor:
                 continue
             key = self._market_id_key(t.get("market_id"))
             bucket = self._daily_entries.setdefault(key, {})

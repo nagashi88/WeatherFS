@@ -1332,3 +1332,213 @@ class TestProfitabilityGuards:
         trader.resolve_position("rt", "yes")
         pnl = trader.trade_history[0]["pnl"]
         assert abs(trader.bankroll - (start + pnl)) < 1e-9
+
+
+class TestDailyPnlRestartBucketing:
+    """CCG-bughunt2 G3: on restart, daily_pnl must be keyed on market_date
+    (station-local resolution date), not resolved_at UTC. Live close_position
+    / resolve_position already key on market_date; restart divergence otherwise
+    silently moves cross-midnight P&L to the wrong day and distorts the
+    daily circuit breaker after the bot reboots.
+    """
+
+    def _build_engine_with_resolved_trade(
+        self, *, market_date: str, resolved_utc: datetime, pnl: float
+    ):
+        from sqlalchemy import create_engine
+        from weatheredge.db.database import init_db
+        from weatheredge.db.database import get_session
+        from weatheredge.db.models import Trade
+
+        engine = create_engine("sqlite:///:memory:")
+        init_db(engine=engine)
+        with get_session(engine) as session:
+            session.add(Trade(
+                market_id="m1", platform="kalshi", mode="paper",
+                side="buy_yes", price=0.40, amount=10.0, cost=4.0,
+                station="KNYC", market_date=market_date,
+                status="won", pnl=pnl, resolved_at=resolved_utc,
+            ))
+        return engine
+
+    def test_restart_bucket_uses_market_date_not_resolved_at(self):
+        """A trade resolved after UTC midnight should bucket to market_date, not
+        to the UTC calendar day of resolved_at."""
+        market_date = "2026-04-22"
+        # Resolution fires at 01:00 UTC the next day — UTC day is 2026-04-23.
+        resolved_utc = datetime(2026, 4, 23, 1, 0, tzinfo=timezone.utc)
+        engine = self._build_engine_with_resolved_trade(
+            market_date=market_date, resolved_utc=resolved_utc, pnl=6.0,
+        )
+
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.connect_db(engine)
+
+        assert trader.daily_pnl.get(market_date) == pytest.approx(6.0)
+        assert "2026-04-23" not in trader.daily_pnl
+        engine.dispose()
+
+    def test_restart_falls_back_to_resolved_at_when_market_date_missing(self):
+        """Legacy rows without market_date should still book to resolved_at UTC day."""
+        resolved_utc = datetime(2026, 4, 22, 15, 0, tzinfo=timezone.utc)
+        engine = self._build_engine_with_resolved_trade(
+            market_date=None, resolved_utc=resolved_utc, pnl=4.5,
+        )
+
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.connect_db(engine)
+
+        assert trader.daily_pnl.get("2026-04-22") == pytest.approx(4.5)
+        engine.dispose()
+
+    def test_restart_matches_live_booking_for_cross_midnight_resolution(self):
+        """The restart bucket key must match what close_position / resolve_position
+        book at live close time, so daily_pnl is stable across reboots."""
+        # Live path: close a position that books to market_date.
+        market_date = "2026-04-22"
+        live_trader = PaperTrader(initial_bankroll=1000.0)
+        live_trader.place_order(Order(
+            market_id="m1", side="buy_yes", price=0.40, amount=10.0,
+            market_date=market_date,
+        ))
+        # Close mid-day on the next UTC day. close_position books to market_date.
+        live_trader.close_position("m1", current_yes_price=0.70, reason="edge_stop")
+        live_keys = set(live_trader.daily_pnl.keys())
+
+        # Restart path: same trade loaded from DB with resolved_at on the next UTC day.
+        resolved_utc = datetime(2026, 4, 23, 2, 30, tzinfo=timezone.utc)
+        engine = self._build_engine_with_resolved_trade(
+            market_date=market_date, resolved_utc=resolved_utc, pnl=3.0,
+        )
+        restart_trader = PaperTrader(initial_bankroll=1000.0)
+        restart_trader.connect_db(engine)
+        restart_keys = set(restart_trader.daily_pnl.keys())
+
+        # Both paths must agree on the bucket day.
+        assert live_keys == restart_keys == {market_date}
+        engine.dispose()
+
+
+class TestDailyEntriesRestartPruning:
+    """CCG-bughunt2 G5: _daily_entries must not rebuild buckets for ancient
+    resolved trades. trade_history grows unboundedly (no pruning), and past
+    markets cannot be re-entered, so stale (market_id, market_date) pairs
+    are pure dead memory — O(total_trades) per restart otherwise.
+    """
+
+    def _build_engine_with_trades(self, trades: list[dict]):
+        from sqlalchemy import create_engine
+        from weatheredge.db.database import init_db, get_session
+        from weatheredge.db.models import Trade
+
+        engine = create_engine("sqlite:///:memory:")
+        init_db(engine=engine)
+        with get_session(engine) as session:
+            for spec in trades:
+                session.add(Trade(
+                    market_id=spec["market_id"], platform="kalshi", mode="paper",
+                    side="buy_yes", price=0.40, amount=10.0, cost=4.0,
+                    station="KNYC", market_date=spec.get("market_date"),
+                    status=spec["status"], pnl=spec.get("pnl"),
+                    resolved_at=spec.get("resolved_at"),
+                ))
+        return engine
+
+    def test_ancient_resolved_trade_is_pruned(self):
+        """A resolved trade with market_date far in the past must NOT
+        populate _daily_entries."""
+        today = datetime.now(timezone.utc)
+        ancient_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+        resolved_utc = today - timedelta(days=30)
+        engine = self._build_engine_with_trades([{
+            "market_id": "m_ancient", "market_date": ancient_date,
+            "status": "won", "pnl": 2.0, "resolved_at": resolved_utc,
+        }])
+
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.connect_db(engine)
+
+        assert "m_ancient" not in trader._daily_entries
+        engine.dispose()
+
+    def test_today_resolved_trade_is_kept(self):
+        """A resolved trade with today's market_date must still populate
+        _daily_entries — the market may still be re-enterable today."""
+        today = datetime.now(timezone.utc)
+        today_str = today.strftime("%Y-%m-%d")
+        engine = self._build_engine_with_trades([{
+            "market_id": "m_today", "market_date": today_str,
+            "status": "edge_stop", "pnl": -0.5, "resolved_at": today,
+        }])
+
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.connect_db(engine)
+
+        assert trader._daily_entries.get("m_today", {}).get(today_str) == 1
+        engine.dispose()
+
+    def test_yesterday_resolved_trade_is_kept_for_overnight_window(self):
+        """market_date = today-1 must still be kept — covers the overnight UTC
+        window where station-local day still lags today_utc by hours."""
+        today = datetime.now(timezone.utc)
+        yesterday_str = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+        engine = self._build_engine_with_trades([{
+            "market_id": "m_yesterday", "market_date": yesterday_str,
+            "status": "edge_stop", "pnl": 0.3,
+            "resolved_at": today - timedelta(hours=5),
+        }])
+
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.connect_db(engine)
+
+        assert trader._daily_entries.get("m_yesterday", {}).get(yesterday_str) == 1
+        engine.dispose()
+
+    def test_open_position_with_old_market_date_is_kept(self):
+        """Open positions must ALWAYS populate _daily_entries regardless of
+        market_date age — they are still active and the counter must reflect
+        the real in-flight exposure even if market_date is stale."""
+        today = datetime.now(timezone.utc)
+        old_date = (today - timedelta(days=10)).strftime("%Y-%m-%d")
+        engine = self._build_engine_with_trades([{
+            "market_id": "m_open_old", "market_date": old_date,
+            "status": "open",
+        }])
+
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.connect_db(engine)
+
+        assert trader._daily_entries.get("m_open_old", {}).get(old_date) == 1
+        engine.dispose()
+
+    def test_bulk_history_does_not_inflate_daily_entries(self):
+        """Realistic scenario: months of trading history → _daily_entries must
+        stay O(recent trades), not O(total trades)."""
+        today = datetime.now(timezone.utc)
+        today_str = today.strftime("%Y-%m-%d")
+        trades = []
+        # 100 ancient trades (should be pruned)
+        for i in range(100):
+            d = today - timedelta(days=30 + i)
+            trades.append({
+                "market_id": f"m_old_{i}",
+                "market_date": d.strftime("%Y-%m-%d"),
+                "status": "won", "pnl": 1.0, "resolved_at": d,
+            })
+        # 2 recent trades (should be kept)
+        trades.append({
+            "market_id": "m_today_a", "market_date": today_str,
+            "status": "edge_stop", "pnl": -0.2, "resolved_at": today,
+        })
+        trades.append({
+            "market_id": "m_today_b", "market_date": today_str,
+            "status": "won", "pnl": 1.5, "resolved_at": today,
+        })
+        engine = self._build_engine_with_trades(trades)
+
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.connect_db(engine)
+
+        # Only the 2 recent market_ids should appear in the counter.
+        assert set(trader._daily_entries.keys()) == {"m_today_a", "m_today_b"}
+        engine.dispose()
