@@ -3723,11 +3723,14 @@ class TestNarrowBucketDynamicSigma:
         # Patch static RMSE to a small value (simulates trade #27: tight σ ≈ 0.5).
         # With forecast=52.5 (1.5°F above bucket top), small σ → sharp Student-T
         # peak near 52.5 and raw P(T ∈ [50,51]) near zero. Wide ensemble (σ ≈ 3)
-        # smears the peak and boosts bucket probability.
+        # smears the peak and boosts bucket probability. Both get_rmse and
+        # get_rmse_floor are patched — the floor otherwise clamps up at long
+        # lead times (TODAY is 2030 → lead ≈35000h) and masks the narrow σ.
         wide_ensemble = [52.5 + (i - 10) * 0.5 for i in range(21)]  # σ ≈ 3.0
 
         with _patch_state(state), \
-             patch("weatheredge.probability.bias_correction.get_rmse", return_value=0.5):
+             patch("weatheredge.probability.bias_correction.get_rmse", return_value=0.5), \
+             patch("weatheredge.bias_correction.get_rmse_floor", return_value=0.5):
             opp_wide = main_module._build_opportunity(
                 market_id,
                 {"yes_price": 0.5},
@@ -3740,7 +3743,8 @@ class TestNarrowBucketDynamicSigma:
             market_id2, "KNYC", self.TODAY, low=50.0, high=51.0,
         )
         with _patch_state(state2), \
-             patch("weatheredge.probability.bias_correction.get_rmse", return_value=0.5):
+             patch("weatheredge.probability.bias_correction.get_rmse", return_value=0.5), \
+             patch("weatheredge.bias_correction.get_rmse_floor", return_value=0.5):
             opp_static = main_module._build_opportunity(
                 market_id2,
                 {"yes_price": 0.5},
