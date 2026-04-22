@@ -2699,7 +2699,11 @@ class TestBuildOpportunityEdgePaths:
         state = self._make_state()
 
         mock_parsed = MagicMock()
-        mock_parsed.threshold = 70.0
+        # CCG-bug-9: threshold kept close to the 75°F forecast in _base_forecasts so
+        # the tightened lead=0 σ (3°F for KLAX/hrrr) doesn't push the edge past the
+        # 40% unrealistic-edge cap. Test asserts hours_until_market_close is
+        # invoked — must not be coupled to the calibrated RMSE values.
+        mock_parsed.threshold = 73.0
         mock_parsed.direction = "above"
         mock_parsed.market_type = "daily_high"
         mock_parsed.date = "2026-04-01"

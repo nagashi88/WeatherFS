@@ -26,24 +26,24 @@ log = logging.getLogger(__name__)
 # Daily-max has ~35-50% higher RMSE than hourly 2m temperature that NWP models are typically
 # validated against. Values raised based on Phase 0 Brier=0.50 evidence of overconfidence.
 _DEFAULT_US_RMSE = {
-    "gfs": {1: 5.0, 2: 7.0, 3: 9.0},
-    "ecmwf": {1: 4.5, 2: 6.5, 3: 8.5},
-    "hrrr": {1: 4.0, 2: 6.0},
+    "gfs": {0: 4.0, 1: 5.0, 2: 7.0, 3: 9.0},
+    "ecmwf": {0: 3.5, 1: 4.5, 2: 6.5, 3: 8.5},
+    "hrrr": {0: 3.0, 1: 4.0, 2: 6.0},
 }
 _DEFAULT_INTL_RMSE = {
-    "gfs": {1: 5.5, 2: 7.5, 3: 9.5},
-    "ecmwf": {1: 4.5, 2: 6.5, 3: 8.5},
+    "gfs": {0: 4.5, 1: 5.5, 2: 7.5, 3: 9.5},
+    "ecmwf": {0: 3.5, 1: 4.5, 2: 6.5, 3: 8.5},
 }
 STATION_RMSE: dict[str, dict[str, dict[int, float]]] = {
     "KNYC": {  # Central Park, NYC — maritime influence reduces extremes slightly
-        "gfs": {1: 4.5, 2: 6.5, 3: 8.5},
-        "ecmwf": {1: 4.0, 2: 5.5, 3: 7.5},
-        "hrrr": {1: 3.5, 2: 5.5},
+        "gfs": {0: 3.5, 1: 4.5, 2: 6.5, 3: 8.5},
+        "ecmwf": {0: 3.0, 1: 4.0, 2: 5.5, 3: 7.5},
+        "hrrr": {0: 2.5, 1: 3.5, 2: 5.5},
     },
     "KMDW": {  # Midway Airport, Chicago — continental, high variability
-        "gfs": {1: 5.0, 2: 7.0, 3: 9.0},
-        "ecmwf": {1: 4.5, 2: 6.5, 3: 8.5},
-        "hrrr": {1: 4.0, 2: 6.0},
+        "gfs": {0: 4.0, 1: 5.0, 2: 7.0, 3: 9.0},
+        "ecmwf": {0: 3.5, 1: 4.5, 2: 6.5, 3: 8.5},
+        "hrrr": {0: 3.0, 1: 4.0, 2: 6.0},
     },
     # US stations — default US RMSE (will be refined by RMSE updater)
     "KMIA": {**_DEFAULT_US_RMSE},
@@ -53,7 +53,7 @@ STATION_RMSE: dict[str, dict[str, dict[int, float]]] = {
     "KSEA": {**_DEFAULT_US_RMSE},
     "KATL": {**_DEFAULT_US_RMSE},
     "KDFW": {**_DEFAULT_US_RMSE},
-    "KPHX": {"gfs": {1: 4.0, 2: 6.0, 3: 8.0}, "ecmwf": {1: 3.5, 2: 5.5, 3: 7.5}, "hrrr": {1: 3.0, 2: 5.0}},  # Desert: lower cloud/precip variance but heat extremes
+    "KPHX": {"gfs": {0: 3.0, 1: 4.0, 2: 6.0, 3: 8.0}, "ecmwf": {0: 2.5, 1: 3.5, 2: 5.5, 3: 7.5}, "hrrr": {0: 2.5, 1: 3.0, 2: 5.0}},  # Desert: lower cloud/precip variance but heat extremes
     "KIAH": {**_DEFAULT_US_RMSE},
     "KSFO": {**_DEFAULT_US_RMSE},
     "KBOS": {**_DEFAULT_US_RMSE},
@@ -155,6 +155,9 @@ def get_rmse(station: str, model: str, lead_time_days: int) -> float:
     """Lookup station/model/lead-time RMSE from STATION_RMSE table.
 
     BugFix H3: Returns sensible defaults instead of KeyError for unknown stations.
+    CCG-bug-9: lead-time miss now falls back to nearest known bucket (typically
+    lead=1) instead of a blind 7.0°F, which over-inflated σ on same-day markets
+    and produced phantom buy_no edges on Polymarket binaries.
     """
     station_data = STATION_RMSE.get(station)
     if station_data is None:
@@ -164,7 +167,17 @@ def get_rmse(station: str, model: str, lead_time_days: int) -> float:
     model_data = station_data.get(model)
     if model_data is None:
         return 5.0  # safe middle-ground default
-    return model_data.get(lead_time_days, 7.0)  # default to max if lead_time unknown
+    value = model_data.get(lead_time_days)
+    if value is None:
+        # CCG-bug-9: fall back to the nearest known lead bucket rather than 7.0.
+        # Prefer lead=1 (best-calibrated short-lead), then the minimum lead in table.
+        fallback_lead = 1 if 1 in model_data else min(model_data.keys())
+        value = model_data[fallback_lead]
+        log.warning(
+            "get_rmse: fallback for %s/%s/lead=%d → using lead=%d value %.1f",
+            station, model, lead_time_days, fallback_lead, value,
+        )
+    return value
 
 
 @dataclass
