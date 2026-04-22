@@ -13,15 +13,23 @@ import numpy as np
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
+from weatheredge.probability.edge import kalshi_taker_fee
+
 log = logging.getLogger(__name__)
 
 ORDER_TTL_HOURS = 2  # Addendum Gap 9: unfilled orders expire after 2h
 
-# Platform fee rates applied to winnings (per-contract $1.00 payout)
-_PLATFORM_WIN_FEE: dict[str, float] = {
-    "kalshi": 0.02,      # Kalshi charges 2% on winnings (payout - cost)
-    "polymarket": 0.00,  # Polymarket has no fee on winnings; spread cost is in edge calc
-}
+
+def _kalshi_fee(price: float, amount: float, platform: str) -> float:
+    """Per-execution Kalshi taker fee (price-dependent, symmetric in p).
+
+    Kalshi charges ceil(0.07·p·(1-p)·100)/100 per contract at every
+    execution (entry and early exit); settlement to $0/$1 is fee-free.
+    Polymarket has no explicit fee (spread cost lives in edge calc).
+    """
+    if platform != "kalshi":
+        return 0.0
+    return kalshi_taker_fee(price) * amount
 
 
 @dataclass
@@ -316,9 +324,14 @@ class PaperTrader:
 
         # BugFix C1: buy_no cost is (1 - yes_price) * amount, not yes_price * amount
         if order.side == "buy_no":
-            cost = (1.0 - order.price) * order.amount
+            stake = (1.0 - order.price) * order.amount
         else:
-            cost = order.price * order.amount
+            stake = order.price * order.amount
+        # Kalshi taker fee is paid per contract at entry (symmetric in price),
+        # so cost captures the real cash outlay and resolve/close PnL stays
+        # consistent with (amount - cost) on a win.
+        entry_fee = _kalshi_fee(order.price, order.amount, order.platform)
+        cost = stake + entry_fee
         if cost > self.bankroll:
             return {"filled": False, "reason": "Insufficient bankroll"}
 
@@ -401,13 +414,17 @@ class PaperTrader:
             # YES-price across both market and limit fills.
             fill_price = limit_price
             if o["side"] == "buy_no":
-                cost = fill_price * o["amount"]
+                stake = fill_price * o["amount"]
                 stored_price = 1.0 - fill_price
                 fill_no_price: float | None = fill_price
             else:
-                cost = fill_price * o["amount"]
+                stake = fill_price * o["amount"]
                 stored_price = fill_price
                 fill_no_price = None
+
+            platform = o.get("platform", "polymarket")
+            entry_fee = _kalshi_fee(stored_price, o["amount"], platform)
+            cost = stake + entry_fee
 
             if cost > self.bankroll:
                 still_pending.append(o)
@@ -489,14 +506,13 @@ class PaperTrader:
                     or (pos["side"] == "buy_no" and outcome == "no")
                 )
                 if won:
-                    platform = pos.get("platform", "polymarket")
-                    fee_rate = _PLATFORM_WIN_FEE.get(platform, 0.0)
-                    # Fee is on WINNINGS (payout - cost), not on full payout
-                    gross_winnings = pos["amount"] - pos["cost"]
-                    pnl = gross_winnings * (1.0 - fee_rate)
+                    # Kalshi/Polymarket settle $0/$1 fee-free; the entry fee
+                    # was already booked into cost, so win pnl is simply
+                    # amount - cost (what cash actually lands after payout).
+                    pnl = pos["amount"] - pos["cost"]
                     pos["status"] = "won"
                 else:
-                    pnl = -pos["cost"]  # lose entire stake
+                    pnl = -pos["cost"]  # lose entire stake (fee included)
                     pos["status"] = "lost"
                 pos["pnl"] = pnl
                 self.bankroll += pos["cost"] + pnl  # return cost ± pnl
@@ -524,7 +540,14 @@ class PaperTrader:
                     current_value = current_yes_price * pos["amount"]
                 else:  # buy_no
                     current_value = (1.0 - current_yes_price) * pos["amount"]
-                pnl = current_value - pos["cost"]
+                # Early close pays a second taker fee at exit price
+                # (symmetric in p on Kalshi). Cost already includes entry fee.
+                exit_fee = _kalshi_fee(
+                    current_yes_price,
+                    pos["amount"],
+                    pos.get("platform", "polymarket"),
+                )
+                pnl = current_value - exit_fee - pos["cost"]
                 pos["status"] = reason
                 pos["pnl"] = pnl
                 self.bankroll += pos["cost"] + pnl  # return cost ± pnl

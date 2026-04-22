@@ -640,13 +640,16 @@ class TestDBPersistenceRoundTrip:
         pt.place_order(Order(market_id="M3", side="buy_no", price=0.40, amount=40.0, platform="polymarket"))
 
         assert len(pt.open_positions) == 3
-        # BugFix C1: buy_no cost = (1 - price) * amount = 0.60 * 40 = 24
-        cost_total = 0.20 * 50.0 + 0.60 * 30.0 + (1.0 - 0.40) * 40.0  # 10 + 18 + 24 = 52
+        # Entry fees booked into cost on Kalshi only:
+        #   M1 poly @ 0.20 × 50 → cost = 10.00 (no fee)
+        #   M2 kalshi @ 0.60 × 30 → stake 18 + kalshi_fee(0.6)*30 = 0.60 → cost 18.60
+        #   M3 poly buy_no @ 0.40 × 40 → stake (1-0.40)*40 = 24.00 (no fee)
+        cost_total = 10.0 + 18.60 + 24.0   # 52.60
         assert abs(pt.bankroll - (500.0 - cost_total)) < 0.01
 
         # Resolve M1 as win, M2 as loss
-        pt.resolve_position("M1", "yes")  # Win: pnl = 50 - 10 = 40
-        pt.resolve_position("M2", "no")   # Loss: pnl = -18
+        pt.resolve_position("M1", "yes")  # Win: pnl = amount - cost = 50 - 10 = 40
+        pt.resolve_position("M2", "no")   # Loss: pnl = -cost = -18.60
 
         assert len(pt.open_positions) == 1  # Only M3 remains
         assert len(pt.trade_history) == 2
@@ -662,12 +665,13 @@ class TestDBPersistenceRoundTrip:
 
             assert len(won) == 1
             assert won[0].market_id == "M1"
-            # Polymarket 0% fee: pnl = (amount - cost) * (1 - 0.00) = 50 - 10 = 40.0
+            # Polymarket: pnl = amount - cost = 50 - 10 = 40.0
             assert abs(won[0].pnl - 40.0) < 0.01
 
             assert len(lost) == 1
             assert lost[0].market_id == "M2"
-            assert lost[0].pnl == -18.0
+            # Kalshi loss burns full cost including entry fee: -18.60
+            assert abs(lost[0].pnl - (-18.60)) < 0.01
 
             assert len(still_open) == 1
             assert still_open[0].market_id == "M3"
@@ -679,11 +683,11 @@ class TestDBPersistenceRoundTrip:
         assert len(pt2.open_positions) == 1
         assert pt2.open_positions[0]["market_id"] == "M3"
         assert len(pt2.trade_history) == 2
-        # BugFix H7: Bankroll reconstructed as initial + resolved_pnl - open_costs
-        # resolved_pnl = 40.0 (M1 win, Polymarket 0% fee) + (-18.0) (M2 loss) = 22.0
+        # Bankroll reconstructed as initial + resolved_pnl - open_costs
+        # resolved_pnl = 40.0 (M1 win) + (-18.60) (M2 loss with entry fee) = 21.40
         # open_cost = 24.0 (M3 buy_no: (1-0.40)*40)
-        # bankroll = 500 + 22.0 - 24.0 = 498.0
-        assert abs(pt2.bankroll - 498.0) < 0.01
+        # bankroll = 500 + 21.40 - 24.0 = 497.40
+        assert abs(pt2.bankroll - 497.40) < 0.01
 
 
 # ===========================================================================
@@ -705,15 +709,18 @@ class TestPerformanceReport:
         pt.place_order(Order(market_id="L1", side="buy_yes", price=0.70, amount=30.0, platform="kalshi",
                              model_probability=0.80, edge_at_entry=0.08))
 
-        pt.resolve_position("W1", "yes")  # Win: pnl = 100 - 30 = 70
-        pt.resolve_position("W2", "yes")  # Win: pnl = 50 - 25 = 25
-        pt.resolve_position("L1", "no")   # Loss: pnl = -21
+        pt.resolve_position("W1", "yes")  # Poly win: pnl = 100 - 30 = 70
+        pt.resolve_position("W2", "yes")  # Poly win: pnl = 50 - 25 = 25
+        # L1 Kalshi buy_yes @ 0.70, amount=30:
+        #   stake 21.00 + kalshi_fee(0.70)*30 = 0.60 → cost 21.60
+        #   Loss burns full cost (incl. entry fee): pnl = -21.60
+        pt.resolve_position("L1", "no")
 
         report = pt.get_performance_report()
         assert report.total_trades == 3
         assert report.winning_trades == 2
         assert report.losing_trades == 1
         assert abs(report.win_rate - 2 / 3) < 0.01
-        # Polymarket 0% fee: W1 pnl = 100-30=70; W2 pnl = 50-25=25; L1 pnl = -21 → total=74
-        assert abs(report.total_pnl - 74.0) < 0.01
+        # W1 70 + W2 25 + L1 -21.60 → total 73.40
+        assert abs(report.total_pnl - 73.40) < 0.01
         assert report.sharpe_ratio != 0.0

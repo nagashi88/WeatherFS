@@ -71,12 +71,20 @@ class ExitManager:
         model_prob = opp.model_probability
         current_price = opp.market_price  # current YES price
 
-        # --- Unrealized P&L ---
+        # --- Unrealized P&L (net of exit taker fee) ---
+        # pnl_pct drives time_decay profit-lock and future capital_protect.
+        # It must reflect *what we would realize if we closed now*, so
+        # subtract the Kalshi taker fee at the current price. Entry fee is
+        # already baked into `cost` at entry time (paper_trader). Symmetric
+        # in price so the same fee(price) value applies to YES and NO sides.
+        from weatheredge.probability.edge import kalshi_taker_fee
         if side == "buy_yes":
             current_value = current_price * amount
         else:  # buy_no — we hold NO contracts worth (1 - yes_price)
             current_value = (1.0 - current_price) * amount
-        unrealized_pnl = current_value - cost
+        platform = pos.get("platform", "polymarket")
+        exit_fee = kalshi_taker_fee(current_price) * amount if platform == "kalshi" else 0.0
+        unrealized_pnl = current_value - exit_fee - cost
         pnl_pct = unrealized_pnl / cost if cost > 0 else 0.0
 
         # --- Current edge (model vs market, from our position's perspective) ---

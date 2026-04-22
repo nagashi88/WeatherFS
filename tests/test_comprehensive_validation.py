@@ -302,7 +302,12 @@ class TestFinancialCorrectness:
     # -----------------------------------------------------------------------
 
     def test_pnl_win_applies_kalshi_fee(self):
-        """Win on Kalshi: 2% fee on winnings → pnl = (1 - 0.50) * (1 - 0.02) = 0.49."""
+        """Win on Kalshi: fee booked at entry; settlement to $1 is fee-free.
+
+        Enter 1 @ 0.50: kalshi_taker_fee(0.5) = ceil(0.07·0.5·0.5·100)/100 = 0.02
+        → cost = 0.50 stake + 0.02 entry fee = 0.52.
+        On win, pnl = amount - cost = 1.00 - 0.52 = 0.48 (one fee paid, not two).
+        """
         from weatheredge.execution.paper_trader import Order, PaperTrader
 
         trader = PaperTrader(initial_bankroll=100.0)
@@ -317,10 +322,9 @@ class TestFinancialCorrectness:
         trader.resolve_position("kalshi-fee-test", "yes")
 
         trade = trader.trade_history[-1]
-        # Kalshi 2% fee on WINNINGS: pnl = (amount - cost) * (1 - 0.02) = (1 - 0.50) * 0.98 = 0.49
-        expected_pnl = (1.0 - 0.50) * (1.0 - 0.02)
+        expected_pnl = 1.0 - 0.52   # amount − (stake + entry_fee)
         assert abs(trade["pnl"] - expected_pnl) < 1e-9, (
-            f"Expected pnl={expected_pnl:.4f} (after 2% Kalshi fee on winnings), got {trade['pnl']:.4f}"
+            f"Expected pnl={expected_pnl:.4f} (entry-fee model), got {trade['pnl']:.4f}"
         )
 
     # -----------------------------------------------------------------------

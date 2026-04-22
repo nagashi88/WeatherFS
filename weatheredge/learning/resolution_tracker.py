@@ -39,14 +39,13 @@ class ResolutionTracker:
                       (trade.side == "buy_no" and actual_outcome == "no")
 
                 if won:
-                    # BugFix C4: Apply platform fee on WINNINGS only, matching paper_trader logic
-                    from weatheredge.execution.paper_trader import _PLATFORM_WIN_FEE
-                    fee_rate = _PLATFORM_WIN_FEE.get(trade.platform or "polymarket", 0.0)
-                    gross_winnings = trade.amount - trade.cost
-                    pnl = gross_winnings * (1.0 - fee_rate)
+                    # Kalshi/Polymarket settle $0/$1 fee-free; entry fee is
+                    # already booked into trade.cost, so win pnl is the flat
+                    # payout minus cost (matches paper_trader.resolve_position).
+                    pnl = trade.amount - trade.cost
                     trade.status = "won"
                 else:
-                    pnl = -trade.cost  # Lose: lose entire cost
+                    pnl = -trade.cost  # Lose: lose entire cost (fee included)
                     trade.status = "lost"
 
                 trade.pnl = pnl

@@ -1146,7 +1146,10 @@ def _run_decision_cycle(state: AppState) -> None:
     daily_pnl = state.paper_trader.daily_pnl.get(_today, 0.0)
     realized_total_pnl = sum(t.get("pnl", 0.0) or 0.0 for t in state.paper_trader.trade_history)
     # Include mark-to-market on open positions so circuit breakers react before
-    # losses are formally realised at exit/resolution.
+    # losses are formally realised at exit/resolution. Net of exit taker fee
+    # to match what we'd actually realize on close — matches exit_manager's
+    # pnl_pct convention.
+    from weatheredge.probability.edge import kalshi_taker_fee
     unrealized_total_pnl = 0.0
     for pos in open_positions:
         if not isinstance(pos, dict):
@@ -1158,16 +1161,21 @@ def _run_decision_cycle(state: AppState) -> None:
         if amount <= 0.0:
             continue
         current_opp = opportunities.get(market_id) if market_id else None
-        current_yes_price = (
-            current_opp.market_price if current_opp is not None else float(pos.get("price") or 0.0)
-        )
+        if current_opp is None:
+            # No fresh mark — don't invent a close-out loss by falling back to
+            # entry price and charging an exit fee. Drop this position from
+            # unrealized totals; it reappears once its opportunity is rebuilt.
+            continue
+        current_yes_price = current_opp.market_price
         if side == "buy_yes":
             current_value = current_yes_price * amount
         elif side == "buy_no":
             current_value = (1.0 - current_yes_price) * amount
         else:
             continue
-        unrealized_total_pnl += (current_value - cost)
+        platform = pos.get("platform", "polymarket")
+        exit_fee = kalshi_taker_fee(current_yes_price) * amount if platform == "kalshi" else 0.0
+        unrealized_total_pnl += (current_value - exit_fee - cost)
     total_pnl = realized_total_pnl + unrealized_total_pnl
 
     log.info(

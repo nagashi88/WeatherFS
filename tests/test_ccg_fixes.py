@@ -836,8 +836,9 @@ class TestPaperTraderResolution:
         order = Order(market_id="t5", side="buy_yes", price=0.40, amount=10.0, platform="kalshi")
         pt.place_order(order)
         pt.resolve_position("t5", "yes")
-        # gross_winnings = 6, fee = 6*0.02 = 0.12, pnl = 5.88
-        assert pt.bankroll == pytest.approx(1005.88)
+        # entry fee = ceil(0.07*0.40*0.60*100)/100 * 10 = 0.02 * 10 = 0.20
+        # cost = 0.40*10 + 0.20 = 4.20; win pnl = 10 - 4.20 = 5.80
+        assert pt.bankroll == pytest.approx(1005.80)
 
     def test_close_position_pnl(self):
         pt = PaperTrader(initial_bankroll=1000.0)

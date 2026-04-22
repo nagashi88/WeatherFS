@@ -998,3 +998,54 @@ def test_exit_ev_price_dependent_exit_cost_symmetric_for_buy_no(mgr):
     finally:
         cfg.MODULES["exit_edge_flip"] = orig_flip
         cfg.MODULES["exit_ev_based"] = orig_ev
+
+
+# ---------------------------------------------------------------------------
+# Finding 4: Kalshi MtM is net of exit taker fee (asymmetry vs polymarket)
+# ---------------------------------------------------------------------------
+
+def test_polymarket_pnl_pct_stays_gross_profit_lock_fires(mgr):
+    """Baseline: Polymarket MtM stays gross → profit-lock fires at 2h, +7.5%.
+
+    buy_yes @ 0.40, amount=100, cost=40 (polymarket, no fees)
+    current_price=0.43 → current_value=43, unrealized=3, pnl_pct=7.5% > 5%
+    lead_time=2h < 3h → time_decay profit-lock triggers.
+    """
+    pos = make_pos(side="buy_yes", price=0.40, amount=100, cost=40.0)
+    opp = make_opp(model_probability=0.45, market_price=0.43)
+    with patch.object(ExitManager, "_lead_time_hours", return_value=2.0):
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    assert reason == "time_decay", (
+        f"Polymarket baseline: pnl_pct=7.5% at 2h must fire profit-lock, "
+        f"got reason={reason}"
+    )
+
+
+def test_kalshi_pnl_pct_net_of_exit_fee_holds_where_poly_would_sell(mgr):
+    """Finding 4: Kalshi MtM subtracts exit taker fee, diverging from polymarket.
+
+    Same position as the baseline test but platform=kalshi with cost=42
+    (40 stake + 2 entry fee). At price=0.43 the exit fee is another 2
+    (kalshi_taker_fee(0.43)=0.02 per contract × 100), so:
+        current_value = 43
+        exit_fee      = 2
+        unrealized    = 43 - 2 - 42 = -1
+        pnl_pct       = -1/42 ≈ -2.4%   (below the 5% profit-lock threshold)
+    Profit-lock must NOT fire — closing now would realize a loss.
+    """
+    pos = {
+        "market_id": "MKT-1",
+        "side": "buy_yes",
+        "price": 0.40,
+        "amount": 100.0,
+        "cost": 42.0,            # stake (40) + kalshi entry fee (2)
+        "edge_at_entry": 0.05,
+        "platform": "kalshi",
+    }
+    opp = make_opp(model_probability=0.45, market_price=0.43)
+    with patch.object(ExitManager, "_lead_time_hours", return_value=2.0):
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    assert reason is None, (
+        f"Kalshi: exit fee wipes the paper profit, profit-lock must NOT fire. "
+        f"Got reason={reason}"
+    )

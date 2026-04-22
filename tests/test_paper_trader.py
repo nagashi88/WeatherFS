@@ -1134,18 +1134,25 @@ class TestProfitabilityGuards:
         assert trader.trade_history[0]["status"] == "lost"
 
     def test_kalshi_win_fee_is_applied(self):
-        """Kalshi takes 2% of winnings — silently skipping the fee inflates P&L."""
+        """Kalshi entry fee is booked in cost; win pnl = amount - cost.
+
+        Fee formula is ceil(0.07·p·(1-p)·100)/100 per contract at entry
+        (symmetric in p, $0/$1 settlement is fee-free). A silent fallback
+        to gross stake would overstate P&L by the entry fee.
+        """
         trader = PaperTrader(initial_bankroll=1000.0)
         trader.place_order(Order(
             market_id="k1", side="buy_yes", price=0.40, amount=100.0,
             platform="kalshi",
         ))
+        # Entry fee = ceil(0.07*0.40*0.60*100)/100 * 100 = 0.02 * 100 = 2.00.
+        # Bankroll after entry = 1000 - (40 + 2) = 958.
+        assert abs(trader.bankroll - 958.0) < 1e-9
         trader.resolve_position("k1", "yes")
-        # Gross winnings = amount - cost = 100 - 40 = 60; fee = 2% of 60 = 1.20.
-        # Net pnl = 58.80; bankroll = 1000 - 40 + 40 + 58.80 = 1058.80.
+        # pnl = amount - cost = 100 - 42 = 58; bankroll = 958 + 42 + 58 = 1058.
         trade = trader.trade_history[0]
-        assert abs(trade["pnl"] - 58.80) < 1e-3
-        assert abs(trader.bankroll - 1058.80) < 1e-3
+        assert abs(trade["pnl"] - 58.0) < 1e-3
+        assert abs(trader.bankroll - 1058.0) < 1e-3
 
     def test_polymarket_win_has_no_fee(self):
         """Polymarket has no winnings fee — fee regression would under-pay."""
@@ -1159,6 +1166,54 @@ class TestProfitabilityGuards:
         # Gross winnings = 60; no fee → pnl = 60.
         assert abs(trade["pnl"] - 60.0) < 1e-9
         assert abs(trader.bankroll - 1060.0) < 1e-9
+
+    def test_kalshi_buy_no_entry_fee_symmetric(self):
+        """Kalshi fee is symmetric in price — buy_no at p=0.60 pays the same
+        entry fee as buy_yes at p=0.40 (both see fee(0.4)=fee(0.6)=0.02)."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(Order(
+            market_id="kno", side="buy_no", price=0.60, amount=100.0,
+            platform="kalshi",
+        ))
+        # stake = (1-0.60)*100 = 40; entry_fee = 0.02*100 = 2; cost = 42.
+        assert abs(trader.bankroll - 958.0) < 1e-9
+        trader.resolve_position("kno", "no")
+        assert abs(trader.trade_history[0]["pnl"] - 58.0) < 1e-3
+
+    def test_kalshi_loss_burns_cost_including_entry_fee(self):
+        """Loss must burn the full cost (stake + entry fee), not just stake.
+        Skipping this means a losing streak under-reports the real drawdown."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(Order(
+            market_id="klos", side="buy_yes", price=0.40, amount=100.0,
+            platform="kalshi",
+        ))
+        trader.resolve_position("klos", "no")
+        # pnl = -cost = -42 (full $42 lost, including the $2 entry fee).
+        assert abs(trader.trade_history[0]["pnl"] + 42.0) < 1e-3
+        assert abs(trader.bankroll - 958.0) < 1e-3
+
+    def test_kalshi_early_close_at_flat_price_pays_two_fees(self):
+        """On Kalshi, closing early at entry price is NOT a flat exit.
+        Taker fees on entry + exit make the round-trip a net loss."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(Order(
+            market_id="krt", side="buy_yes", price=0.40, amount=100.0,
+            platform="kalshi",
+        ))
+        # Close at the same price: expected pnl ≈ -(entry_fee + exit_fee) = -4.
+        trader.close_position("krt", current_yes_price=0.40, reason="edge_stop")
+        pnl = trader.trade_history[0]["pnl"]
+        assert -4.1 < pnl < -3.9, f"expected ~-4 (two fees), got {pnl}"
+
+    def test_polymarket_unchanged_by_kalshi_fee_fix(self):
+        """Polymarket entries stay fee-free: cost equals stake."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        trader.place_order(Order(
+            market_id="p2", side="buy_yes", price=0.40, amount=100.0,
+            platform="polymarket",
+        ))
+        assert abs(trader.bankroll - 960.0) < 1e-9  # no fee deducted
 
     def test_daily_pnl_booked_to_market_date_not_today(self):
         """PRD M3: P&L must book to market_date, not UTC today.
