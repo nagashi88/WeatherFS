@@ -153,6 +153,77 @@ class TestBlendedProbability:
         assert details["hrrr_rmse"] == pytest.approx(4.25, abs=0.01)
 
 
+class TestHrrrRmseFloor:
+    """G4 regression: 0.85× multiplier must not push hrrr_rmse below the HRRR floor
+    once main.py has already floored the input rmse upstream via rmse_floor_dynamic.
+    """
+
+    def test_hrrr_short_lead_rmse_not_driven_below_floor(self):
+        import weatheredge.config as cfg
+        orig = cfg.MODULES.get("rmse_floor_dynamic", False)
+        cfg.MODULES["rmse_floor_dynamic"] = True
+        try:
+            _, _, details = blended_probability(
+                threshold=70.0,
+                rmse=1.5,  # already floored upstream at HRRR <12h floor (1.5°F)
+                is_us_station=True,
+                lead_time_hours=6,
+                hrrr_forecast_temp=72.0,
+            )
+            assert details["hrrr_rmse"] == pytest.approx(1.5, abs=0.01)
+        finally:
+            cfg.MODULES["rmse_floor_dynamic"] = orig
+
+    def test_hrrr_long_lead_rmse_not_driven_below_floor(self):
+        import weatheredge.config as cfg
+        orig = cfg.MODULES.get("rmse_floor_dynamic", False)
+        cfg.MODULES["rmse_floor_dynamic"] = True
+        try:
+            _, _, details = blended_probability(
+                threshold=70.0,
+                rmse=3.0,  # GFS-floored (long lead primary is GFS)
+                is_us_station=True,
+                lead_time_hours=48,
+                hrrr_forecast_temp=72.0,
+            )
+            assert details["hrrr_rmse"] == pytest.approx(3.0, abs=0.01)
+        finally:
+            cfg.MODULES["rmse_floor_dynamic"] = orig
+
+    def test_floor_inactive_preserves_multiplier(self):
+        import weatheredge.config as cfg
+        orig = cfg.MODULES.get("rmse_floor_dynamic", False)
+        cfg.MODULES["rmse_floor_dynamic"] = False
+        try:
+            _, _, details = blended_probability(
+                threshold=70.0,
+                rmse=5.0,
+                is_us_station=True,
+                lead_time_hours=6,
+                hrrr_forecast_temp=72.0,
+            )
+            assert details["hrrr_rmse"] == pytest.approx(4.25, abs=0.01)
+        finally:
+            cfg.MODULES["rmse_floor_dynamic"] = orig
+
+    def test_multiplier_still_applies_above_floor(self):
+        """When rmse is well above HRRR floor, the 0.85× tightening still takes effect."""
+        import weatheredge.config as cfg
+        orig = cfg.MODULES.get("rmse_floor_dynamic", False)
+        cfg.MODULES["rmse_floor_dynamic"] = True
+        try:
+            _, _, details = blended_probability(
+                threshold=70.0,
+                rmse=5.0,  # 5.0 * 0.85 = 4.25, well above 1.5°F HRRR floor
+                is_us_station=True,
+                lead_time_hours=6,
+                hrrr_forecast_temp=72.0,
+            )
+            assert details["hrrr_rmse"] == pytest.approx(4.25, abs=0.01)
+        finally:
+            cfg.MODULES["rmse_floor_dynamic"] = orig
+
+
 class TestWeightTables:
     def test_us_weights_sum_to_one(self):
         for bucket, weights in WEIGHTS_US.items():

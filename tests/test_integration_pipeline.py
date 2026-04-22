@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 # Dynamic future date so tests don't break when hardcoded dates drift into the past
 _FUTURE_DATE = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
+# Same date formatted as Kalshi event ticker segment: "YYMMMDD" (e.g. "26APR24").
+_FUTURE_DATE_KALSHI = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
 
 import pytest
 
@@ -96,7 +98,7 @@ class TestPolymarketIntegration:
 
         # yes_price=0.55: model≈0.97, gross_edge≈0.42 ≤ 0.50 cap (FIX 2 won't zero it)
         price_data = {"yes_price": 0.55}
-        forecast_rows = _make_forecast_rows("KNYC", gfs_temp=78.0, ecmwf_temp=79.0)
+        forecast_rows = _make_forecast_rows("KNYC", gfs_temp=78.0, ecmwf_temp=79.0, target_date=future_date)
 
         with patch("weatheredge.main.get_session") as mock_sess:
             mock_db = MagicMock()
@@ -204,9 +206,9 @@ class TestKalshiIntegration:
         """A Kalshi contract ID should match via prefix to RESOLUTION_SOURCES."""
         state = _init()
         # No metadata cache entry — relies on prefix matching
-        state.market_metadata.pop("KXHIGHNY-26MAR30-T65", None)
+        state.market_metadata.pop(f"KXHIGHNY-{_FUTURE_DATE_KALSHI}-T65", None)
 
-        market_id = "KXHIGHNY-26MAR30-T65"
+        market_id = f"KXHIGHNY-{_FUTURE_DATE_KALSHI}-T65"
         price_data = {"yes_price": 0.55}
         forecast_rows = _make_forecast_rows("KNYC", gfs_temp=68.0)
 
@@ -231,7 +233,7 @@ class TestKalshiIntegration:
         """Kalshi bracket contracts (B76.5) extract threshold correctly."""
         state = _init()
 
-        market_id = "KXHIGHDEN-26MAR30-B76.5"
+        market_id = f"KXHIGHDEN-{_FUTURE_DATE_KALSHI}-B76.5"
         price_data = {"yes_price": 0.55}
         forecast_rows = _make_forecast_rows("KDEN", gfs_temp=77.0)
 
@@ -255,7 +257,7 @@ class TestKalshiIntegration:
         """Kalshi market with cached metadata should use it directly."""
         state = _init()
 
-        market_id = "KXHIGHCHI-26APR01-T55"
+        market_id = f"KXHIGHCHI-{_FUTURE_DATE_KALSHI}-T55"
         state.market_metadata[market_id] = {
             "market_id": market_id,
             "ticker": "KXHIGHCHI",
@@ -366,7 +368,7 @@ class TestLeadTimeCalculation:
         }
 
         price_data = {"yes_price": 0.50}
-        forecast_rows = _make_forecast_rows("KNYC", gfs_temp=72.0)
+        forecast_rows = _make_forecast_rows("KNYC", gfs_temp=72.0, target_date=today)
 
         with patch("weatheredge.main.get_session") as mock_sess:
             mock_db = MagicMock()
@@ -400,7 +402,7 @@ class TestLeadTimeCalculation:
         }
 
         price_data = {"yes_price": 0.60}
-        forecast_rows = _make_forecast_rows("KDEN", gfs_temp=65.0)
+        forecast_rows = _make_forecast_rows("KDEN", gfs_temp=65.0, target_date=future)
 
         with patch("weatheredge.main.get_session") as mock_sess:
             mock_db = MagicMock()
@@ -440,7 +442,7 @@ class TestArbScanData:
             "parsed": parsed,
         }
 
-        kalshi_id = "KXHIGHNY-26APR01-T70"
+        kalshi_id = f"KXHIGHNY-{_FUTURE_DATE_KALSHI}-T70"
         state.market_metadata[kalshi_id] = {
             "market_id": kalshi_id,
             "ticker": "KXHIGHNY",
@@ -554,7 +556,7 @@ class TestEdgeCases:
         ) as mock_metar:
             # gfs_temp=97, ecmwf_temp=97: both models well above threshold=90,
             # blended forecast_prob≈0.97, no contradiction with METAR override=0.99 (diff<0.30)
-            forecast_rows = _make_forecast_rows("KPHX", gfs_temp=97.0, ecmwf_temp=97.0)
+            forecast_rows = _make_forecast_rows("KPHX", gfs_temp=97.0, ecmwf_temp=97.0, target_date=_future_date)
 
             with patch("weatheredge.main.get_session") as mock_sess:
                 mock_db = MagicMock()

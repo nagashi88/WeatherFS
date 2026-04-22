@@ -154,6 +154,17 @@ def blended_probability(
         # temperature the advantage shrinks — use conservative 15% tightening.
         # Phase 0 evidence: 0.70 multiplier produced overconfident P→0 outputs (Brier 0.50).
         hrrr_rmse = rmse * 0.85
+        # G4: upstream (main._derive_probability) floors rmse at the PRIMARY model's
+        # floor — when primary is HRRR<12h the floor is 1.5°F, so 1.5 * 0.85 = 1.275°F
+        # would re-tighten σ below the floor the floor was meant to enforce. When
+        # primary is GFS (long lead), the floor is 3.0°F and 3.0 * 0.85 = 2.55°F
+        # sits below HRRR's own 3.0°F floor at that lead. Re-apply the HRRR floor
+        # only when rmse_floor_dynamic is active (matches upstream gate, so tests
+        # that don't enable it keep original behavior).
+        from weatheredge.config import MODULES
+        if MODULES.get("rmse_floor_dynamic", False):
+            from weatheredge.bias_correction import get_rmse_floor
+            hrrr_rmse = max(hrrr_rmse, get_rmse_floor("hrrr", lead_time_hours))
         hrrr_prob = gaussian_probability(hrrr_forecast_temp, threshold, hrrr_rmse, direction)
         hrrr_prob_raw = gaussian_probability(hrrr_forecast_temp, threshold, hrrr_rmse, direction, clamp=False)
         details["hrrr_prob"] = round(hrrr_prob, 4)

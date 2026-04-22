@@ -244,7 +244,9 @@ class TestKalshiPrefixMatch:
     def test_kalshi_prefix_to_trade_execution(self, state, db_engine):
         state.paper_trader.connect_db(db_engine)
 
-        market_id = "KXHIGHDEN-26MAR30-T76"
+        # Dynamic future Kalshi ticker date so the market isn't rejected as past
+        _kalshi_date = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
+        market_id = f"KXHIGHDEN-{_kalshi_date}-T76"
         # Clear any cached metadata to force prefix matching
         state.market_metadata.pop(market_id, None)
 

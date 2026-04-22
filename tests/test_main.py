@@ -2591,7 +2591,9 @@ class TestBuildOpportunityEdgePaths:
     def test_kalshi_b_prefix_threshold_parsed(self):
         """'B76' suffix on Kalshi contract ID parses threshold=76 (lines 816-817)."""
         state = self._make_state()
-        market_id = "KXHIGHDEN-26MAR30-B76"
+        # Dynamic future Kalshi ticker date so the market isn't rejected as past
+        _kalshi_date = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
+        market_id = f"KXHIGHDEN-{_kalshi_date}-B76"
         forecasts = self._base_forecasts("KDEN")
 
         with _patch_state(state):

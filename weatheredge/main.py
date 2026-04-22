@@ -1974,6 +1974,24 @@ def _build_opportunity(
                     direction = "below"
             except ValueError:
                 pass
+        # CCG-bughunt2: parse date from Kalshi event ticker (e.g. "26MAR30" → "2026-03-30")
+        # so F4 strict forecast lookup can match. Without this, every Kalshi market
+        # resolved via prefix-match (no parsed metadata) silently drops its forecast.
+        if len(parts) >= 2:
+            date_token = parts[1].upper()
+            if len(date_token) == 7:
+                _KALSHI_MONTHS = {
+                    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+                }
+                try:
+                    yy = int(date_token[:2])
+                    mon = _KALSHI_MONTHS.get(date_token[2:5])
+                    dd = int(date_token[5:7])
+                    if mon is not None and 1 <= dd <= 31:
+                        market_date = f"{2000 + yy:04d}-{mon:02d}-{dd:02d}"
+                except ValueError:
+                    pass
 
     # --- Look up forecast for the specific market date ---
     forecast = _get_forecast_for_date(forecasts, station, market_date)
