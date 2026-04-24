@@ -329,6 +329,29 @@ def test_store_market_metadata_infers_fields_from_kalshi_ticker(scanner, engine)
         assert payload.get("direction") == "below"
 
 
+def test_store_market_metadata_parses_kalshi_bucket_title(scanner, engine):
+    market_id = "KXHIGHNY-26APR23-B72.5"
+    market_data = {
+        "platform": "kalshi",
+        "market_id": market_id,
+        "ticker": "KXHIGHNY",
+        "title": "Will the **high temp in NYC** be 72-73° on Apr 23, 2026?",
+        "resolution_source": {"station": "KNYC", "type": "daily_high", "source": "NWS CLI"},
+    }
+    processed = scanner.process_market(market_data, "kalshi")
+
+    with get_session(engine=engine) as session:
+        scanner.store_market_metadata(session, market_id, processed)
+
+    with get_session(engine=engine) as session:
+        row = session.get(Market, market_id)
+        assert row is not None
+        assert row.threshold_low == pytest.approx(71.5)
+        assert row.threshold_high == pytest.approx(73.5)
+        payload = json.loads(row.resolution_source or "{}")
+        assert payload.get("direction") == "above"
+
+
 # ---------------------------------------------------------------------------
 # scan_polymarket — mock pmxt.Polymarket
 # ---------------------------------------------------------------------------

@@ -27,6 +27,9 @@ MODEL_CONF_FLOOR: float = 0.70            # Exit 2: below this = low confidence
 TIME_PROFIT_HOURS: float = 3.0            # Exit 3: take profit inside 3h
 TIME_PROFIT_MIN_PNL: float = 0.05         # Exit 3: profit threshold for 3h window
 TIME_FORCE_EXIT_HOURS: float = 1.0        # Exit 3: force-close inside 1h
+MARKET_AGAINST_BUY_NO_YES_PRICE: float = 0.95
+MARKET_AGAINST_BUY_YES_PRICE: float = 0.05
+BELOW_MARKET_INTRADAY_YES_PRICE: float = 0.80
 
 
 class ExitManager:
@@ -131,6 +134,33 @@ class ExitManager:
 
         from weatheredge.config import MODULES
 
+        # Same-day "below" markets can become dangerous before final resolution:
+        # if observed high is still below threshold and the tradable market is
+        # already strongly YES, a buy_no is fighting both tape and live weather.
+        if (
+            MODULES.get("exit_edge_flip", True)
+            and side == "buy_no"
+            and getattr(opp, "direction", "") == "below"
+            and getattr(opp, "market_type", "daily_high") == "daily_high"
+            and current_price >= BELOW_MARKET_INTRADAY_YES_PRICE
+            and getattr(opp, "metar_daily_high", None) is not None
+            and getattr(opp, "threshold", None) is not None
+            and opp.metar_daily_high < opp.threshold
+            and lead_time_hours is not None
+            and lead_time_hours <= 12.0
+        ):
+            log.info(
+                "EXIT edge_stop: market=%s below-market intraday stop "
+                "(YES=%.3f >= %.2f, daily_high=%.1f < threshold=%.1f, lead=%.1fh) → selling",
+                market_id,
+                current_price,
+                BELOW_MARKET_INTRADAY_YES_PRICE,
+                opp.metar_daily_high,
+                opp.threshold,
+                lead_time_hours,
+            )
+            return "edge_stop"
+
         # ================================================================
         # EXIT 1: EV-Based Exit (Phase 1 primary decision rule)
         # STEP 2: moved before edge_flip. With EV at check #1, closes that
@@ -196,6 +226,29 @@ class ExitManager:
                 "exit_manager: market=%s pnl=%.1f%% but model_confidence=%.1f%% >= %.0f%% → holding dip",
                 market_id, pnl_pct * 100, model_confidence * 100, MODEL_CONF_FLOOR * 100,
             )
+
+        # ================================================================
+        # EXIT 2b: Market-consensus kill switch
+        # If the tradable market has moved to the tails against our side, the
+        # position is functionally invalidated even if our model still reports
+        # stale edge. Keep this after capital_protect so phases that explicitly
+        # enable P&L stops retain their more specific exit reason.
+        # ================================================================
+        if MODULES.get("exit_edge_flip", True):
+            if side == "buy_no" and current_price >= MARKET_AGAINST_BUY_NO_YES_PRICE:
+                log.info(
+                    "EXIT edge_stop: market=%s market consensus against buy_no "
+                    "(YES=%.3f >= %.2f) → selling",
+                    market_id, current_price, MARKET_AGAINST_BUY_NO_YES_PRICE,
+                )
+                return "edge_stop"
+            if side == "buy_yes" and current_price <= MARKET_AGAINST_BUY_YES_PRICE:
+                log.info(
+                    "EXIT edge_stop: market=%s market consensus against buy_yes "
+                    "(YES=%.3f <= %.2f) → selling",
+                    market_id, current_price, MARKET_AGAINST_BUY_YES_PRICE,
+                )
+                return "edge_stop"
 
         # ================================================================
         # EXIT 3: Time-Decay Exit

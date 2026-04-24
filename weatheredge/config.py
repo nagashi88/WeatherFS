@@ -235,6 +235,9 @@ class Settings(BaseSettings):
     yes_guard_rail_max_prob: float = 0.70  # Above this → HARD BLOCK
     yes_guard_rail_haircut_prob: float = 0.50  # Above this (and ≤ max_prob) → size × haircut_multiplier
     yes_guard_rail_haircut_multiplier: float = 0.15  # Kelly haircut for gray zone (0.50 < p ≤ 0.70)
+    daily_low_entry_enabled: bool = False  # Disabled until forecasts store true daily minimums
+    qualitative_caution_guard_enabled: bool = True
+    qualitative_caution_haircut_multiplier: float = 0.50
 
     # Learning
     weight_update_interval_trades: int = 50

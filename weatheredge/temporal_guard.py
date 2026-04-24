@@ -59,6 +59,13 @@ MAX_PRICE_STALENESS = timedelta(minutes=0)
 # ---------------------------------------------------------------------------
 
 
+def _as_utc_aware(ts: datetime) -> datetime:
+    """Normalize SQLite-naive datetimes to UTC-aware for safe comparisons."""
+    if ts.tzinfo is None or ts.tzinfo.utcoffset(ts) is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
 def assert_no_lookahead(
     forecast_timestamp: datetime,
     market_price_timestamp: datetime,
@@ -95,6 +102,9 @@ def assert_no_lookahead(
         TemporalLeakageError: If any of the three ordering rules is violated.
     """
     src = f"({forecast_source})" if forecast_source else ""
+    forecast_timestamp = _as_utc_aware(forecast_timestamp)
+    market_price_timestamp = _as_utc_aware(market_price_timestamp)
+    trade_decision_timestamp = _as_utc_aware(trade_decision_timestamp)
 
     # Rule 1: forecast must not be newer than the price being traded at.
     if forecast_timestamp > market_price_timestamp:

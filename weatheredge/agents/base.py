@@ -31,6 +31,9 @@ class TradeOrder:
     raw_model_prob: float | None = None  # Pre-clamp blended; None = not available (legacy/fallback)
     order_type: str = "market"
     cash_capped: bool = False  # PortfolioManager sets True when amount was reduced to fit cash
+    forecast_timestamp: datetime | None = None
+    market_price_timestamp: datetime | None = None
+    signal_ids: list[int] = field(default_factory=list)
 
 @dataclass
 class MarketOpportunity:
@@ -45,6 +48,7 @@ class MarketOpportunity:
     model_probability: float  # Our estimated probability
     net_edge: float  # model_prob - market_price - fees (YES side)
     net_edge_no: float = 0.0  # (1-model_prob) - (1-market_price) - fees (NO side)
+    market_type: str = "daily_high"
     market_date: str = ""  # YYYY-MM-DD resolution date for date-exposure cap
     ensemble_temps: list[float] | None = None  # 31 ensemble member values
     forecast_temp: float = 0.0
@@ -63,7 +67,12 @@ class MarketOpportunity:
     # YES resolution physically impossible — exit_manager uses this to force close buy_yes.
     bucket_invalidated_for_yes: bool = False
     bucket_metar_high: float | None = None  # Observed daily_high °F when invalidation detected
+    metar_daily_high: float | None = None
+    metar_daily_low: float | None = None
     # Per-market price freshness: timestamp of the price row used to build this
     # opportunity. Used by the per-market freshness gate so an illiquid market
     # with a stale row is skipped even when the global newest-row age is fresh.
     market_price_timestamp: datetime | None = None
+    # Forecast row timestamp used for this decision. Execution must prove this
+    # timestamp is not newer than the market price snapshot being traded.
+    forecast_timestamp: datetime | None = None

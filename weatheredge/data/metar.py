@@ -330,5 +330,26 @@ class CurrentConditionsTracker:
             )
             return 0.99
 
+        elif market_type == "daily_low" and direction == "above":
+            # Daily low is monotone non-increasing. Once it falls below the
+            # threshold, an "above" low-temperature market cannot recover.
+            if tracker.daily_low_f < threshold:
+                log.info(
+                    "METAR OVERRIDE %s: daily low %.1f°F < threshold %.1f°F → above-low is 0.01",
+                    station, tracker.daily_low_f, threshold,
+                )
+                return 0.01
+            return None
+
+        elif market_type == "daily_low" and direction == "below":
+            # YES is already locked once the observed daily low breaches the threshold.
+            if tracker.daily_low_f < threshold:
+                log.info(
+                    "METAR OVERRIDE %s: daily low %.1f°F < threshold %.1f°F → below-low is 0.99",
+                    station, tracker.daily_low_f, threshold,
+                )
+                return 0.99
+            return None
+
         # No decisive override for other market types
         return None

@@ -26,6 +26,7 @@ from weatheredge.data import market_parser as mp_module
 from weatheredge.data.market_parser import (
     ParsedMarket,
     get_parse_failure_stats,
+    parse_kalshi_temperature_title,
     parse_polymarket_title,
     reset_parse_history_for_tests,
 )
@@ -75,6 +76,32 @@ def test_parse_bucket():
     assert result.threshold_low == 50.0
     assert result.threshold_high == 51.0
     assert result.threshold is None
+
+
+def test_parse_kalshi_bucket_title_uses_half_degree_band():
+    result = parse_kalshi_temperature_title(
+        "Will the **high temp in NYC** be 72-73° on Apr 23, 2026?"
+    )
+
+    assert result is not None
+    assert result.station == "KNYC"
+    assert result.date == "2026-04-23"
+    assert result.market_type == "daily_high"
+    assert result.threshold_low == 71.5
+    assert result.threshold_high == 73.5
+    assert result.threshold is None
+
+
+def test_parse_kalshi_below_title_stays_one_sided():
+    result = parse_kalshi_temperature_title(
+        "Will Denver's high temperature on March 30 be 76.5°F or below?"
+    )
+
+    assert result is not None
+    assert result.station == "KDEN"
+    assert result.date == "2026-03-30"
+    assert result.threshold == 76.5
+    assert result.direction == "below"
 
 
 # ---------------------------------------------------------------------------

@@ -80,7 +80,9 @@ def main():
 
     # Activate phase
     log.info("WeatherEdge starting in: %s", phase)
-    modules = activate_phase(phase)
+    # Starting an already-selected phase should not rewrite activated_at.
+    # Only an explicit --phase switch marks a new phase activation on disk.
+    modules = activate_phase(phase, persist=bool(args.phase))
 
     on_count = sum(1 for v in modules.values() if v)
     log.info("Modules: %d ON, %d OFF", on_count, len(modules) - on_count)

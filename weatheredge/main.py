@@ -18,6 +18,7 @@ import threading
 import time
 from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
+from numbers import Real
 from pathlib import Path
 
 import aiohttp
@@ -25,7 +26,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from weatheredge.config import Settings, MODULES, BURST_EDGE_DISCOUNT, BURST_WINDOW_MINUTES
 from weatheredge.data.actuals import fetch_daily_max_actual, store_actual_temperatures
-from weatheredge.data.market import MarketScanner, RESOLUTION_SOURCES
+from weatheredge.data.market import (
+    MarketScanner,
+    RESOLUTION_SOURCES,
+    _kalshi_bucket_bounds_from_ticker,
+    _title_is_one_sided_below,
+)
 from weatheredge.data.noaa import fetch_noaa_forecast, store_noaa_forecast
 from weatheredge.data.weather import fetch_forecast, fetch_ensemble, fetch_ecmwf, store_forecast
 from weatheredge.db.database import get_session, init_db
@@ -99,6 +105,16 @@ def _first_not_none(*values):
         if value is not None:
             return value
     return None
+
+
+def _observed_temp_or_none(value: object) -> float | None:
+    """Return a real METAR temperature, ignoring mocks/sentinels/non-finite values."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    temp = float(value)
+    if temp != temp:
+        return None
+    return temp
 
 
 def should_evaluate_market(volume: float, spread_pct: float) -> tuple[bool, str]:
@@ -515,12 +531,14 @@ def _bootstrap_phase2_drift_entries(state: AppState) -> None:
 def _startup_bootstrap_cycle(run_decision_loop_once: bool = True) -> None:
     """Prime DB state immediately at startup before waiting for interval jobs.
 
-    Runs market and forecast fetch once so phase-matrix profiles do not remain
-    empty until the first scheduler tick. Optionally runs one decision cycle.
+    Runs forecast and market fetch once so phase-matrix profiles do not remain
+    empty until the first scheduler tick. Market fetch intentionally runs after
+    forecast fetch: the temporal guard requires the traded price snapshot to be
+    at least as new as the forecast snapshot used for the decision.
     """
     steps = [
-        ("fetch_market_data", fetch_market_data),
         ("fetch_forecast_data", fetch_forecast_data),
+        ("fetch_market_data", fetch_market_data),
     ]
     if run_decision_loop_once:
         steps.append(("run_decision_loop", run_decision_loop))
@@ -1091,8 +1109,44 @@ def _run_decision_cycle(state: AppState) -> None:
 
         market_signals: list[Signal] = []
 
+        # Baseline mode: phase config says agent_voting=False, so do not run
+        # agent consensus. Trade only the blended model edge against a fixed
+        # threshold, then let PortfolioManager handle sizing/risk.
+        if not MODULES.get("agent_voting", False):
+            min_edge = float(getattr(state.settings, "min_edge_percent", 10.0)) / 100.0
+            if opp.net_edge >= opp.net_edge_no:
+                baseline_side = "buy_yes"
+                baseline_edge = opp.net_edge
+            else:
+                baseline_side = "buy_no"
+                baseline_edge = opp.net_edge_no
+            if baseline_edge >= min_edge:
+                market_signals.append(Signal(
+                    market_id=market_id,
+                    side=baseline_side,
+                    confidence=1.0,
+                    agent_name="Baseline",
+                    reasoning=f"Blended edge {baseline_edge:.2f} >= fixed gate {min_edge:.2f}",
+                ))
+                if state.settings.enable_conservative_agent:
+                    try:
+                        market_signals.append(conservative_strategy(opp, state.settings))
+                    except Exception as exc:
+                        log.warning("baseline conservative guard failed for %s: %s", market_id, exc)
+                if getattr(state.settings, "qualitative_caution_guard_enabled", True):
+                    try:
+                        qual_signal = state.rules_qualitative_engine.analyze(
+                            opp,
+                            conditions_tracker=state.conditions_tracker,
+                            calibration_tracker=state.calibration_tracker,
+                        )
+                        llm_calls += 1
+                        market_signals.append(qual_signal)
+                    except Exception as exc:
+                        log.warning("baseline qualitative guard failed for %s: %s", market_id, exc)
+
         # Conservative strategy
-        if state.settings.enable_conservative_agent:
+        if MODULES.get("agent_voting", False) and state.settings.enable_conservative_agent:
             try:
                 sig = conservative_strategy(opp, state.settings)
                 market_signals.append(sig)
@@ -1100,7 +1154,7 @@ def _run_decision_cycle(state: AppState) -> None:
                 log.warning("conservative_strategy failed for %s: %s", market_id, exc)
 
         # Aggressive strategy — pass same-city opportunities as bucket markets for laddering
-        if state.settings.enable_aggressive_agent:
+        if MODULES.get("agent_voting", False) and state.settings.enable_aggressive_agent:
             try:
                 _bucket_markets = [o for o in _opps_by_city.get(opp.city, []) if o.market_id != market_id]
                 sigs = aggressive_strategy(opp, _bucket_markets, state.settings)
@@ -1125,15 +1179,16 @@ def _run_decision_cycle(state: AppState) -> None:
                 log.warning("mean_reversion_strategy failed for %s: %s", market_id, exc)
 
         # Sell NO strategy (v2): buy NO on overpriced YES brackets
-        try:
-            sig = sell_no_strategy(opp, state.settings)
-            if sig.side != "no_trade":
-                market_signals.append(sig)
-        except Exception as exc:
-            log.warning("sell_no_strategy failed for %s: %s", market_id, exc)
+        if MODULES.get("agent_voting", False):
+            try:
+                sig = sell_no_strategy(opp, state.settings)
+                if sig.side != "no_trade":
+                    market_signals.append(sig)
+            except Exception as exc:
+                log.warning("sell_no_strategy failed for %s: %s", market_id, exc)
 
         # TimesFM Quantile Tail strategy (Phase 6)
-        if getattr(state.settings, 'enable_timesfm_agent', False) and state.timesfm_forecaster is not None:
+        if MODULES.get("agent_voting", False) and getattr(state.settings, 'enable_timesfm_agent', False) and state.timesfm_forecaster is not None:
             try:
                 from weatheredge.agents.strategies.timesfm_quantile import timesfm_quantile_strategy
                 sig = timesfm_quantile_strategy(opp, state.settings)
@@ -1144,20 +1199,21 @@ def _run_decision_cycle(state: AppState) -> None:
 
         # Qualitative analysis — rules engine (deterministic, no LLM)
         # Only run for markets with meaningful edge to avoid noise
-        try:
-            if max(opp.net_edge, opp.net_edge_no) >= LLM_EDGE_THRESHOLD:
-                qual_signal = state.rules_qualitative_engine.analyze(
-                    opp,
-                    conditions_tracker=state.conditions_tracker,
-                    calibration_tracker=state.calibration_tracker,
-                )
-                llm_calls += 1  # counter kept for logging compatibility
-                if qual_signal.side != "no_trade":
-                    market_signals.append(qual_signal)
-            else:
-                llm_skipped += 1
-        except Exception as exc:
-            log.warning("rules_qualitative_engine failed for %s: %s", market_id, exc)
+        if MODULES.get("agent_qualitative", False):
+            try:
+                if max(opp.net_edge, opp.net_edge_no) >= LLM_EDGE_THRESHOLD:
+                    qual_signal = state.rules_qualitative_engine.analyze(
+                        opp,
+                        conditions_tracker=state.conditions_tracker,
+                        calibration_tracker=state.calibration_tracker,
+                    )
+                    llm_calls += 1  # counter kept for logging compatibility
+                    if qual_signal.side != "no_trade":
+                        market_signals.append(qual_signal)
+                else:
+                    llm_skipped += 1
+            except Exception as exc:
+                log.warning("rules_qualitative_engine failed for %s: %s", market_id, exc)
 
         # LLM qualitative agent available as offline fallback (not called in hot loop)
         # To enable: state.qualitative_agent.analyze(opp) — kept for weekly learning/reporting
@@ -1266,6 +1322,8 @@ def _run_decision_cycle(state: AppState) -> None:
             total_pnl=total_pnl,
             recent_fills=_recent_fills,
         )
+        for _order in trade_orders:
+            _order.signal_ids = list(_signal_ids_by_market.get(_order.market_id, []))
     except Exception as exc:
         log.error("run_decision_loop: portfolio_manager failed: %s", exc, exc_info=True)
         trade_orders = []
@@ -1333,6 +1391,9 @@ def _run_decision_cycle(state: AppState) -> None:
                 blended_prob=trade_order.blended_prob,
                 raw_model_prob=trade_order.raw_model_prob,
                 order_type=trade_order.order_type,
+                forecast_timestamp=trade_order.forecast_timestamp,
+                market_price_timestamp=trade_order.market_price_timestamp,
+                signal_ids=trade_order.signal_ids,
                 cash_capped=trade_order.cash_capped,
             )
             result = state.paper_trader.place_order(order)
@@ -1391,6 +1452,16 @@ def _run_decision_cycle(state: AppState) -> None:
                     except Exception as exc:
                         log.debug(
                             "run_decision_loop: signal back-link failed for %s: %s",
+                            trade_order.market_id, exc,
+                        )
+                elif pending:
+                    try:
+                        _db_id = int(result.get("db_id", 0) or 0)
+                        if _db_id and trade_order.signal_ids:
+                            _link_signals_to_trade(_db_id, trade_order.signal_ids)
+                    except Exception as exc:
+                        log.debug(
+                            "run_decision_loop: pending signal back-link failed for %s: %s",
                             trade_order.market_id, exc,
                         )
             else:
@@ -1964,14 +2035,16 @@ def _build_opportunity(
             if bucket_high is not None:
                 bucket_high = _c_to_f(bucket_high)
     else:
-        # Kalshi markets: extract threshold from market_id if possible
-        # e.g. KXHIGHDEN-26MAR30-T76 → threshold=76, KXHIGHDEN-26MAR30-B76.5 → threshold=76.5
+        # Kalshi markets: extract threshold/bucket from market_id if possible.
+        # T76 is a one-sided threshold; B76.5 is a displayed bucket (76-77°),
+        # not "below 76.5", unless the title explicitly says "or below".
         threshold = 70.0
         direction = "above"
         market_type = resolution_source.get("type", "daily_high")
         market_date = None
         bucket_low = None
         bucket_high = None
+        title_is_below = _title_is_one_sided_below(metadata.get("title") if metadata else None)
         # Try to parse Kalshi contract-level threshold from market_id
         parts = market_id.split("-")
         if len(parts) >= 3:
@@ -1980,8 +2053,15 @@ def _build_opportunity(
                 if tail.startswith("T"):
                     threshold = float(tail[1:])
                 elif tail.startswith("B"):
-                    threshold = float(tail[1:])
-                    direction = "below"
+                    if title_is_below:
+                        threshold = float(tail[1:])
+                        direction = "below"
+                    else:
+                        bounds = _kalshi_bucket_bounds_from_ticker(market_id)
+                        if bounds is not None:
+                            bucket_low, bucket_high = bounds
+                            threshold = (bucket_low + bucket_high) / 2.0
+                            direction = "above"
             except ValueError:
                 pass
         # CCG-bughunt2: parse date from Kalshi event ticker (e.g. "26MAR30" → "2026-03-30")
@@ -2155,7 +2235,13 @@ def _build_opportunity(
                     ))
                 except Exception as _tg_exc:
                     log.warning("contradiction telegram alert failed: %s", _tg_exc)
-                return None
+                if not allow_extreme_price:
+                    return None
+                log.warning(
+                    "METAR-FORECAST CONTRADICTION %s: keeping exit-side opportunity "
+                    "so open positions can be evaluated",
+                    market_id,
+                )
         except Exception as _exc:
             log.warning("_build_opportunity: contradiction check failed for %s: %s", market_id, _exc)
 
@@ -2167,6 +2253,21 @@ def _build_opportunity(
     # Structural invalidation flag: METAR shows daily_high > bucket_high → YES impossible.
     _bucket_invalidated_for_yes: bool = False
     _bucket_metar_high: float | None = None
+    _metar_daily_high: float | None = None
+    _metar_daily_low: float | None = None
+    if (
+        state.conditions_tracker is not None
+        and market_date is not None
+        and market_date == station_local_today_str(station)
+    ):
+        tracker = state.conditions_tracker.get_tracker(station)
+        if tracker is not None:
+            observed_high = _observed_temp_or_none(getattr(tracker, "daily_high_f", None))
+            observed_low = _observed_temp_or_none(getattr(tracker, "daily_low_f", None))
+            if observed_high is not None and observed_high > -900.0:
+                _metar_daily_high = observed_high
+            if observed_low is not None and observed_low < 900.0:
+                _metar_daily_low = observed_low
 
     # BugFix C6: Use bucket_probability for bucket markets instead of midpoint "above"
     if bucket_low is not None and bucket_high is not None:
@@ -2217,23 +2318,25 @@ def _build_opportunity(
             if (
                 state.conditions_tracker is not None
                 and market_date is not None
-                and market_type == "daily_high"
+                and market_type in {"daily_high", "daily_low"}
                 and market_date == station_local_today_str(station)
             ):
                 tracker = state.conditions_tracker.get_tracker(station)
-                if (
-                    tracker is not None
-                    and tracker.daily_high_f > -900.0
-                ):
-                    metar_high = tracker.daily_high_f
-                    # Bucket semantics are upper-exclusive at settlement
-                    # (see _determine_market_outcome: `low <= actual < high`).
-                    # Using `<=` on both bounds here would boost YES for
-                    # metar_high == bucket_high while settlement resolves that
-                    # exact value as NO — a systematic YES-bias at the
-                    # boundary. Match settlement: in-range uses `<` on high,
-                    # invalidation uses `>=`.
-                    if bucket_low <= metar_high < bucket_high:
+                if tracker is not None:
+                    observed_value: float | None = None
+                    invalidated = False
+                    observed_high = _observed_temp_or_none(getattr(tracker, "daily_high_f", None))
+                    observed_low = _observed_temp_or_none(getattr(tracker, "daily_low_f", None))
+                    if market_type == "daily_high" and observed_high is not None and observed_high > -900.0:
+                        observed_value = observed_high
+                        invalidated = observed_value >= bucket_high
+                    elif market_type == "daily_low" and observed_low is not None and observed_low < 900.0:
+                        observed_value = observed_low
+                        invalidated = observed_value < bucket_low
+
+                    if observed_value is None:
+                        pass
+                    elif bucket_low <= observed_value < bucket_high:
                         # CCG-bug-7: running max inside the bucket is NOT a
                         # YES signal — temp can still climb past bucket_high
                         # before close. Trade #28 lost $2.85 because this
@@ -2244,35 +2347,34 @@ def _build_opportunity(
                         if _hrs_to_close is not None and _hrs_to_close <= 2.0:
                             adjusted = max(probability, 0.85)
                             log.info(
-                                "BUCKET METAR override %s: observed daily high %.1f in [%.0f,%.0f) "
+                                "BUCKET METAR override %s: observed %s %.1f in [%.0f,%.0f) "
                                 "hrs_to_close=%.1f → prob %.2f→%.2f",
-                                market_id, metar_high, bucket_low, bucket_high,
+                                market_id, market_type, observed_value, bucket_low, bucket_high,
                                 _hrs_to_close, probability, adjusted,
                             )
                             probability = adjusted
                             model_used = "metar_bucket_in_range_near_close"
                         else:
                             log.debug(
-                                "BUCKET METAR in-range (day open): %s obs_high=%.1f "
+                                "BUCKET METAR in-range (day open): %s %s=%.1f "
                                 "in [%.0f,%.0f) hrs_to_close=%s — NOT overriding "
                                 "(running max can still exit bucket)",
-                                market_id, metar_high, bucket_low, bucket_high,
+                                market_id, market_type, observed_value, bucket_low, bucket_high,
                                 f"{_hrs_to_close:.1f}" if _hrs_to_close is not None else "?",
                             )
-                    elif metar_high >= bucket_high:
-                        # Already past the bucket — daily max can only stay or climb.
+                    elif invalidated:
+                        # Daily high can only stay/climb above a high bucket;
+                        # daily low can only stay/fall below a low bucket.
                         adjusted = min(probability, 0.05)
                         log.info(
-                            "BUCKET METAR override %s: observed daily high %.1f > bucket_high %.0f → prob %.2f→%.2f",
-                            market_id, metar_high, bucket_high, probability, adjusted,
+                            "BUCKET METAR override %s: observed %s %.1f outside [%.0f,%.0f) → prob %.2f→%.2f",
+                            market_id, market_type, observed_value, bucket_low, bucket_high, probability, adjusted,
                         )
                         probability = adjusted
                         model_used = "metar_bucket_exceeded"
-                        # Structural kill: YES is now physically impossible. Exit manager
-                        # consumes this flag to close open buy_yes positions regardless of
-                        # price (edge/EV rules can't catch it when market≈0 and model≈0).
+                        # Structural kill: YES is now physically impossible.
                         _bucket_invalidated_for_yes = True
-                        _bucket_metar_high = metar_high
+                        _bucket_metar_high = observed_value
         except Exception as exc:
             log.warning("_build_opportunity: bucket_probability failed for %s: %s", market_id, exc)
             return None
@@ -2489,6 +2591,7 @@ def _build_opportunity(
         model_probability=probability,
         net_edge=net_edge,
         net_edge_no=net_edge_no,
+        market_type=market_type,
         market_date=market_date or "",
         volume=price_data.get("volume"),
         ensemble_temps=ensemble_members,
@@ -2505,7 +2608,10 @@ def _build_opportunity(
         bucket_high=bucket_high,
         bucket_invalidated_for_yes=_bucket_invalidated_for_yes,
         bucket_metar_high=_bucket_metar_high,
+        metar_daily_high=_metar_daily_high,
+        metar_daily_low=_metar_daily_low,
         market_price_timestamp=price_data.get("timestamp"),
+        forecast_timestamp=forecast.get("forecast_timestamp"),
     )
 
 
@@ -3011,6 +3117,23 @@ def _pnl_by_lead_time(trades: list) -> dict[str, dict[str, float]]:
     return buckets
 
 
+def _phase_activated_since_for_db() -> datetime | None:
+    """Return current phase activation timestamp normalized for SQLite DateTime."""
+    try:
+        from weatheredge.phase_config import get_phase_activated_at
+
+        activated_at = get_phase_activated_at()
+        if not activated_at:
+            return None
+        parsed = datetime.fromisoformat(str(activated_at).replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except Exception as exc:
+        log.warning("phase gate: could not parse activated_at: %s", exc)
+        return None
+
+
 def check_phase1_gate() -> bool:
     """Phase 1 gate: 40+ trades, calibration gap < 15%, Baseline B profitable."""
     _CALIBRATION_GAP_MAX = 0.15
@@ -3019,16 +3142,29 @@ def check_phase1_gate() -> bool:
 
     try:
         with get_session() as session:
-            from sqlalchemy import select
-            from weatheredge.db.models import Trade
+            from sqlalchemy import select, func
+            from weatheredge.db.models import Trade, LeakageViolation
             from weatheredge.learning.calibration import compute_reliability_data
 
-            closed_trades = session.execute(
-                select(Trade).where(Trade.status.in_(closed_statuses))
-            ).scalars().all()
+            phase_since = _phase_activated_since_for_db()
+            closed_stmt = select(Trade).where(
+                Trade.mode == "paper",
+                Trade.status.in_(closed_statuses),
+            )
+            leakage_stmt = select(func.count(LeakageViolation.id))
+            if phase_since is not None:
+                closed_stmt = closed_stmt.where(Trade.created_at >= phase_since)
+                leakage_stmt = leakage_stmt.where(LeakageViolation.violated_at >= phase_since)
+
+            closed_trades = session.execute(closed_stmt).scalars().all()
+            leakage_count = int(session.execute(leakage_stmt).scalar_one())
 
             if len(closed_trades) < 40:
                 log.warning("Phase 1 gate: only %d trades, need 40+", len(closed_trades))
+                return False
+
+            if leakage_count > 0:
+                log.error("Phase 1 FAILED: temporal leakage violations=%d after phase activation", leakage_count)
                 return False
 
             records: list[dict[str, float | int]] = []

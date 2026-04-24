@@ -39,6 +39,10 @@ def make_opp(
     bucket_invalidated_for_yes: bool = False,
     bucket_metar_high: float | None = None,
     bucket_high: float | None = None,
+    direction: str = "above",
+    market_type: str = "daily_high",
+    threshold: float = 75.0,
+    metar_daily_high: float | None = None,
 ) -> MagicMock:
     """Return a mock MarketOpportunity with the attributes ExitManager reads."""
     opp = MagicMock()
@@ -47,6 +51,10 @@ def make_opp(
     opp.bucket_invalidated_for_yes = bucket_invalidated_for_yes
     opp.bucket_metar_high = bucket_metar_high
     opp.bucket_high = bucket_high
+    opp.direction = direction
+    opp.market_type = market_type
+    opp.threshold = threshold
+    opp.metar_daily_high = metar_daily_high
     return opp
 
 
@@ -86,6 +94,107 @@ def test_constants_have_expected_values():
     assert TIME_PROFIT_HOURS == pytest.approx(3.0)
     assert TIME_PROFIT_MIN_PNL == pytest.approx(0.05)
     assert TIME_FORCE_EXIT_HOURS == pytest.approx(1.0)
+
+
+def test_market_consensus_stop_closes_buy_no_loser(mgr):
+    import weatheredge.config as cfg
+
+    original = cfg.MODULES.get("exit_pnl_stoploss", False)
+    cfg.MODULES["exit_pnl_stoploss"] = False
+    try:
+        pos = make_pos(side="buy_no", price=0.35, cost=35.0)
+        opp = make_opp(model_probability=0.10, market_price=0.95)
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    finally:
+        cfg.MODULES["exit_pnl_stoploss"] = original
+
+    assert reason == "edge_stop"
+
+
+def test_market_consensus_stop_closes_buy_yes_loser(mgr):
+    import weatheredge.config as cfg
+
+    original = cfg.MODULES.get("exit_pnl_stoploss", False)
+    cfg.MODULES["exit_pnl_stoploss"] = False
+    try:
+        pos = make_pos(side="buy_yes", price=0.35, cost=35.0)
+        opp = make_opp(model_probability=0.90, market_price=0.05)
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    finally:
+        cfg.MODULES["exit_pnl_stoploss"] = original
+
+    assert reason == "edge_stop"
+
+
+def test_below_market_intraday_stop_closes_buy_no_before_tail_loss(mgr):
+    pos = make_pos(
+        market_id="BELOW-MKT",
+        side="buy_no",
+        price=0.44,
+        amount=10.0,
+        cost=5.60,
+    )
+    pos["station"] = "KNYC"
+    pos["market_date"] = "2099-01-01"
+    opp = make_opp(
+        model_probability=0.40,
+        market_price=0.85,
+        direction="below",
+        threshold=66.5,
+        metar_daily_high=64.9,
+    )
+
+    with patch("weatheredge.execution.exit_manager.hours_until_market_close", return_value=8.0):
+        reason = mgr._check_position(pos, {"BELOW-MKT": opp}, {})
+
+    assert reason == "edge_stop"
+
+
+def test_below_market_intraday_stop_waits_when_observed_high_breached_threshold(mgr):
+    import weatheredge.config as cfg
+
+    pos = make_pos(
+        market_id="BELOW-MKT",
+        side="buy_no",
+        price=0.44,
+        amount=10.0,
+        cost=5.60,
+        edge_at_entry=0.40,
+    )
+    pos["station"] = "KNYC"
+    pos["market_date"] = "2099-01-01"
+    opp = make_opp(
+        model_probability=0.40,
+        market_price=0.85,
+        direction="below",
+        threshold=66.5,
+        metar_daily_high=67.0,
+    )
+
+    original = cfg.MODULES.get("exit_pnl_stoploss", False)
+    cfg.MODULES["exit_pnl_stoploss"] = False
+    try:
+        with patch("weatheredge.execution.exit_manager.hours_until_market_close", return_value=8.0):
+            reason = mgr._check_position(pos, {"BELOW-MKT": opp}, {})
+    finally:
+        cfg.MODULES["exit_pnl_stoploss"] = original
+
+    assert reason is None
+
+
+def test_market_consensus_stop_respects_exit_edge_flip_gate(mgr):
+    import weatheredge.config as cfg
+
+    original = cfg.MODULES.get("exit_edge_flip", True)
+    cfg.MODULES["exit_edge_flip"] = False
+    try:
+        pos = make_pos(side="buy_no", price=0.35, cost=35.0)
+        opp = make_opp(model_probability=0.10, market_price=0.95)
+        reason = mgr._check_position(pos, {"MKT-1": opp}, {})
+    finally:
+        cfg.MODULES["exit_edge_flip"] = original
+
+    assert reason != "edge_stop"
 
 
 # ---------------------------------------------------------------------------

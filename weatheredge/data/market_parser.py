@@ -281,6 +281,101 @@ def parse_polymarket_title(title: str, current_year: int | None = None) -> Parse
     return parsed
 
 
+def parse_kalshi_temperature_title(title: str, current_year: int | None = None) -> ParsedMarket | None:
+    """Parse Kalshi KXHIGH-style weather titles.
+
+    Kalshi bucket tickers such as ``B72.5`` are displayed as integer ranges
+    ("72-73°"). Model them as half-degree settlement bands, e.g. [71.5, 73.5),
+    instead of as a one-sided "below 72.5" threshold.
+    """
+    if current_year is None:
+        current_year = datetime.now().year
+
+    title_lower = title.lower()
+
+    city = None
+    station = None
+    for city_name, station_code in sorted(CITY_TO_STATION.items(), key=lambda x: -len(x[0])):
+        if re.search(r'\b' + re.escape(city_name) + r'\b', title_lower):
+            city = city_name
+            station = station_code
+            break
+    if not city or not station:
+        return None
+
+    month_map = {
+        "jan": 1, "january": 1,
+        "feb": 2, "february": 2,
+        "mar": 3, "march": 3,
+        "apr": 4, "april": 4,
+        "may": 5,
+        "jun": 6, "june": 6,
+        "jul": 7, "july": 7,
+        "aug": 8, "august": 8,
+        "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10,
+        "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+    month_pat = "|".join(sorted(month_map, key=len, reverse=True))
+    date_match = re.search(
+        rf'\b({month_pat})\.?\s+(\d{{1,2}})(?:,\s*(\d{{4}}))?',
+        title_lower,
+    )
+    if not date_match:
+        return None
+    month = month_map[date_match.group(1)]
+    day = int(date_match.group(2))
+    year = int(date_match.group(3)) if date_match.group(3) else current_year
+    date_str = f"{year:04d}-{month:02d}-{day:02d}"
+
+    market_type = "daily_low" if re.search(r'\blow\s+temp|\blow(?:est)?\s+temperature\b', title_lower) else "daily_high"
+
+    bucket_match = re.search(
+        r'be\s+(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*°',
+        title_lower,
+    )
+    if bucket_match:
+        low_display = float(bucket_match.group(1))
+        high_display = float(bucket_match.group(2))
+        return ParsedMarket(
+            city=city,
+            station=station,
+            date=date_str,
+            market_type=market_type,
+            threshold_low=low_display - 0.5,
+            threshold_high=high_display + 0.5,
+            direction="above",
+            source="parsed_from_kalshi_title",
+        )
+
+    above_match = re.search(r'(?:>|above|higher than)\s*(-?\d+(?:\.\d+)?)\s*°?', title_lower)
+    if above_match:
+        return ParsedMarket(
+            city=city,
+            station=station,
+            date=date_str,
+            market_type=market_type,
+            threshold=float(above_match.group(1)),
+            direction="above",
+            source="parsed_from_kalshi_title",
+        )
+
+    below_match = re.search(r'(-?\d+(?:\.\d+)?)\s*°?\s*(?:f)?\s+or\s+(?:below|lower)', title_lower)
+    if below_match:
+        return ParsedMarket(
+            city=city,
+            station=station,
+            date=date_str,
+            market_type=market_type,
+            threshold=float(below_match.group(1)),
+            direction="below",
+            source="parsed_from_kalshi_title",
+        )
+
+    return None
+
+
 def _parse_polymarket_title_inner(title: str, current_year: int | None = None) -> ParsedMarket | None:
     """Pure parsing logic — no observability side-effects. See public wrapper."""
     # BugFix M5: Derive current year dynamically instead of hardcoding 2026

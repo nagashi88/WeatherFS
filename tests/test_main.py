@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import weatheredge.config as cfg
 import weatheredge.main as main_module
 from weatheredge.main import (
     AppState,
@@ -1255,6 +1256,78 @@ class TestDecisionLoopDataFlow:
                         run_decision_loop()
 
         state.paper_trader.cancel_expired_orders.assert_called_once()
+
+    def test_agent_voting_off_uses_baseline_signal_with_entry_guards(self, monkeypatch):
+        """agent_voting=False uses Baseline for direction, with guard signals only."""
+        from weatheredge.agents.base import MarketOpportunity, Signal
+
+        state = _make_app_state()
+        now = datetime.now(timezone.utc)
+        opp = MarketOpportunity(
+            market_id="baseline_mkt",
+            platform="polymarket",
+            city="NYC",
+            station="KNYC",
+            threshold=70.0,
+            direction="above",
+            market_price=0.45,
+            model_probability=0.20,
+            net_edge=-0.28,
+            net_edge_no=0.22,
+            market_date="2030-05-01",
+            volume=5000.0,
+            market_price_timestamp=now,
+            forecast_timestamp=now - timedelta(minutes=10),
+        )
+        state.rules_qualitative_engine = MagicMock()
+        state.rules_qualitative_engine.analyze.return_value = Signal(
+            market_id="baseline_mkt",
+            side="no_trade",
+            confidence=0.0,
+            agent_name="Qualitative",
+        )
+        state.portfolio_manager.aggregate_signals.return_value = []
+
+        monkeypatch.setitem(cfg.MODULES, "agent_voting", False)
+        monkeypatch.setitem(cfg.MODULES, "agent_qualitative", False)
+
+        with _patch_state(state):
+            with patch.object(main_module, "_get_weather_data_age_minutes", return_value=1):
+                with patch.object(main_module, "_get_market_price_data_age_minutes", return_value=1):
+                    with patch.object(main_module, "_read_latest_forecasts", return_value={"KNYC": {}}):
+                        with patch.object(
+                            main_module,
+                            "_read_latest_market_prices",
+                            return_value={
+                                "baseline_mkt": {
+                                    "yes_price": 0.45,
+                                    "volume": 5000,
+                                    "spread": 0.02,
+                                    "timestamp": now,
+                                }
+                            },
+                        ):
+                                with patch.object(main_module, "_build_opportunity", return_value=opp):
+                                    with patch.object(main_module, "conservative_strategy") as cons:
+                                        cons.return_value = Signal(
+                                            market_id="baseline_mkt",
+                                            side="no_trade",
+                                            confidence=0.0,
+                                            agent_name="Conservative",
+                                        )
+                                        with patch.object(main_module, "aggressive_strategy") as aggr:
+                                            with patch.object(main_module, "sell_no_strategy") as sell_no:
+                                                run_decision_loop()
+
+        cons.assert_called_once()
+        aggr.assert_not_called()
+        sell_no.assert_not_called()
+        kwargs = state.portfolio_manager.aggregate_signals.call_args.kwargs
+        signals = kwargs["signals_by_market"]["baseline_mkt"]
+        by_agent = {sig.agent_name: sig for sig in signals}
+        assert by_agent["Baseline"].side == "buy_no"
+        assert by_agent["Conservative"].side == "no_trade"
+        assert by_agent["Qualitative"].side == "no_trade"
 
     def test_agent_weight_updater_triggered(self):
         """agent_weight_updater.update_agent_weights is called when should_update=True."""
@@ -2634,8 +2707,8 @@ class TestBuildOpportunityEdgePaths:
 
         assert opp is None
 
-    def test_kalshi_b_prefix_threshold_parsed(self):
-        """'B76' suffix on Kalshi contract ID parses threshold=76 (lines 816-817)."""
+    def test_kalshi_b_prefix_bucket_parsed(self):
+        """'B76' suffix on Kalshi contract ID parses as a bucket, not below."""
         state = self._make_state()
         # Dynamic future Kalshi ticker date so the market isn't rejected as past
         _kalshi_date = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
@@ -2647,6 +2720,9 @@ class TestBuildOpportunityEdgePaths:
 
         assert opp is not None
         assert opp.threshold == pytest.approx(76.0)
+        assert opp.bucket_low == pytest.approx(75.0)
+        assert opp.bucket_high == pytest.approx(77.0)
+        assert opp.direction == "above"
 
     def test_zero_fahrenheit_forecast_not_dropped_as_falsy(self):
         """0.0°F is a valid forecast and must not be treated as missing data."""
@@ -3843,7 +3919,48 @@ class TestNarrowBucketDynamicSigma:
         assert abs(opp_wide.raw_model_prob - opp_static.raw_model_prob) < 1e-6, (
             f"Wide bucket should not trigger ensemble-σ widening. "
             f"wide={opp_wide.raw_model_prob:.4f} static={opp_static.raw_model_prob:.4f}"
+            )
+
+
+def test_contradiction_keeps_exit_side_opportunity_for_open_position():
+    state = _make_app_state()
+    state.conditions_tracker = MagicMock()
+    state.conditions_tracker.metar_probability_override.return_value = 0.99
+
+    parsed = MagicMock()
+    parsed.threshold = 70.0
+    parsed.direction = "above"
+    parsed.market_type = "daily_high"
+    parsed.date = "2030-05-01"
+    parsed.threshold_low = None
+    parsed.threshold_high = None
+    state.market_metadata["MKT-CONTRA"] = {
+        "resolution_source": {"station": "KNYC", "type": "daily_high"},
+        "platform": "polymarket",
+        "parsed": parsed,
+    }
+    forecasts = {
+        "KNYC": {
+            "temperature_forecast": 70.0,
+            "ecmwf_temp": None,
+            "hrrr_temp": None,
+            "ensemble_members": None,
+            "model": "gfs",
+            "forecast_timestamp": datetime.now(timezone.utc),
+        }
+    }
+
+    with _patch_state(state), patch.object(main_module, "hours_until_market_close", return_value=6.0):
+        entry_opp = main_module._build_opportunity(
+            "MKT-CONTRA", {"yes_price": 0.95}, forecasts,
         )
+        exit_opp = main_module._build_opportunity(
+            "MKT-CONTRA", {"yes_price": 0.95}, forecasts, allow_extreme_price=True,
+        )
+
+    assert entry_opp is None
+    assert exit_opp is not None
+    assert exit_opp.market_price == 0.95
 
 
 # ---------------------------------------------------------------------------

@@ -39,11 +39,20 @@ class TestAssertNoLookahead:
         with pytest.raises(TemporalLeakageError, match="LOOKAHEAD DETECTED"):
             assert_no_lookahead(forecast_ts, market_ts, decision_ts, "gfs", "mkt-1")
 
+    def test_naive_sqlite_timestamps_are_treated_as_utc(self):
+        """SQLite returns naive datetimes; guard must compare them safely."""
+        decision_ts = _now()
+        market_ts = (decision_ts - timedelta(minutes=5)).replace(tzinfo=None)
+        forecast_ts = (decision_ts - timedelta(minutes=10)).replace(tzinfo=None)
+
+        assert_no_lookahead(forecast_ts, market_ts, decision_ts, "gfs", "mkt-1")
+
 
 class TestPlaceOrderTemporalGuard:
     """Integration tests: temporal guard in PaperTrader.place_order()."""
 
-    def test_valid_timestamps_trade_fills(self):
+    def test_valid_timestamps_trade_fills(self, monkeypatch):
+        monkeypatch.setitem(_cfg.MODULES, "temporal_guard", True)
         pt = PaperTrader(initial_bankroll=1000.0)
         order = Order(
             market_id="mkt-1",
@@ -56,7 +65,8 @@ class TestPlaceOrderTemporalGuard:
         result = pt.place_order(order)
         assert result["filled"] is True
 
-    def test_lookahead_returns_filled_false(self):
+    def test_lookahead_returns_filled_false(self, monkeypatch):
+        monkeypatch.setitem(_cfg.MODULES, "temporal_guard", True)
         pt = PaperTrader(initial_bankroll=1000.0)
         market_ts = _now() - timedelta(minutes=10)
         forecast_ts = _now() - timedelta(minutes=5)  # forecast NEWER than market
@@ -89,8 +99,9 @@ class TestPlaceOrderTemporalGuard:
         result = pt.place_order(order)
         assert result["filled"] is True
 
-    def test_no_timestamps_bypasses_guard(self):
-        """When timestamps are None, guard is skipped even if flag is on."""
+    def test_no_timestamps_rejected_when_guard_on(self, monkeypatch):
+        """Guard ON means an order must prove forecast and market-price times."""
+        monkeypatch.setitem(_cfg.MODULES, "temporal_guard", True)
         pt = PaperTrader(initial_bankroll=1000.0)
         order = Order(
             market_id="mkt-1",
@@ -99,4 +110,5 @@ class TestPlaceOrderTemporalGuard:
             amount=10.0,
         )
         result = pt.place_order(order)
-        assert result["filled"] is True
+        assert result["filled"] is False
+        assert result["reason"] == "missing_temporal_timestamps"

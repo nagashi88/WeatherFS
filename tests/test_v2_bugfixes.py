@@ -129,6 +129,24 @@ class TestBug1MetarBelowOverride:
         )
         assert result is None
 
+    def test_daily_low_above_invalidates_after_low_breaches_threshold(self):
+        tracker = self._make_tracker("KMIA", temp_f=69.0)
+
+        result = tracker.metar_probability_override(
+            "KMIA", threshold=70.0, direction="above", market_type="daily_low"
+        )
+
+        assert result == 0.01
+
+    def test_daily_low_below_locks_yes_after_low_breaches_threshold(self):
+        tracker = self._make_tracker("KMIA", temp_f=69.0)
+
+        result = tracker.metar_probability_override(
+            "KMIA", threshold=70.0, direction="below", market_type="daily_low"
+        )
+
+        assert result == 0.99
+
     def test_above_market_override_when_exceeded(self):
         """'Above' market: daily high already >= threshold -> 0.99 (Bug 1 correct case)."""
         tracker = self._make_tracker("KNYC", temp_f=76.0, high_f=76.0)

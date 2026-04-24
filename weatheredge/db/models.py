@@ -103,6 +103,7 @@ class Trade(Base):
         'ev_based'  — early exit when EV(close) > EV(hold)
         'bucket_invalidated' — early exit when METAR daily_high exceeds bucket_high
                                (YES resolution physically impossible)
+        'pending'   — limit order placed but not filled yet
         'cancelled' — unfilled order cancelled (TTL expired or kill switch)
         'abandoned' — filled position abandoned during emergency exit
     """
@@ -131,6 +132,10 @@ class Trade(Base):
     pnl: Mapped[float | None] = mapped_column(Float)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    order_type: Mapped[str | None] = mapped_column(Text, default="market")
+    limit_price: Mapped[float | None] = mapped_column(Float)
+    forecast_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    market_price_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
     # True when PortfolioManager reduced this trade's amount to fit available
     # cash (the cap path floors size to 0.01 increments). Replaces the older
     # "amount < 1.0" heuristic in daily_summary so a legitimately small

@@ -230,11 +230,11 @@ class TestKalshiIntegration:
         assert opp.city == "NYC"
 
     def test_kalshi_bracket_contract(self):
-        """Kalshi bracket contracts (B76.5) extract threshold correctly."""
+        """Kalshi bracket contracts (B76.5) become bucket ranges, not below-threshold markets."""
         state = _init()
 
         market_id = f"KXHIGHDEN-{_FUTURE_DATE_KALSHI}-B76.5"
-        price_data = {"yes_price": 0.55}
+        price_data = {"yes_price": 0.20}
         forecast_rows = _make_forecast_rows("KDEN", gfs_temp=77.0)
 
         with patch("weatheredge.main.get_session") as mock_sess:
@@ -249,6 +249,8 @@ class TestKalshiIntegration:
 
         assert opp is not None
         assert opp.threshold == 76.5
+        assert opp.bucket_low == pytest.approx(75.5)
+        assert opp.bucket_high == pytest.approx(77.5)
         assert opp.platform == "kalshi"
         assert opp.station == "KDEN"
         assert opp.city == "Denver"

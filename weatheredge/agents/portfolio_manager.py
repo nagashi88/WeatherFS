@@ -14,6 +14,7 @@ import math
 from weatheredge.agents.base import MarketOpportunity, Signal, TradeOrder
 from weatheredge.agents.risk_manager import RiskManager
 from weatheredge.config import Settings
+from weatheredge.data.station_time import hours_until_market_close
 
 log = logging.getLogger(__name__)
 
@@ -37,8 +38,36 @@ def _dedupe_agent_votes(signals: list[Signal]) -> list[Signal]:
     return list(best.values()) + no_trade_keep
 
 
+def _is_opposing_signal(signal_side: str, majority_side: str) -> bool:
+    return (
+        signal_side in {"buy_yes", "buy_no"}
+        and majority_side in {"buy_yes", "buy_no"}
+        and signal_side != majority_side
+    )
+
+
+def _is_fragile_entry_context(opp: MarketOpportunity, majority_side: str) -> bool:
+    """Contexts where disagreement should reduce size instead of being ignored."""
+    market_type = getattr(opp, "market_type", "daily_high")
+    bucket_low = getattr(opp, "bucket_low", None)
+    bucket_high = getattr(opp, "bucket_high", None)
+
+    if majority_side == "buy_yes":
+        return True
+    if market_type == "daily_low":
+        return True
+    if bucket_low is not None and bucket_high is not None and (bucket_high - bucket_low) <= 2.0:
+        return True
+    if opp.market_date and opp.station:
+        lead_hours = hours_until_market_close(opp.market_date, opp.station)
+        if lead_hours is not None and lead_hours <= 12.0:
+            return True
+    return False
+
+
 class PortfolioManager:
     AGENT_WEIGHTS: dict[str, float] = {
+        "Baseline": 1.00,
         "Conservative": 0.30,
         "Aggressive": 0.25,
         "MeanReversion": 0.05,  # Disabled by default; kept at min weight for learning loop
@@ -177,6 +206,7 @@ class PortfolioManager:
             station = opp.station if opp else ""
             platform = opp.platform if opp else ""
             market_date = opp.market_date if (opp and hasattr(opp, "market_date")) else ""
+            market_type = getattr(opp, "market_type", "daily_high") if opp else "daily_high"
             volume = opp.volume if (opp and hasattr(opp, "volume")) else None
             bucket_low = getattr(opp, "bucket_low", None) if opp else None
             bucket_high = getattr(opp, "bucket_high", None) if opp else None
@@ -184,6 +214,30 @@ class PortfolioManager:
                 opp.net_edge_no if (opp and majority_side == "buy_no")
                 else (opp.net_edge if opp else 0.0)
             )
+            caution_haircut = 1.0
+            if (
+                opp is not None
+                and getattr(self.settings, "qualitative_caution_guard_enabled", True)
+            ):
+                conservative_abstained = any(
+                    sig.agent_name == "Conservative" and sig.side == "no_trade"
+                    for sig in signals
+                )
+                qualitative_against = any(
+                    sig.agent_name == "Qualitative"
+                    and _is_opposing_signal(sig.side, majority_side)
+                    for sig in signals
+                )
+                if (
+                    conservative_abstained
+                    and qualitative_against
+                    and _is_fragile_entry_context(opp, majority_side)
+                ):
+                    caution_haircut = getattr(
+                        self.settings,
+                        "qualitative_caution_haircut_multiplier",
+                        0.50,
+                    )
             candidates.append(
                 {
                     "market_id": market_id,
@@ -194,12 +248,14 @@ class PortfolioManager:
                     "station": station,
                     "platform": platform,
                     "market_date": market_date,
+                    "market_type": market_type,
                     "volume": volume,
                     "bucket_low": bucket_low,
                     "bucket_high": bucket_high,
                     "effective_edge": effective_edge,
                     "majority_score": majority_side_score,
                     "side_margin": majority_side_score - minority_side_score,
+                    "caution_haircut": caution_haircut,
                 }
             )
 
@@ -240,10 +296,22 @@ class PortfolioManager:
             station = candidate.get("station", "")
             platform = candidate["platform"]
             market_date = candidate.get("market_date", "")
+            market_type = candidate.get("market_type", "daily_high")
             volume = candidate.get("volume")
             bucket_low = candidate.get("bucket_low")
             bucket_high = candidate.get("bucket_high")
             effective_edge = candidate["effective_edge"]
+            caution_haircut = float(candidate.get("caution_haircut", 1.0) or 1.0)
+
+            if (
+                market_type == "daily_low"
+                and not getattr(self.settings, "daily_low_entry_enabled", False)
+            ):
+                log.warning(
+                    "Daily-low entry BLOCK: market=%s skipped until true daily-min forecasts are available",
+                    market_id,
+                )
+                continue
 
             # A3: in-cycle bucket correlation guard. Adjacent/overlapping buckets in the
             # same city+date are highly correlated (one outcome pays both) — taking both
@@ -313,6 +381,18 @@ class PortfolioManager:
                 volume=volume,
                 platform=platform or "kalshi",
             )
+            if caution_haircut < 1.0:
+                pre_haircut = preliminary_size
+                preliminary_size = round(preliminary_size * caution_haircut, 2)
+                log.warning(
+                    "Qualitative caution HAIRCUT: market=%s side=%s preliminary size %.2f→%.2f "
+                    "(x%.2f; Conservative=no_trade, Qualitative opposed, fragile context)",
+                    market_id,
+                    majority_side,
+                    pre_haircut,
+                    preliminary_size,
+                    caution_haircut,
+                )
 
             # Risk checks consume exposure in dollars (cost), while position sizing
             # returns contract amount. Convert contracts -> cost for correct limits.
@@ -351,6 +431,8 @@ class PortfolioManager:
                 volume=volume,
                 platform=platform or "kalshi",
             )
+            if caution_haircut < 1.0:
+                amount = round(amount * caution_haircut, 2)
 
             # Step 5: VPIN reduction
             if risk_result.get("reduce_size"):
@@ -422,6 +504,8 @@ class PortfolioManager:
                 blended_prob=opp.blended_prob if opp else None,
                 raw_model_prob=opp.raw_model_prob if opp else None,
                 cash_capped=cash_capped,
+                forecast_timestamp=getattr(opp, "forecast_timestamp", None) if opp else None,
+                market_price_timestamp=getattr(opp, "market_price_timestamp", None) if opp else None,
             )
             orders.append(order)
 

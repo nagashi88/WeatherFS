@@ -134,6 +134,18 @@ def _migrate_trades_columns(engine: Engine) -> None:
             # (amount < 1.0) is the only signal for pre-migration data.
             conn.execute(text("ALTER TABLE trades ADD COLUMN cash_capped INTEGER DEFAULT 0"))
             log.info("Migrated trades table: added 'cash_capped' column")
+        if "order_type" not in existing:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN order_type TEXT DEFAULT 'market'"))
+            log.info("Migrated trades table: added 'order_type' column")
+        if "limit_price" not in existing:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN limit_price FLOAT"))
+            log.info("Migrated trades table: added 'limit_price' column")
+        if "forecast_timestamp" not in existing:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN forecast_timestamp DATETIME"))
+            log.info("Migrated trades table: added 'forecast_timestamp' column")
+        if "market_price_timestamp" not in existing:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN market_price_timestamp DATETIME"))
+            log.info("Migrated trades table: added 'market_price_timestamp' column")
 
 
 def _migrate_calibration_records_columns(engine: Engine) -> None:

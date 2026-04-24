@@ -189,7 +189,7 @@ def test_startup_bootstrap_runs_immediate_steps_in_order():
     ):
         main_module._startup_bootstrap_cycle(run_decision_loop_once=True)
 
-    assert calls == ["market", "forecast", "decision"]
+    assert calls == ["forecast", "market", "decision"]
 
 
 def test_startup_bootstrap_continues_when_one_step_fails():
@@ -208,7 +208,7 @@ def test_startup_bootstrap_continues_when_one_step_fails():
     ):
         main_module._startup_bootstrap_cycle(run_decision_loop_once=True)
 
-    assert calls == ["market", "forecast", "decision"]
+    assert calls == ["forecast", "market", "decision"]
 
 
 # ---------------------------------------------------------------------------
@@ -401,3 +401,142 @@ def test_launch_status_mode_does_not_touch_phase_file(tmp_path, monkeypatch, cap
     assert after == seed, (
         f"--status clobbered current_phase.json. Expected {seed!r}, got {after!r}"
     )
+
+
+def test_launch_plain_start_does_not_persist_phase_activation(monkeypatch):
+    """A normal restart must not reset activated_at for the active phase."""
+    import sys
+    import launch
+
+    calls: list[tuple[str, bool]] = []
+
+    monkeypatch.setattr(sys, "argv", ["launch.py"])
+    monkeypatch.setattr("weatheredge.phase_config.get_current_phase", lambda: "phase_1")
+    monkeypatch.setattr(
+        "weatheredge.phase_config.activate_phase",
+        lambda phase, persist=True: calls.append((phase, persist)) or {"bias_correction": True},
+    )
+    monkeypatch.setattr("weatheredge.main.main", lambda: None)
+
+    launch.main()
+
+    assert calls == [("phase_1", False)]
+
+
+def test_launch_explicit_phase_persists_phase_activation(monkeypatch):
+    """An explicit --phase switch is the one path that should reset activated_at."""
+    import sys
+    import launch
+
+    calls: list[tuple[str, bool]] = []
+
+    monkeypatch.setattr(sys, "argv", ["launch.py", "--phase", "phase_2"])
+    monkeypatch.setattr("weatheredge.phase_config.get_current_phase", lambda: "phase_1")
+    monkeypatch.setattr(
+        "weatheredge.phase_config.activate_phase",
+        lambda phase, persist=True: calls.append((phase, persist)) or {"burst_mode": True},
+    )
+    monkeypatch.setattr("weatheredge.main.main", lambda: None)
+
+    launch.main()
+
+    assert calls == [("phase_2", True)]
+
+
+def test_dashboard_start_does_not_pass_phase_to_launcher():
+    """Dashboard Start must not reset activated_at for the already-active phase."""
+    from pathlib import Path
+
+    source = Path("weatheredge/dashboard/control_panel.py").read_text()
+
+    assert '_start_bot(current_phase)' not in source
+    assert '[str(VENV_PYTHON), str(PROJECT_ROOT / "launch.py")]' in source
+
+
+def _phase1_gate_trade(i: int, created_at: datetime, pnl: float = 1.0):
+    from weatheredge.db.models import Trade
+
+    return Trade(
+        market_id=f"phase1-gate-{i}",
+        platform="kalshi",
+        mode="paper",
+        side="buy_yes",
+        price=0.50,
+        amount=1.0,
+        cost=0.50,
+        agent_name="Baseline",
+        model_probability=0.90,
+        edge_at_entry=0.20,
+        station="KNYC",
+        market_date="2030-01-01",
+        status="won",
+        pnl=pnl,
+        resolved_at=created_at + timedelta(hours=1),
+        created_at=created_at,
+    )
+
+
+def test_phase1_gate_ignores_pre_activation_trade_history(monkeypatch):
+    """Old closed trades must not promote a newly activated Phase 1."""
+    from weatheredge import main as main_module
+    from weatheredge.db.database import get_session, init_db
+
+    init_db()
+    activated = datetime(2026, 4, 23, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "weatheredge.phase_config.get_phase_activated_at",
+        lambda: activated.isoformat(),
+    )
+
+    with get_session() as session:
+        created_at = activated.replace(tzinfo=None) - timedelta(days=1)
+        for i in range(40):
+            session.add(_phase1_gate_trade(i, created_at))
+
+    assert main_module.check_phase1_gate() is False
+
+
+def test_phase1_gate_passes_on_clean_post_activation_trades(monkeypatch):
+    from weatheredge import main as main_module
+    from weatheredge.db.database import get_session, init_db
+
+    init_db()
+    activated = datetime(2026, 4, 23, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "weatheredge.phase_config.get_phase_activated_at",
+        lambda: activated.isoformat(),
+    )
+
+    with get_session() as session:
+        created_at = activated.replace(tzinfo=None) + timedelta(minutes=1)
+        for i in range(40):
+            session.add(_phase1_gate_trade(i, created_at))
+
+    assert main_module.check_phase1_gate() is True
+
+
+def test_phase1_gate_fails_on_post_activation_leakage(monkeypatch):
+    from weatheredge import main as main_module
+    from weatheredge.db.database import get_session, init_db
+    from weatheredge.db.models import LeakageViolation
+
+    init_db()
+    activated = datetime(2026, 4, 23, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "weatheredge.phase_config.get_phase_activated_at",
+        lambda: activated.isoformat(),
+    )
+
+    with get_session() as session:
+        created_at = activated.replace(tzinfo=None) + timedelta(minutes=1)
+        for i in range(40):
+            session.add(_phase1_gate_trade(i, created_at))
+        session.add(
+            LeakageViolation(
+                market_id="phase1-gate-leak",
+                error_msg="synthetic post-activation leakage",
+                violated_at=created_at,
+            )
+        )
+
+    assert main_module.check_phase1_gate() is False

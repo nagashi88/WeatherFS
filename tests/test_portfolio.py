@@ -736,6 +736,96 @@ def test_yes_guard_rail_disabled_also_skips_haircut():
     assert orders[0].amount == 100.0  # Full size, no haircut
 
 
+def test_daily_low_entries_are_blocked_until_min_forecasts_exist():
+    """daily_low entries are disabled while forecast_temp represents daily max."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-LOW", side="buy_no", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-LOW", side="buy_no", confidence=1.0, agent_name="SellNO"),
+    ]
+    opp = make_opportunity("MKT-LOW")
+    opp.market_type = "daily_low"
+    opp.net_edge_no = 0.20
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-LOW": signals},
+        opportunities={"MKT-LOW": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+
+
+def test_qualitative_caution_haircut_reduces_fragile_entry_size():
+    """Conservative abstention + Qualitative opposition should reduce size, not veto."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-FRAGILE", side="no_trade", confidence=1.0, agent_name="Conservative"),
+        Signal(market_id="MKT-FRAGILE", side="buy_no", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-FRAGILE", side="buy_no", confidence=1.0, agent_name="SellNO"),
+        Signal(market_id="MKT-FRAGILE", side="buy_yes", confidence=0.8, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-FRAGILE")
+    opp.net_edge_no = 0.25
+    opp.bucket_low = 66.0
+    opp.bucket_high = 67.0
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-FRAGILE": signals},
+        opportunities={"MKT-FRAGILE": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_no"
+    assert orders[0].amount == pytest.approx(50.0)
+
+
+def test_qualitative_caution_does_not_haircut_non_fragile_buy_no():
+    """The caution rule is scoped; it should not slash every opposed buy_no."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-STABLE", side="no_trade", confidence=1.0, agent_name="Conservative"),
+        Signal(market_id="MKT-STABLE", side="buy_no", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-STABLE", side="buy_no", confidence=1.0, agent_name="SellNO"),
+        Signal(market_id="MKT-STABLE", side="buy_yes", confidence=0.8, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-STABLE")
+    opp.net_edge_no = 0.25
+    opp.market_date = "2099-01-01"
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-STABLE": signals},
+        opportunities={"MKT-STABLE": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].amount == pytest.approx(100.0)
+
+
 def test_cash_cap_reservation_is_fee_inclusive_on_kalshi():
     """CCG-bughunt3 G4-new regression: cross-cycle cash reservation must include
     Kalshi per-contract fee, otherwise the second candidate gets an inflated

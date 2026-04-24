@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -18,12 +19,37 @@ import pmxt
 
 from weatheredge.backtesting.market_prices import _extract_from_kalshi_ticker
 from weatheredge.config import Settings
-from weatheredge.data.market_parser import ParsedMarket, CITY_TO_STATION, parse_polymarket_title
+from weatheredge.data.market_parser import (
+    ParsedMarket,
+    CITY_TO_STATION,
+    parse_kalshi_temperature_title,
+    parse_polymarket_title,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
 log = logging.getLogger(__name__)
+
+
+def _kalshi_bucket_bounds_from_ticker(market_id: str) -> tuple[float, float] | None:
+    """Return half-degree bucket bounds for KXHIGH ``Bxx.5`` bucket contracts."""
+    parts = str(market_id).upper().split("-")
+    if len(parts) < 3:
+        return None
+    tail = parts[-1]
+    if not tail.startswith("B"):
+        return None
+    try:
+        center = float(tail[1:])
+    except ValueError:
+        return None
+    return center - 1.0, center + 1.0
+
+
+def _title_is_one_sided_below(title: object) -> bool:
+    raw = str(title or "").lower()
+    return bool(re.search(r'\bor\s+(?:below|lower)\b|\bbelow\b|\blower\b', raw))
 
 # ---------------------------------------------------------------------------
 # Resolution source mapping — PRD Section 3.2.2
@@ -165,6 +191,14 @@ class MarketScanner:
         """
         ticker = market_data.get("ticker", "")
         resolution = self.get_resolution_source(platform, ticker)
+
+        # Kalshi KXHIGH tickers identify the city/date family, but bucket
+        # contracts need the title to distinguish ranges ("72-73°") from
+        # one-sided thresholds. Attach parsed metadata whenever possible.
+        if platform == "kalshi":
+            parsed = parse_kalshi_temperature_title(market_data.get("title", ""))
+            if parsed:
+                market_data["parsed"] = parsed
 
         # If hardcoded lookup fails for Polymarket, try title parsing
         if resolution is None and platform == "polymarket":
@@ -428,11 +462,18 @@ class MarketScanner:
         ticker_station, ticker_date, ticker_threshold, ticker_direction = _extract_from_kalshi_ticker(
             ticker_or_market
         )
+        ticker_bucket_bounds = None
+        if not isinstance(parsed, ParsedMarket) and not _title_is_one_sided_below(market_data.get("title")):
+            ticker_bucket_bounds = _kalshi_bucket_bounds_from_ticker(ticker_or_market)
         if station is None:
             station = ticker_station
         if market_date is None and ticker_date is not None:
             market_date = ticker_date.isoformat()
-        if ticker_threshold is not None and threshold is None and threshold_low is None and threshold_high is None:
+        if ticker_bucket_bounds is not None and threshold is None and threshold_low is None and threshold_high is None:
+            threshold_low, threshold_high = ticker_bucket_bounds
+            threshold = (threshold_low + threshold_high) / 2.0
+            direction = "above"
+        elif ticker_threshold is not None and threshold is None and threshold_low is None and threshold_high is None:
             threshold = ticker_threshold
         if direction is None:
             direction = ticker_direction

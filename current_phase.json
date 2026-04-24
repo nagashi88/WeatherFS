@@ -1,6 +1,6 @@
 {
   "phase": "phase_1",
-  "activated_at": "2026-04-21T23:13:56.475164+00:00",
+  "activated_at": "2026-04-23T17:34:22.084886+00:00",
   "modules": {
     "agent_mean_reversion": false,
     "agent_voting": false,

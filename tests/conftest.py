@@ -10,6 +10,25 @@ import weatheredge.config as _cfg
 
 
 @pytest.fixture(autouse=True)
+def _isolate_runtime_database(tmp_path, monkeypatch):
+    """Keep tests from writing leakage/trade rows into the live paper DB."""
+    from weatheredge.db import database as _db
+
+    if _db._engine is not None:
+        _db._engine.dispose()
+    _db._engine = None
+    _db._SessionLocal = None
+
+    monkeypatch.setenv("WEATHEREDGE_DB_PATH", str(tmp_path / "weatheredge_test.db"))
+    yield
+
+    if _db._engine is not None:
+        _db._engine.dispose()
+    _db._engine = None
+    _db._SessionLocal = None
+
+
+@pytest.fixture(autouse=True)
 def _enable_all_modules_for_tests():
     """Enable all MODULES flags during tests so existing tests verify behavior.
 
@@ -19,6 +38,9 @@ def _enable_all_modules_for_tests():
     original = dict(_cfg.MODULES)
     for key in _cfg.MODULES:
         _cfg.MODULES[key] = True
+    # Direct PaperTrader unit tests construct bare Orders; temporal-guard
+    # behavior is covered by explicit tests that enable this flag.
+    _cfg.MODULES["temporal_guard"] = False
     yield
     _cfg.MODULES.update(original)
 

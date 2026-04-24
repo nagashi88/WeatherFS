@@ -52,6 +52,7 @@ class Order:
     order_type: str = "market"
     forecast_timestamp: datetime | None = None
     market_price_timestamp: datetime | None = None
+    signal_ids: list[int] | None = None
     cash_capped: bool = False  # propagated from TradeOrder; persisted on Trade row
 
 
@@ -124,6 +125,13 @@ class PaperTrader:
             for t in open_trades:
                 self.open_positions.append(self._trade_to_dict(t))
                 open_cost_total += t.cost
+
+            pending_trades = session.execute(
+                select(Trade).where(Trade.mode == "paper", Trade.status == "pending")
+            ).scalars().all()
+
+            for t in pending_trades:
+                self.open_orders.append(self._trade_to_dict(t))
 
             # Resolved trades — reconstruct history and daily P&L
             resolved = session.execute(
@@ -232,6 +240,11 @@ class PaperTrader:
             "city": "",
             "station": t.station or "",
             "market_date": t.market_date or "",
+            "order_type": t.order_type or "market",
+            "limit_price": t.limit_price,
+            "forecast_timestamp": t.forecast_timestamp,
+            "market_price_timestamp": t.market_price_timestamp,
+            "cash_capped": bool(t.cash_capped),
             "status": t.status,
             "created_at": t.created_at,
             "pnl": t.pnl,
@@ -264,7 +277,11 @@ class PaperTrader:
                 blended_prob=trade_dict.get("blended_prob"),
                 raw_model_prob=trade_dict.get("raw_model_prob"),
                 cash_capped=bool(trade_dict.get("cash_capped", False)),
-                status="open",
+                order_type=trade_dict.get("order_type", "market"),
+                limit_price=trade_dict.get("limit_price"),
+                forecast_timestamp=trade_dict.get("forecast_timestamp"),
+                market_price_timestamp=trade_dict.get("market_price_timestamp"),
+                status=trade_dict.get("status", "open"),
             )
             session.add(db_trade)
             session.flush()
@@ -287,6 +304,36 @@ class PaperTrader:
                 trade.pnl = pnl
                 trade.resolved_at = datetime.now(timezone.utc)
 
+    def _mark_pending_order_filled(self, db_id: int | None, trade_dict: dict) -> int | None:
+        """Update a persisted pending limit order into an open position."""
+        if self._engine is None or db_id is None:
+            return None
+
+        from weatheredge.db.database import get_session
+        from weatheredge.db.models import Trade
+
+        with get_session(self._engine) as session:
+            trade = session.get(Trade, db_id)
+            if trade is None:
+                return None
+            trade.status = "open"
+            trade.price = trade_dict["price"]
+            trade.amount = trade_dict["amount"]
+            trade.cost = trade_dict["cost"]
+            trade.agent_name = trade_dict.get("agent_name")
+            trade.model_probability = trade_dict.get("model_probability")
+            trade.edge_at_entry = trade_dict.get("edge_at_entry")
+            trade.gaussian_prob = trade_dict.get("gaussian_prob")
+            trade.ensemble_prob = trade_dict.get("ensemble_prob")
+            trade.blended_prob = trade_dict.get("blended_prob")
+            trade.raw_model_prob = trade_dict.get("raw_model_prob")
+            trade.cash_capped = bool(trade_dict.get("cash_capped", False))
+            trade.order_type = "limit"
+            trade.limit_price = trade_dict.get("limit_price")
+            trade.forecast_timestamp = trade_dict.get("forecast_timestamp")
+            trade.market_price_timestamp = trade_dict.get("market_price_timestamp")
+        return db_id
+
     # ------------------------------------------------------------------
     # Trading
     # ------------------------------------------------------------------
@@ -296,8 +343,16 @@ class PaperTrader:
         from weatheredge.config import MODULES
 
         # US-TG: Temporal guard — reject trades with lookahead bias
-        if MODULES.get("temporal_guard", False) and order.forecast_timestamp is not None and order.market_price_timestamp is not None:
+        if MODULES.get("temporal_guard", False):
             from weatheredge.temporal_guard import assert_no_lookahead, TemporalLeakageError, record_leakage_violation
+            if order.forecast_timestamp is None or order.market_price_timestamp is None:
+                error = (
+                    "MISSING TEMPORAL TIMESTAMPS: forecast_timestamp and "
+                    "market_price_timestamp are required before trading"
+                )
+                log.critical("Temporal guard rejected %s: %s", order.market_id, error)
+                record_leakage_violation(order.market_id, error, order.__dict__)
+                return {"filled": False, "reason": "missing_temporal_timestamps", "error": error}
             try:
                 assert_no_lookahead(
                     forecast_timestamp=order.forecast_timestamp,
@@ -326,6 +381,7 @@ class PaperTrader:
                 "side": order.side,
                 "price": order.price,
                 "amount": order.amount,
+                "cost": 0.0,
                 "limit_price": limit_price,
                 "agent_name": order.agent_name,
                 "model_probability": order.model_probability,
@@ -339,12 +395,25 @@ class PaperTrader:
                 "blended_prob": order.blended_prob,
                 "raw_model_prob": order.raw_model_prob,
                 "cash_capped": order.cash_capped,
+                "forecast_timestamp": order.forecast_timestamp,
+                "market_price_timestamp": order.market_price_timestamp,
+                "order_type": "limit",
                 "status": "pending",
                 "created_at": datetime.now(timezone.utc),
                 "pnl": None,
             }
+            try:
+                db_id = self._persist_new_trade(pending)
+            except Exception as exc:
+                log.error(
+                    "_persist_new_trade failed for pending limit %s: %s — kept in-memory",
+                    market_id, exc,
+                )
+                db_id = None
+            pending["db_id"] = db_id
+            pending["signal_ids"] = list(order.signal_ids or [])
             self.open_orders.append(pending)
-            return {"filled": False, "pending": True, "limit_price": limit_price}
+            return {"filled": False, "pending": True, "limit_price": limit_price, "db_id": db_id}
 
         # BugFix C1: buy_no cost is (1 - yes_price) * amount, not yes_price * amount
         if order.side == "buy_no":
@@ -378,6 +447,9 @@ class PaperTrader:
             "blended_prob": order.blended_prob,
             "raw_model_prob": order.raw_model_prob,
             "cash_capped": order.cash_capped,
+            "forecast_timestamp": order.forecast_timestamp,
+            "market_price_timestamp": order.market_price_timestamp,
+            "order_type": "market",
             "status": "open",
             "created_at": datetime.now(timezone.utc),
             "pnl": None,
@@ -473,20 +545,37 @@ class PaperTrader:
                 "ensemble_prob": o.get("ensemble_prob"),
                 "blended_prob": o.get("blended_prob"),
                 "raw_model_prob": o.get("raw_model_prob"),
+                "cash_capped": bool(o.get("cash_capped", False)),
+                "limit_price": limit_price,
+                "forecast_timestamp": o.get("forecast_timestamp"),
+                "market_price_timestamp": o.get("market_price_timestamp"),
+                "order_type": "limit",
                 "status": "open",
-                "created_at": datetime.now(timezone.utc),
+                "created_at": o.get("created_at") or datetime.now(timezone.utc),
                 "pnl": None,
             }
 
-            try:
-                db_id = self._persist_new_trade(trade)
-            except Exception as exc:
-                log.error(
-                    "_persist_new_trade failed for limit fill %s: %s — kept in-memory",
-                    market_id, exc,
-                )
-                db_id = None
+            db_id = o.get("db_id")
+            if db_id is not None:
+                try:
+                    db_id = self._mark_pending_order_filled(int(db_id), trade)
+                except Exception as exc:
+                    log.error(
+                        "_mark_pending_order_filled failed for %s: %s — kept in-memory",
+                        market_id, exc,
+                    )
+                    db_id = None
+            if db_id is None:
+                try:
+                    db_id = self._persist_new_trade(trade)
+                except Exception as exc:
+                    log.error(
+                        "_persist_new_trade failed for limit fill %s: %s — kept in-memory",
+                        market_id, exc,
+                    )
+                    db_id = None
             trade["db_id"] = db_id
+            trade["signal_ids"] = list(o.get("signal_ids") or [])
 
             self.open_positions.append(trade)
             self.last_limit_fills.append(trade)
