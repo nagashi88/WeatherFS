@@ -144,6 +144,7 @@ class Trade(Base):
     # "amount < 1.0" heuristic in daily_summary so a legitimately small
     # full-size order isn't misreported as a cash-cap event.
     cash_capped: Mapped[bool | None] = mapped_column(Boolean, default=False)
+    regime: Mapped[str | None] = mapped_column(Text)
 
 
 class DailyPerformance(Base):

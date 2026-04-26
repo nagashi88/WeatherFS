@@ -110,6 +110,9 @@ def init_db(engine: Engine | None = None) -> None:
     # Migrate forecasts: add daily max/min columns so daily-low markets can use
     # true daily minima without breaking legacy temperature_forecast readers.
     _migrate_forecast_columns(target)
+    # Backfill regime tag on trades that pre-date the live tagger. Idempotent
+    # (only updates rows where regime IS NULL), so re-runs are no-ops.
+    _backfill_trade_regimes(target)
     log.info("Database tables created (or already exist) at %s", target.url)
 
 
@@ -149,6 +152,64 @@ def _migrate_trades_columns(engine: Engine) -> None:
         if "market_price_timestamp" not in existing:
             conn.execute(text("ALTER TABLE trades ADD COLUMN market_price_timestamp DATETIME"))
             log.info("Migrated trades table: added 'market_price_timestamp' column")
+        if "regime" not in existing:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN regime TEXT"))
+            log.info("Migrated trades table: added 'regime' column")
+
+
+def _backfill_trade_regimes(engine: Engine) -> None:
+    """Tag pre-existing trades with a strategy regime derived from DB state.
+
+    METAR override is not persisted on Trade rows, so we apply a conservative
+    heuristic: buy_yes on a bucket market (markets.threshold_low/high both
+    non-null) with model_probability >= 0.85 is treated as METAR override —
+    no model produces p>=0.85 on a 1°F band without the override forcing it.
+    Trades whose market_id has no matching markets row default to is_bucket=False.
+    """
+    from sqlalchemy import text, inspect as sa_inspect
+    from weatheredge.regime import classify_regime
+
+    inspector = sa_inspect(engine)
+    if "trades" not in inspector.get_table_names():
+        return
+    if "regime" not in {col["name"] for col in inspector.get_columns("trades")}:
+        return
+
+    metar_heuristic_floor = 0.85
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            """
+            SELECT t.id, t.side, t.model_probability, t.raw_model_prob,
+                   m.threshold_low, m.threshold_high
+            FROM trades t
+            LEFT JOIN markets m ON m.id = t.market_id
+            WHERE t.regime IS NULL
+            """
+        )).fetchall()
+        if not rows:
+            return
+        for row in rows:
+            is_bucket = (
+                row.threshold_low is not None and row.threshold_high is not None
+            )
+            inferred_override: float | None = None
+            if (
+                is_bucket
+                and row.side == "buy_yes"
+                and (row.model_probability or 0.0) >= metar_heuristic_floor
+            ):
+                inferred_override = row.model_probability
+            regime = classify_regime(
+                side=row.side,
+                is_bucket=is_bucket,
+                raw_model_prob=row.raw_model_prob,
+                metar_override=inferred_override,
+            )
+            conn.execute(
+                text("UPDATE trades SET regime = :r WHERE id = :id"),
+                {"r": regime, "id": row.id},
+            )
+        log.info("Backfilled regime for %d trades", len(rows))
 
 
 def _migrate_calibration_records_columns(engine: Engine) -> None:
