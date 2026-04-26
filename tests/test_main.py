@@ -1080,16 +1080,24 @@ class TestSchedulerJobRegistration:
         assert job["hour"] == 6
         assert job["minute"] == 0
 
+    def test_db_backup_registered(self, registered_jobs):
+        ids = [j["id"] for j in registered_jobs]
+        assert "db_backup" in ids
+        job = next(j for j in registered_jobs if j["id"] == "db_backup")
+        assert job["trigger"] == "cron"
+        assert job["hour"] == 23
+        assert job["minute"] == 55
+
     def test_all_eleven_jobs_registered(self, registered_jobs):
-        """14 core jobs + 1 optional bias_correction_refresh when Phase 1 enabled.
+        """15 core jobs + 1 optional bias_correction_refresh when Phase 1 enabled.
 
         Core jobs: market_scan, forecast_poll, actuals_backfill, metar_poll,
         model_run_detector, decision_loop, resolution_check_intraday,
         resolution_check, rmse_recalculation, error_analysis, wallet_profiling,
-        edge_decay_check, morning_briefing, daily_summary.
+        edge_decay_check, morning_briefing, db_backup, daily_summary.
         """
         from weatheredge.config import MODULES
-        expected = 14 + (1 if MODULES.get("bias_correction", False) else 0)
+        expected = 15 + (1 if MODULES.get("bias_correction", False) else 0)
         assert len(registered_jobs) == expected
 
     def test_bias_correction_refresh_registered_when_enabled(self, registered_jobs):

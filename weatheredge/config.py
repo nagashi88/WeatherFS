@@ -260,6 +260,10 @@ class Settings(BaseSettings):
     rmse_recalc_interval_days: int = 30
     error_analysis_interval_days: int = 7
 
+    # Daily SQLite hot-backup
+    db_backup_dir: str = "backups/daily"
+    db_backup_retention_days: int = 30
+
     # Go live thresholds
     min_paper_trades_before_live: int = 200
     min_win_rate_before_live: float = 0.55

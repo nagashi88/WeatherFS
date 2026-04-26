@@ -3565,6 +3565,30 @@ def run_edge_decay_check() -> None:
         log.error("run_edge_decay_check failed: %s", exc, exc_info=True)
 
 
+def run_db_backup() -> None:
+    """Daily SQLite hot-backup with retention.
+
+    Cron fires at 23:45 UTC, ~10 min before the daily summary, so the
+    backup captures the day's resolved trades before any next-day churn.
+    """
+    log.info("run_db_backup: starting daily backup")
+    try:
+        from pathlib import Path
+        from weatheredge.db.backup import backup_database
+        from weatheredge.db.database import _resolve_db_path
+
+        state = get_state()
+        out = backup_database(
+            source_db=_resolve_db_path(),
+            target_dir=Path(state.settings.db_backup_dir),
+            retention_days=state.settings.db_backup_retention_days,
+        )
+        if out is not None:
+            log.info("run_db_backup: complete → %s", out)
+    except Exception as exc:
+        log.error("run_db_backup failed: %s", exc, exc_info=True)
+
+
 def run_daily_summary() -> None:
     """Daily aggregation job: log P&L by agent, parser failure rate,
     cash-cap hits, agent disagreement.
@@ -4030,6 +4054,19 @@ def main() -> None:
         id="morning_briefing",
         max_instances=1,
         coalesce=True,
+    )
+
+    # Daily SQLite hot-backup at 23:55 UTC, just before the day rolls and
+    # the summary cuts. Captures every resolved trade of the closing day.
+    scheduler.add_job(
+        run_db_backup,
+        "cron",
+        hour=23,
+        minute=55,
+        id="db_backup",
+        max_instances=1,
+        coalesce=True,
+        timezone=timezone.utc,
     )
 
     # P2 — daily summary at 00:05 UTC of the next day, summarising the day
