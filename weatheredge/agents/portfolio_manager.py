@@ -65,6 +65,69 @@ def _is_fragile_entry_context(opp: MarketOpportunity, majority_side: str) -> boo
     return False
 
 
+def _same_cycle_duplicate_key(candidate: dict) -> tuple[str, str, str, str] | None:
+    """Group same-cycle candidates that express the same directional exposure."""
+    station_or_city = str(candidate.get("station") or candidate.get("city") or "").strip()
+    market_date = str(candidate.get("market_date") or "").strip()
+    majority_side = str(candidate.get("majority_side") or "").strip()
+    if not station_or_city or not market_date or majority_side not in {"buy_yes", "buy_no"}:
+        return None
+    market_type = str(candidate.get("market_type") or "daily_high").strip()
+    return (station_or_city, market_date, market_type, majority_side)
+
+
+def _same_cycle_duplicate_rank(candidate: dict) -> tuple[float, float, float]:
+    """Tie-break same-exposure candidates by real edge first, then conviction."""
+    return (
+        float(candidate.get("effective_edge") or 0.0),
+        float(candidate.get("majority_score") or 0.0),
+        float(candidate.get("side_margin") or 0.0),
+    )
+
+
+def _filter_same_cycle_duplicates(candidates: list[dict]) -> list[dict]:
+    """Keep the best same-cycle candidate per station/date/type/side.
+
+    This is intentionally narrower than a "max one trade per event" rule. It
+    only dedupes candidates produced in the same aggregate call and keeps the
+    candidate with the strongest signal-side edge, preserving future cycles if
+    prices or forecasts move.
+    """
+    passthrough: list[dict] = []
+    best_by_key: dict[tuple[str, str, str, str], dict] = {}
+    removed: list[dict] = []
+
+    for candidate in candidates:
+        key = _same_cycle_duplicate_key(candidate)
+        if key is None:
+            passthrough.append(candidate)
+            continue
+
+        current_best = best_by_key.get(key)
+        if current_best is None:
+            best_by_key[key] = candidate
+            continue
+
+        if _same_cycle_duplicate_rank(candidate) > _same_cycle_duplicate_rank(current_best):
+            removed.append(current_best)
+            best_by_key[key] = candidate
+        else:
+            removed.append(candidate)
+
+    for candidate in removed:
+        log.info(
+            "Same-cycle duplicate BLOCK: market=%s skipped (station=%s date=%s type=%s side=%s edge=%.3f)",
+            candidate.get("market_id"),
+            candidate.get("station") or candidate.get("city"),
+            candidate.get("market_date"),
+            candidate.get("market_type"),
+            candidate.get("majority_side"),
+            float(candidate.get("effective_edge") or 0.0),
+        )
+
+    return passthrough + list(best_by_key.values())
+
+
 class PortfolioManager:
     AGENT_WEIGHTS: dict[str, float] = {
         "Baseline": 1.00,
@@ -217,6 +280,36 @@ class PortfolioManager:
             caution_haircut = 1.0
             if (
                 opp is not None
+                and getattr(self.settings, "model_disagreement_guard_enabled", True)
+                and opp.gaussian_prob is not None
+                and opp.ensemble_prob is not None
+            ):
+                disagreement = abs(float(opp.gaussian_prob) - float(opp.ensemble_prob))
+                block_threshold = getattr(self.settings, "model_disagreement_block_threshold", 0.25)
+                haircut_threshold = getattr(self.settings, "model_disagreement_haircut_threshold", 0.15)
+                if disagreement >= block_threshold:
+                    log.warning(
+                        "Model-disagreement BLOCK: market=%s skipped (gaussian=%.3f ensemble=%.3f diff=%.3f >= %.2f)",
+                        market_id,
+                        opp.gaussian_prob,
+                        opp.ensemble_prob,
+                        disagreement,
+                        block_threshold,
+                    )
+                    continue
+                if disagreement >= haircut_threshold:
+                    haircut = getattr(self.settings, "model_disagreement_haircut_multiplier", 0.50)
+                    caution_haircut = min(caution_haircut, haircut)
+                    log.warning(
+                        "Model-disagreement HAIRCUT: market=%s side=%s diff=%.3f >= %.2f (x%.2f)",
+                        market_id,
+                        majority_side,
+                        disagreement,
+                        haircut_threshold,
+                        haircut,
+                    )
+            if (
+                opp is not None
                 and getattr(self.settings, "qualitative_caution_guard_enabled", True)
             ):
                 conservative_abstained = any(
@@ -238,6 +331,28 @@ class PortfolioManager:
                         "qualitative_caution_haircut_multiplier",
                         0.50,
                     )
+            if (
+                opp is not None
+                and getattr(self.settings, "weak_long_buy_yes_guard_enabled", True)
+                and majority_side == "buy_yes"
+            ):
+                is_threshold_market = bucket_low is None and bucket_high is None
+                threshold_only = getattr(self.settings, "weak_long_buy_yes_threshold_only", True)
+                min_lead_days = getattr(self.settings, "weak_long_buy_yes_min_lead_days", 1)
+                min_probability = getattr(self.settings, "weak_long_buy_yes_min_probability", 0.50)
+                if (
+                    (not threshold_only or is_threshold_market)
+                    and getattr(opp, "lead_time_days", 0) > min_lead_days
+                    and model_probability < min_probability
+                ):
+                    log.warning(
+                        "Weak-long-YES BLOCK: market=%s skipped buy_yes (lead_days=%s, model_p=%.3f < %.2f)",
+                        market_id,
+                        getattr(opp, "lead_time_days", None),
+                        model_probability,
+                        min_probability,
+                    )
+                    continue
             candidates.append(
                 {
                     "market_id": market_id,
@@ -256,8 +371,12 @@ class PortfolioManager:
                     "majority_score": majority_side_score,
                     "side_margin": majority_side_score - minority_side_score,
                     "caution_haircut": caution_haircut,
+                    "raw_model_prob": getattr(opp, "raw_model_prob", None) if opp else None,
                 }
             )
+
+        if getattr(self.settings, "same_cycle_duplicate_guard_enabled", True):
+            candidates = _filter_same_cycle_duplicates(candidates)
 
         # Prioritize strongest opportunities first; this matters when risk caps
         # stop processing before all candidates can be accepted. Rank by the
@@ -302,6 +421,33 @@ class PortfolioManager:
             bucket_high = candidate.get("bucket_high")
             effective_edge = candidate["effective_edge"]
             caution_haircut = float(candidate.get("caution_haircut", 1.0) or 1.0)
+            raw_model_prob = candidate.get("raw_model_prob")
+
+            if (
+                opp is not None
+                and getattr(self.settings, "bucket_raw_prob_floor_guard_enabled", True)
+                and majority_side == "buy_no"
+                and bucket_low is not None
+                and bucket_high is not None
+                and raw_model_prob is not None
+                and float(raw_model_prob)
+                < getattr(self.settings, "bucket_raw_prob_floor_guard_min_raw_yes", 0.01)
+            ):
+                log.warning(
+                    "Raw-prob floor BLOCK: market=%s skipped buy_no bucket "
+                    "(raw_yes=%.4f < %.4f, model_p=%.3f, market_price=%.3f, edge=%.3f, "
+                    "station=%s date=%s type=%s)",
+                    market_id,
+                    float(raw_model_prob),
+                    getattr(self.settings, "bucket_raw_prob_floor_guard_min_raw_yes", 0.01),
+                    model_probability,
+                    market_price,
+                    effective_edge,
+                    station,
+                    market_date,
+                    market_type,
+                )
+                continue
 
             if (
                 market_type == "daily_low"

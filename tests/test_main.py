@@ -2744,6 +2744,76 @@ class TestBuildOpportunityEdgePaths:
         assert opp is not None
         assert opp.forecast_temp == pytest.approx(0.0)
 
+    def test_daily_low_uses_true_daily_min_forecast(self):
+        """daily_low markets must use daily minimum, not the daily-high forecast."""
+        state = self._make_state()
+        market_date = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
+        market_id = "0xdaily_low_min"
+
+        mock_parsed = MagicMock()
+        mock_parsed.threshold = 58.0
+        mock_parsed.direction = "above"
+        mock_parsed.market_type = "daily_low"
+        mock_parsed.date = market_date
+        mock_parsed.threshold_low = None
+        mock_parsed.threshold_high = None
+        state.market_metadata[market_id] = {
+            "resolution_source": {"station": "KNYC", "type": "daily_low"},
+            "platform": "polymarket",
+            "parsed": mock_parsed,
+        }
+        forecasts = {
+            "KNYC": {
+                "temperature_forecast": 82.0,
+                "temperature_min_forecast": 55.0,
+                "ecmwf_min_temp": None,
+                "hrrr_min_temp": None,
+                "nbm_min_temp": None,
+                "ensemble_members_min": None,
+                "model": "gfs",
+                "forecast_timestamp": datetime.now(timezone.utc),
+            }
+        }
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(market_id, {"yes_price": 0.5}, forecasts)
+
+        assert opp is not None
+        assert opp.market_type == "daily_low"
+        assert opp.forecast_temp == pytest.approx(55.0)
+
+    def test_daily_low_without_true_min_forecast_returns_none(self):
+        """daily_low entry stays blocked when only daily-high forecast exists."""
+        state = self._make_state()
+        market_date = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
+        market_id = "0xdaily_low_no_min"
+
+        mock_parsed = MagicMock()
+        mock_parsed.threshold = 58.0
+        mock_parsed.direction = "above"
+        mock_parsed.market_type = "daily_low"
+        mock_parsed.date = market_date
+        mock_parsed.threshold_low = None
+        mock_parsed.threshold_high = None
+        state.market_metadata[market_id] = {
+            "resolution_source": {"station": "KNYC", "type": "daily_low"},
+            "platform": "polymarket",
+            "parsed": mock_parsed,
+        }
+        forecasts = {
+            "KNYC": {
+                "temperature_forecast": 82.0,
+                "ensemble_members": None,
+                "model": "gfs",
+                "forecast_timestamp": datetime.now(timezone.utc),
+            }
+        }
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(market_id, {"yes_price": 0.5}, forecasts)
+
+        assert opp is None
+
     def test_invalid_market_date_falls_back_to_default_lead_time(self):
         """Unparseable date in parsed.date is silently ignored (lines 858-859)."""
         state = self._make_state()

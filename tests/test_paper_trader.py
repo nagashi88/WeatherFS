@@ -218,6 +218,37 @@ class TestCancelExpiredOrders:
         assert len(trader.open_orders) == 1
         assert trader.open_orders[0]["market_id"] == "new"
 
+    def test_naive_db_timestamp_is_treated_as_utc(self):
+        """SQLite-restored naive datetimes must not crash TTL comparisons."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        order = self._add_open_order(
+            trader,
+            "sqlite_naive",
+            age_hours=ORDER_TTL_HOURS + 0.1,
+        )
+        order["created_at"] = order["created_at"].replace(tzinfo=None)
+
+        cancelled = trader.cancel_expired_orders()
+
+        assert cancelled == 1
+        assert len(trader.open_orders) == 0
+        assert trader.trade_history[0]["created_at"].tzinfo is timezone.utc
+
+    def test_iso_string_timestamp_is_treated_as_utc(self):
+        """String timestamps from legacy state are normalized before TTL checks."""
+        trader = PaperTrader(initial_bankroll=1000.0)
+        order = self._add_open_order(
+            trader,
+            "legacy_string",
+            age_hours=ORDER_TTL_HOURS + 0.1,
+        )
+        order["created_at"] = order["created_at"].replace(tzinfo=None).isoformat()
+
+        cancelled = trader.cancel_expired_orders()
+
+        assert cancelled == 1
+        assert len(trader.open_orders) == 0
+
     def test_no_orders_returns_zero(self):
         """No open orders → cancel_expired_orders returns 0."""
         trader = PaperTrader(initial_bankroll=1000.0)

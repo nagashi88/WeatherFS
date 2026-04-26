@@ -188,11 +188,19 @@ def _is_running() -> tuple[bool, int | None]:
         return False, None
     try:
         pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, 0)
-        return True, pid
-    except (ValueError, ProcessLookupError, PermissionError):
+    except ValueError:
         PID_FILE.unlink(missing_ok=True)
         return False, None
+    try:
+        os.kill(pid, 0)
+        return True, pid
+    except ProcessLookupError:
+        PID_FILE.unlink(missing_ok=True)
+        return False, None
+    except PermissionError:
+        # Sandboxed dashboard sessions may be unable to signal a live bot
+        # process. Treat this as running to avoid starting a duplicate.
+        return True, pid
 
 
 def _start_bot():
@@ -224,6 +232,8 @@ def _stop_bot():
             pass
     except ProcessLookupError:
         pass
+    except PermissionError:
+        return
     PID_FILE.unlink(missing_ok=True)
 
 

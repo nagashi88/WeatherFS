@@ -223,6 +223,26 @@ class PaperTrader:
         return str(market_id).strip()
 
     @staticmethod
+    def _coerce_utc_datetime(value: object) -> datetime | None:
+        """Return an aware UTC datetime for DB/in-memory timestamps.
+
+        SQLite drops timezone info on DateTime columns, so persisted pending
+        orders can come back as naive datetimes after restart.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
     def _trade_to_dict(t) -> dict:
         """Convert a DB Trade row to the in-memory dict format."""
         return {
@@ -246,7 +266,7 @@ class PaperTrader:
             "market_price_timestamp": t.market_price_timestamp,
             "cash_capped": bool(t.cash_capped),
             "status": t.status,
-            "created_at": t.created_at,
+            "created_at": PaperTrader._coerce_utc_datetime(t.created_at),
             "pnl": t.pnl,
         }
 
@@ -596,12 +616,22 @@ class PaperTrader:
         """
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(hours=ORDER_TTL_HOURS)
-        expired = [o for o in self.open_orders if o["created_at"] < cutoff]
+        expired = []
+        still_open = []
+        for o in self.open_orders:
+            created_at = self._coerce_utc_datetime(o.get("created_at"))
+            if created_at is None:
+                created_at = now
+            o["created_at"] = created_at
+            if created_at < cutoff:
+                expired.append(o)
+            else:
+                still_open.append(o)
         for o in expired:
             o["status"] = "cancelled"
             self._update_trade_in_db(o.get("db_id"), "cancelled", 0.0)
             self.trade_history.append(o)
-        self.open_orders = [o for o in self.open_orders if o["created_at"] >= cutoff]
+        self.open_orders = still_open
         return len(expired)
 
     def resolve_position(self, market_id: str, outcome: str) -> None:

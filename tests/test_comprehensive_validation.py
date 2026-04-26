@@ -732,7 +732,7 @@ class TestProbabilityCalculations:
     # -----------------------------------------------------------------------
 
     def test_blended_short_lead_weights_exact(self):
-        """GFS=0.70, ECMWF=0.80, HRRR=0.90 at lead=6h → 0.60*0.9+0.25*0.7+0.15*0.8=0.835."""
+        """Short lead exact blend: HRRR=0.90, NBM=0.85, GFS=0.70, ECMWF=0.80."""
         from weatheredge.probability.blended import blended_probability
 
         with patch(
@@ -742,27 +742,28 @@ class TestProbabilityCalculations:
         ) as mock_gauss:
             mock_ens.return_value = 0.70        # GFS ensemble (called 2x: clamped + raw)
             # Each gaussian model is called twice (clamped + raw); same value preserves blend math.
-            mock_gauss.side_effect = [0.80, 0.80, 0.90, 0.90]  # ECMWF x2, HRRR x2
+            mock_gauss.side_effect = [0.80, 0.80, 0.90, 0.90, 0.85, 0.85]  # ECMWF x2, HRRR x2, NBM x2
 
             prob, model, details = blended_probability(
                 threshold=70.0,
                 direction="above",
                 rmse=3.0,
                 is_us_station=True,
-                lead_time_hours=6.0,        # short bucket: HRRR=60%, GFS=25%, ECMWF=15%
+                lead_time_hours=6.0,        # short: HRRR=45%, NBM=25%, GFS=20%, ECMWF=10%
                 ensemble_temps=[68.0] * 25,  # >=20 members triggers ensemble_probability
                 ecmwf_forecast_temp=72.0,    # triggers gaussian_probability (ECMWF)
                 hrrr_forecast_temp=74.0,     # triggers gaussian_probability (HRRR)
+                nbm_forecast_temp=73.0,      # triggers gaussian_probability (NBM)
             )
 
-        expected = 0.60 * 0.90 + 0.25 * 0.70 + 0.15 * 0.80  # = 0.835
+        expected = 0.45 * 0.90 + 0.25 * 0.85 + 0.20 * 0.70 + 0.10 * 0.80
         assert abs(prob - expected) < 1e-6, (
             f"Expected {expected:.6f}, got {prob:.6f}. "
-            "Weight formula: HRRR*0.60 + GFS*0.25 + ECMWF*0.15"
+            "Weight formula: HRRR*0.45 + NBM*0.25 + GFS*0.20 + ECMWF*0.10"
         )
 
     def test_blended_medium_lead_weights_exact(self):
-        """At lead=18h (medium): HRRR=0.40, GFS=0.35, ECMWF=0.25."""
+        """At lead=18h (medium): NBM=0.35, HRRR=0.25, GFS=0.25, ECMWF=0.15."""
         from weatheredge.probability.blended import blended_probability
 
         with patch(
@@ -771,24 +772,25 @@ class TestProbabilityCalculations:
             "weatheredge.probability.blended.gaussian_probability"
         ) as mock_gauss:
             mock_ens.return_value = 0.70
-            mock_gauss.side_effect = [0.80, 0.80, 0.90, 0.90]  # ECMWF x2 (clamped+raw), HRRR x2
+            mock_gauss.side_effect = [0.80, 0.80, 0.90, 0.90, 0.85, 0.85]  # ECMWF x2, HRRR x2, NBM x2
 
             prob, _, _ = blended_probability(
                 threshold=70.0,
                 direction="above",
                 rmse=3.0,
                 is_us_station=True,
-                lead_time_hours=18.0,        # medium bucket: HRRR=40%, GFS=35%, ECMWF=25%
+                lead_time_hours=18.0,        # medium: NBM=35%, HRRR=25%, GFS=25%, ECMWF=15%
                 ensemble_temps=[68.0] * 25,
                 ecmwf_forecast_temp=72.0,
                 hrrr_forecast_temp=74.0,
+                nbm_forecast_temp=73.0,
             )
 
-        expected = 0.40 * 0.90 + 0.35 * 0.70 + 0.25 * 0.80  # = 0.36+0.245+0.20 = 0.805
+        expected = 0.25 * 0.90 + 0.35 * 0.85 + 0.25 * 0.70 + 0.15 * 0.80
         assert abs(prob - expected) < 1e-6, f"Expected {expected:.6f}, got {prob:.6f}"
 
     def test_blended_long_lead_weights_exact(self):
-        """At lead=36h (long): GFS=0.40, ECMWF=0.40, HRRR=0.20."""
+        """At lead=36h (long): NBM=0.35, GFS=0.30, ECMWF=0.30, HRRR=0.05."""
         from weatheredge.probability.blended import blended_probability
 
         with patch(
@@ -797,20 +799,21 @@ class TestProbabilityCalculations:
             "weatheredge.probability.blended.gaussian_probability"
         ) as mock_gauss:
             mock_ens.return_value = 0.70
-            mock_gauss.side_effect = [0.80, 0.80, 0.90, 0.90]  # ECMWF x2 (clamped+raw), HRRR x2
+            mock_gauss.side_effect = [0.80, 0.80, 0.90, 0.90, 0.85, 0.85]  # ECMWF x2, HRRR x2, NBM x2
 
             prob, _, _ = blended_probability(
                 threshold=70.0,
                 direction="above",
                 rmse=3.0,
                 is_us_station=True,
-                lead_time_hours=36.0,        # long bucket: GFS=40%, ECMWF=40%, HRRR=20%
+                lead_time_hours=36.0,        # long: NBM=35%, GFS=30%, ECMWF=30%, HRRR=5%
                 ensemble_temps=[68.0] * 25,
                 ecmwf_forecast_temp=72.0,
                 hrrr_forecast_temp=74.0,
+                nbm_forecast_temp=73.0,
             )
 
-        expected = 0.20 * 0.90 + 0.40 * 0.70 + 0.40 * 0.80  # = 0.18+0.28+0.32 = 0.780
+        expected = 0.05 * 0.90 + 0.35 * 0.85 + 0.30 * 0.70 + 0.30 * 0.80
         assert abs(prob - expected) < 1e-6, f"Expected {expected:.6f}, got {prob:.6f}"
 
     # -----------------------------------------------------------------------

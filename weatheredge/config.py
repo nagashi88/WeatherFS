@@ -235,9 +235,20 @@ class Settings(BaseSettings):
     yes_guard_rail_max_prob: float = 0.70  # Above this → HARD BLOCK
     yes_guard_rail_haircut_prob: float = 0.50  # Above this (and ≤ max_prob) → size × haircut_multiplier
     yes_guard_rail_haircut_multiplier: float = 0.15  # Kelly haircut for gray zone (0.50 < p ≤ 0.70)
-    daily_low_entry_enabled: bool = False  # Disabled until forecasts store true daily minimums
+    daily_low_entry_enabled: bool = True  # Enabled only when true daily-min forecasts are present
+    model_disagreement_guard_enabled: bool = True
+    model_disagreement_haircut_threshold: float = 0.15
+    model_disagreement_block_threshold: float = 0.25
+    model_disagreement_haircut_multiplier: float = 0.50
     qualitative_caution_guard_enabled: bool = True
     qualitative_caution_haircut_multiplier: float = 0.50
+    same_cycle_duplicate_guard_enabled: bool = True
+    weak_long_buy_yes_guard_enabled: bool = True
+    weak_long_buy_yes_threshold_only: bool = True
+    weak_long_buy_yes_min_lead_days: int = 1
+    weak_long_buy_yes_min_probability: float = 0.50
+    bucket_raw_prob_floor_guard_enabled: bool = True
+    bucket_raw_prob_floor_guard_min_raw_yes: float = 0.01
 
     # Learning
     weight_update_interval_trades: int = 50

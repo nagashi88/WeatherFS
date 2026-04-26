@@ -1,6 +1,6 @@
 """Open-Meteo weather data fetcher for WeatherEdge.
 
-Implements fetch_forecast, fetch_ensemble, and fetch_ecmwf with retry logic
+Implements fetch_forecast, fetch_ensemble, fetch_ecmwf, and fetch_nbm with retry logic
 per Addendum Gap 12: 3 retries with exponential backoff (1s, 4s, 16s).
 """
 
@@ -185,6 +185,30 @@ async def fetch_ecmwf(
     return await _get_with_retry(session, url, params)
 
 
+async def fetch_nbm(
+    lat: float,
+    lon: float,
+    session: aiohttp.ClientSession,
+) -> dict[str, Any]:
+    """Fetch NBM Conus forecast data from Open-Meteo /v1/gfs.
+
+    NBM is available for U.S. Conus locations as ``ncep_nbm_conus`` and updates
+    hourly. It is fetched as a separate model so the blend can compare it with
+    GFS/HRRR/ECMWF rather than silently replacing them.
+    """
+    url = f"{BASE_URL}/v1/gfs"
+    params: dict[str, Any] = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": ",".join(HOURLY_VARS),
+        "models": "ncep_nbm_conus",
+        "timezone": "UTC",
+        "temperature_unit": "fahrenheit",
+    }
+    log.info("Fetching NBM for lat=%s lon=%s", lat, lon)
+    return await _get_with_retry(session, url, params)
+
+
 def store_forecast(
     db_session: Any,
     station: str,
@@ -194,9 +218,9 @@ def store_forecast(
 ) -> Forecast:
     """Write a parsed forecast response to the forecasts table.
 
-    Extracts temperature_forecast for target_date from hourly series. For
-    daily-temperature contracts this uses the target-day max temperature; if no
-    target-day points exist it falls back to the first available value.
+    Extracts daily max/min temperatures for target_date from hourly series. The
+    legacy ``temperature_forecast`` column remains the daily max for backward
+    compatibility; daily-low decisions use ``temperature_min_forecast``.
     precipitation_forecast still uses the first available hourly point.
     For ensemble data, serialises all temperature_2m values as a JSON array
     into ensemble_members.
@@ -232,7 +256,7 @@ def store_forecast(
             except (AttributeError, ValueError):
                 continue
 
-    # Extract target-date max temperature (daily-high aligned), with first-value fallback.
+    # Extract target-date max/min temperature, with first-value fallback.
     temp_values: list[float] | None = hourly.get("temperature_2m")
     target_day_temps: list[float] = []
     if target_day and temp_values and time_values:
@@ -249,22 +273,27 @@ def store_forecast(
                 target_day_temps.append(float(temp_val))
 
     if target_day_temps:
-        temperature_forecast: float | None = max(target_day_temps)
+        temperature_max_forecast: float | None = max(target_day_temps)
+        temperature_min_forecast: float | None = min(target_day_temps)
     else:
-        temperature_forecast = temp_values[0] if temp_values else None
+        fallback_temp = temp_values[0] if temp_values else None
+        temperature_max_forecast = fallback_temp
+        temperature_min_forecast = fallback_temp
 
     # Extract first available precipitation value
     precip_values: list[float] | None = hourly.get("precipitation")
     precipitation_forecast: float | None = precip_values[0] if precip_values else None
 
-    # For ensemble model: extract per-member daily-max for the target date.
+    # For ensemble model: extract per-member daily max/min for the target date.
     # BugFix E1: The old code stored the control member's 168-value hourly time series.
     # ensemble_probability() expects one value per member (e.g. daily-max), not hourly points
     # of a single member. The GFS ensemble API returns temperature_2m_member01..member30
     # as separate hourly series alongside temperature_2m (deterministic control member).
     ensemble_members_json: str | None = None
+    ensemble_min_members_json: str | None = None
     if model == "ensemble":
         member_max_temps: list[float] = []
+        member_min_temps: list[float] = []
         member_keys = sorted(k for k in hourly if k.startswith("temperature_2m_member"))
         for member_key in member_keys:
             member_series: list[float] | None = hourly.get(member_key)
@@ -285,18 +314,27 @@ def store_forecast(
                         day_temps.append(float(val))
                 if day_temps:
                     member_max_temps.append(max(day_temps))
+                    member_min_temps.append(min(day_temps))
             else:
                 first = next((float(v) for v in member_series if v is not None), None)
                 if first is not None:
                     member_max_temps.append(first)
+                    member_min_temps.append(first)
 
         if member_max_temps:
             ensemble_members_json = json.dumps(member_max_temps)
-            # Use ensemble mean as temperature_forecast for this row
-            temperature_forecast = sum(member_max_temps) / len(member_max_temps)
+            ensemble_min_members_json = json.dumps(member_min_temps) if member_min_temps else None
+            # Use ensemble mean max/min for this row
+            temperature_max_forecast = sum(member_max_temps) / len(member_max_temps)
+            if member_min_temps:
+                temperature_min_forecast = sum(member_min_temps) / len(member_min_temps)
             log.debug(
-                "store_forecast: ensemble %s %s — %d members, mean_max=%.1f°C",
-                station, target_date, len(member_max_temps), temperature_forecast,
+                "store_forecast: ensemble %s %s — %d members, mean_max=%.1f°F mean_min=%.1f°F",
+                station,
+                target_date,
+                len(member_max_temps),
+                temperature_max_forecast,
+                temperature_min_forecast,
             )
         elif temp_values:
             # Fallback: API did not return member keys (unexpected) — store control member daily-max only
@@ -306,8 +344,10 @@ def store_forecast(
             )
             if target_day_temps:
                 ensemble_members_json = json.dumps([max(target_day_temps)])
+                ensemble_min_members_json = json.dumps([min(target_day_temps)])
             else:
                 ensemble_members_json = json.dumps([temp_values[0]])
+                ensemble_min_members_json = json.dumps([temp_values[0]])
 
     # Calculate lead time from the first timestamp in the response
     lead_time_hours = 0
@@ -330,8 +370,11 @@ def store_forecast(
         model=model,
         forecast_timestamp=datetime.now(timezone.utc),
         lead_time_hours=lead_time_hours,
-        temperature_forecast=temperature_forecast,
+        temperature_max_forecast=temperature_max_forecast,
+        temperature_min_forecast=temperature_min_forecast,
+        temperature_forecast=temperature_max_forecast,
         ensemble_members=ensemble_members_json,
+        ensemble_min_members=ensemble_min_members_json,
         precipitation_forecast=precipitation_forecast,
     )
     db_session.add(forecast)

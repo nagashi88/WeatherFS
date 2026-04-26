@@ -5,15 +5,15 @@ that accounts for HRRR (High-Resolution Rapid Refresh) dominance at short lead
 times for US cities.
 
 Weight scheme (with TimesFM):
-  Lead <12h (US):  HRRR 50%, GFS ensemble 20%, ECMWF 10%, TimesFM 20%
-  Lead 12-24h (US): HRRR 30%, GFS ensemble 25%, ECMWF 20%, TimesFM 25%
-  Lead >24h (US):  GFS ensemble 30%, ECMWF 30%, HRRR 15%, TimesFM 25%
+  Lead <12h (US):  HRRR 40%, NBM 15%, GFS ensemble 15%, ECMWF 10%, TimesFM 20%
+  Lead 12-24h (US): NBM 25%, HRRR 25%, GFS ensemble 15%, ECMWF 15%, TimesFM 20%
+  Lead >24h (US):  NBM 30%, GFS ensemble 25%, ECMWF 25%, HRRR 5%, TimesFM 15%
   Non-US:          GFS ensemble 40%, ECMWF 40%, TimesFM 20%
 
 Without TimesFM (fallback — original weights):
-  Lead <12h (US):  HRRR 60%, GFS ensemble 25%, ECMWF 15%
-  Lead 12-24h (US): HRRR 40%, GFS ensemble 35%, ECMWF 25%
-  Lead >24h (US):  GFS ensemble 40%, ECMWF 40%, HRRR 20%
+  Lead <12h (US):  HRRR 45%, NBM 25%, GFS ensemble 20%, ECMWF 10%
+  Lead 12-24h (US): NBM 35%, HRRR 25%, GFS ensemble 25%, ECMWF 15%
+  Lead >24h (US):  NBM 35%, GFS ensemble 30%, ECMWF 30%, HRRR 5%
   Non-US:          GFS ensemble 50%, ECMWF 50%
 
 Also integrates METAR override from Enhancement 3 and TimesFM NWP error
@@ -33,9 +33,9 @@ log = logging.getLogger(__name__)
 
 # HRRR weight tables by lead time bucket (with TimesFM)
 WEIGHTS_US: dict[str, dict[str, float]] = {
-    "short":  {"hrrr": 0.50, "gfs_ensemble": 0.20, "ecmwf": 0.10, "timesfm": 0.20},  # <12h
-    "medium": {"hrrr": 0.30, "gfs_ensemble": 0.25, "ecmwf": 0.20, "timesfm": 0.25},  # 12-24h
-    "long":   {"hrrr": 0.15, "gfs_ensemble": 0.30, "ecmwf": 0.30, "timesfm": 0.25},  # >24h
+    "short":  {"hrrr": 0.40, "nbm": 0.15, "gfs_ensemble": 0.15, "ecmwf": 0.10, "timesfm": 0.20},  # <12h
+    "medium": {"hrrr": 0.25, "nbm": 0.25, "gfs_ensemble": 0.15, "ecmwf": 0.15, "timesfm": 0.20},  # 12-24h
+    "long":   {"hrrr": 0.05, "nbm": 0.30, "gfs_ensemble": 0.25, "ecmwf": 0.25, "timesfm": 0.15},  # >24h
 }
 
 WEIGHTS_NON_US: dict[str, float] = {
@@ -46,9 +46,9 @@ WEIGHTS_NON_US: dict[str, float] = {
 
 # Fallback weights when TimesFM is unavailable (original Enhancement 5 values)
 WEIGHTS_US_NO_TIMESFM: dict[str, dict[str, float]] = {
-    "short":  {"hrrr": 0.60, "gfs_ensemble": 0.25, "ecmwf": 0.15},
-    "medium": {"hrrr": 0.40, "gfs_ensemble": 0.35, "ecmwf": 0.25},
-    "long":   {"hrrr": 0.20, "gfs_ensemble": 0.40, "ecmwf": 0.40},
+    "short":  {"hrrr": 0.45, "nbm": 0.25, "gfs_ensemble": 0.20, "ecmwf": 0.10},
+    "medium": {"hrrr": 0.25, "nbm": 0.35, "gfs_ensemble": 0.25, "ecmwf": 0.15},
+    "long":   {"hrrr": 0.05, "nbm": 0.35, "gfs_ensemble": 0.30, "ecmwf": 0.30},
 }
 
 WEIGHTS_NON_US_NO_TIMESFM: dict[str, float] = {
@@ -80,6 +80,8 @@ def blended_probability(
     ecmwf_forecast_temp: float | None = None,
     # HRRR-specific forecast temp (from /v1/gfs for US locations)
     hrrr_forecast_temp: float | None = None,
+    # NBM-specific forecast temp (from /v1/gfs model ncep_nbm_conus)
+    nbm_forecast_temp: float | None = None,
     # METAR override probability (from CurrentConditionsTracker)
     metar_override: float | None = None,
     # Learned model weights from Brier score self-learning (C4 fix)
@@ -121,6 +123,9 @@ def blended_probability(
         if hrrr_forecast_temp is not None:
             hrrr_forecast_temp += timesfm_error_adj
             details["hrrr_temp_corrected"] = round(hrrr_forecast_temp, 2)
+        if nbm_forecast_temp is not None:
+            nbm_forecast_temp += timesfm_error_adj
+            details["nbm_temp_corrected"] = round(nbm_forecast_temp, 2)
 
     # Calculate individual model probabilities
     # GFS ensemble
@@ -171,6 +176,19 @@ def blended_probability(
         details["hrrr_temp"] = hrrr_forecast_temp
         details["hrrr_rmse"] = round(hrrr_rmse, 2)
 
+    # NBM (Gaussian with NBM forecast temp). Treat as high-resolution U.S. model
+    # but do not over-tighten: until we have WeatherEdge-specific calibration,
+    # use a conservative 10% RMSE tightening versus the primary model.
+    nbm_prob: float | None = None
+    nbm_prob_raw: float | None = None
+    if nbm_forecast_temp is not None and is_us_station:
+        nbm_rmse = rmse * 0.90
+        nbm_prob = gaussian_probability(nbm_forecast_temp, threshold, nbm_rmse, direction)
+        nbm_prob_raw = gaussian_probability(nbm_forecast_temp, threshold, nbm_rmse, direction, clamp=False)
+        details["nbm_prob"] = round(nbm_prob, 4)
+        details["nbm_temp"] = nbm_forecast_temp
+        details["nbm_rmse"] = round(nbm_rmse, 2)
+
     # TimesFM probability (from quantile outputs — captures non-Gaussian tails)
     timesfm_prob_val: float | None = timesfm_prob
     if timesfm_prob_val is not None:
@@ -192,6 +210,7 @@ def blended_probability(
         else:
             weights = dict(WEIGHTS_NON_US_NO_TIMESFM)
         weights.setdefault("hrrr", 0.0)
+        weights.setdefault("nbm", 0.0)
         details["weight_bucket"] = "non_us"
 
     details["timesfm_active"] = has_timesfm
@@ -248,6 +267,13 @@ def blended_probability(
             weighted_sum += hrrr_for_blend * w
             total_weight += w
 
+    if nbm_prob is not None and weights.get("nbm", 0) > 0:
+        nbm_for_blend = nbm_prob_raw if nbm_prob_raw is not None else nbm_prob
+        if math.isfinite(nbm_for_blend):
+            w = weights["nbm"]
+            weighted_sum += nbm_for_blend * w
+            total_weight += w
+
     if (
         timesfm_prob_val is not None
         and weights.get("timesfm", 0) > 0
@@ -260,6 +286,10 @@ def blended_probability(
 
     # Fallback: if no model data at all, use GFS point forecast with Gaussian
     if total_weight == 0:
+        if nbm_forecast_temp is not None:
+            fallback = gaussian_probability(nbm_forecast_temp, threshold, rmse, direction)
+            details["fallback"] = "gaussian_nbm_point"
+            return fallback, "gaussian_nbm_fallback", details
         if gfs_forecast_temp is not None:
             fallback = gaussian_probability(gfs_forecast_temp, threshold, rmse, direction)
             details["fallback"] = "gaussian_gfs_point"
@@ -285,6 +315,8 @@ def blended_probability(
         models_used.append("ecmwf")
     if hrrr_prob is not None:
         models_used.append("hrrr")
+    if nbm_prob is not None:
+        models_used.append("nbm")
     if timesfm_prob_val is not None:
         models_used.append("timesfm")
     model_label = "blended_" + "+".join(models_used)

@@ -29,6 +29,7 @@ _DEFAULT_US_RMSE = {
     "gfs": {0: 4.0, 1: 5.0, 2: 7.0, 3: 9.0},
     "ecmwf": {0: 3.5, 1: 4.5, 2: 6.5, 3: 8.5},
     "hrrr": {0: 3.0, 1: 4.0, 2: 6.0},
+    "nbm": {0: 3.5, 1: 4.5, 2: 6.5, 3: 8.5},
 }
 _DEFAULT_INTL_RMSE = {
     "gfs": {0: 4.5, 1: 5.5, 2: 7.5, 3: 9.5},
@@ -39,11 +40,13 @@ STATION_RMSE: dict[str, dict[str, dict[int, float]]] = {
         "gfs": {0: 3.5, 1: 4.5, 2: 6.5, 3: 8.5},
         "ecmwf": {0: 3.0, 1: 4.0, 2: 5.5, 3: 7.5},
         "hrrr": {0: 2.5, 1: 3.5, 2: 5.5},
+        "nbm": {0: 3.0, 1: 4.0, 2: 5.5, 3: 7.5},
     },
     "KMDW": {  # Midway Airport, Chicago — continental, high variability
         "gfs": {0: 4.0, 1: 5.0, 2: 7.0, 3: 9.0},
         "ecmwf": {0: 3.5, 1: 4.5, 2: 6.5, 3: 8.5},
         "hrrr": {0: 3.0, 1: 4.0, 2: 6.0},
+        "nbm": {0: 3.5, 1: 4.5, 2: 6.5, 3: 8.5},
     },
     # US stations — default US RMSE (will be refined by RMSE updater)
     "KMIA": {**_DEFAULT_US_RMSE},
@@ -53,7 +56,7 @@ STATION_RMSE: dict[str, dict[str, dict[int, float]]] = {
     "KSEA": {**_DEFAULT_US_RMSE},
     "KATL": {**_DEFAULT_US_RMSE},
     "KDFW": {**_DEFAULT_US_RMSE},
-    "KPHX": {"gfs": {0: 3.0, 1: 4.0, 2: 6.0, 3: 8.0}, "ecmwf": {0: 2.5, 1: 3.5, 2: 5.5, 3: 7.5}, "hrrr": {0: 2.5, 1: 3.0, 2: 5.0}},  # Desert: lower cloud/precip variance but heat extremes
+    "KPHX": {"gfs": {0: 3.0, 1: 4.0, 2: 6.0, 3: 8.0}, "ecmwf": {0: 2.5, 1: 3.5, 2: 5.5, 3: 7.5}, "hrrr": {0: 2.5, 1: 3.0, 2: 5.0}, "nbm": {0: 2.5, 1: 3.5, 2: 5.5, 3: 7.5}},  # Desert: lower cloud/precip variance but heat extremes
     "KIAH": {**_DEFAULT_US_RMSE},
     "KSFO": {**_DEFAULT_US_RMSE},
     "KBOS": {**_DEFAULT_US_RMSE},

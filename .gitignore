@@ -7,6 +7,8 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.hypothesis/
+.weatheredge.pid
 *.egg-info/
 dist/
 build/

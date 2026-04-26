@@ -365,14 +365,15 @@ class TestWeekSimulationModelRuns:
         assert len(events_fired) == 0
 
     def test_hrrr_weights_decrease_as_lead_time_grows(self):
-        """HRRR weight is 60% at <12h, 40% at 12-24h, 20% at >24h."""
+        """HRRR weight decreases as NBM/GFS/ECMWF take more long-lead weight."""
         assert _get_lead_bucket(6.0) == "short"
         assert _get_lead_bucket(18.0) == "medium"
         assert _get_lead_bucket(30.0) == "long"
 
-        assert WEIGHTS_US["short"]["hrrr"] == 0.50   # reduced from 0.60 for TimesFM slot
-        assert WEIGHTS_US["medium"]["hrrr"] == 0.30  # reduced from 0.40 for TimesFM slot
-        assert WEIGHTS_US["long"]["hrrr"] == 0.15    # reduced from 0.20 for TimesFM slot
+        assert WEIGHTS_US["short"]["hrrr"] == 0.40
+        assert WEIGHTS_US["medium"]["hrrr"] == 0.25
+        assert WEIGHTS_US["long"]["hrrr"] == 0.05
+        assert WEIGHTS_US["long"]["nbm"] == 0.30
 
         # HRRR strictly decreasing across buckets
         assert WEIGHTS_US["short"]["hrrr"] > WEIGHTS_US["medium"]["hrrr"] > WEIGHTS_US["long"]["hrrr"]

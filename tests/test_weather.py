@@ -22,6 +22,7 @@ from weatheredge.data.weather import (
     fetch_ecmwf,
     fetch_ensemble,
     fetch_forecast,
+    fetch_nbm,
     store_forecast,
 )
 
@@ -71,6 +72,24 @@ SAMPLE_ECMWF_RESPONSE = {
         "time": SAMPLE_TIMES,
         "temperature_2m": [5.5, 5.3, 5.1],
         "apparent_temperature": [2.5, 2.3, 2.1],
+        "precipitation": [0.0, 0.0, 0.1],
+        "precipitation_probability": [5, 10, 15],
+        "rain": [0.0, 0.0, 0.0],
+        "snowfall": [0.0, 0.0, 0.0],
+        "cloud_cover": [30, 35, 40],
+        "wind_speed_10m": [10.0, 10.5, 11.0],
+        "wind_gusts_10m": [18.0, 18.5, 19.0],
+        "relative_humidity_2m": [65, 67, 69],
+    },
+}
+
+SAMPLE_NBM_RESPONSE = {
+    "latitude": 40.71,
+    "longitude": -74.01,
+    "hourly": {
+        "time": SAMPLE_TIMES,
+        "temperature_2m": [6.5, 6.2, 5.9],
+        "apparent_temperature": [3.5, 3.2, 2.9],
         "precipitation": [0.0, 0.0, 0.1],
         "precipitation_probability": [5, 10, 15],
         "rain": [0.0, 0.0, 0.0],
@@ -216,6 +235,26 @@ async def test_fetch_ecmwf_calls_correct_endpoint():
 
 
 # ---------------------------------------------------------------------------
+# fetch_nbm tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fetch_nbm_calls_gfs_endpoint_with_nbm_model():
+    """fetch_nbm must select the Open-Meteo NBM Conus model explicitly."""
+    session = _make_mock_session(SAMPLE_NBM_RESPONSE)
+
+    result = await fetch_nbm(40.71, -74.01, session)
+
+    assert result["hourly"]["temperature_2m"] == [6.5, 6.2, 5.9]
+    call_args = session.get.call_args
+    url = call_args[0][0]
+    params = call_args[1]["params"]
+    assert url == f"{BASE_URL}/v1/gfs"
+    assert params["models"] == "ncep_nbm_conus"
+    assert params["temperature_unit"] == "fahrenheit"
+
+
+# ---------------------------------------------------------------------------
 # Retry logic tests
 # ---------------------------------------------------------------------------
 
@@ -336,6 +375,8 @@ def test_store_forecast_writes_to_db():
         assert row.target_date == "2026-03-30"
         assert row.model == "forecast"
         assert row.temperature_forecast == 5.2
+        assert row.temperature_max_forecast == 5.2
+        assert row.temperature_min_forecast == 4.8
         assert row.precipitation_forecast == 0.0
 
 
@@ -362,6 +403,9 @@ def test_store_forecast_ensemble_serialises_members():
         assert row.ensemble_members is not None
         members = json.loads(row.ensemble_members)
         assert members == [4.5, 4.3, 4.1]
+        assert row.ensemble_min_members is not None
+        min_members = json.loads(row.ensemble_min_members)
+        assert min_members == [4.1, 3.9, 3.7]
 
 
 def test_store_forecast_non_ensemble_no_members():
@@ -411,6 +455,8 @@ def test_store_forecast_uses_target_date_max_temperature():
     )
 
     assert row.temperature_forecast == pytest.approx(71.5)
+    assert row.temperature_max_forecast == pytest.approx(71.5)
+    assert row.temperature_min_forecast == pytest.approx(65.0)
     mock_session.add.assert_called_once()
 
 

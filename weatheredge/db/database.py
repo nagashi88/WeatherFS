@@ -107,6 +107,9 @@ def init_db(engine: Engine | None = None) -> None:
     # Migrate signals: add trade_id back-link to enable JOIN from a trade to
     # the per-agent votes that produced it.
     _migrate_signals_columns(target)
+    # Migrate forecasts: add daily max/min columns so daily-low markets can use
+    # true daily minima without breaking legacy temperature_forecast readers.
+    _migrate_forecast_columns(target)
     log.info("Database tables created (or already exist) at %s", target.url)
 
 
@@ -199,6 +202,33 @@ def _migrate_signals_columns(engine: Engine) -> None:
                 "ON signals(market_id, trade_id)"
             )
         )
+
+
+def _migrate_forecast_columns(engine: Engine) -> None:
+    """Add daily min/max forecast columns to existing forecasts table."""
+    from sqlalchemy import inspect as sa_inspect
+
+    inspector = sa_inspect(engine)
+    if "forecasts" not in inspector.get_table_names():
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("forecasts")}
+    with engine.begin() as conn:
+        if "temperature_max_forecast" not in existing:
+            conn.execute(text("ALTER TABLE forecasts ADD COLUMN temperature_max_forecast FLOAT"))
+            conn.execute(
+                text(
+                    "UPDATE forecasts SET temperature_max_forecast = temperature_forecast "
+                    "WHERE temperature_max_forecast IS NULL"
+                )
+            )
+            log.info("Migrated forecasts table: added 'temperature_max_forecast' column")
+        if "temperature_min_forecast" not in existing:
+            conn.execute(text("ALTER TABLE forecasts ADD COLUMN temperature_min_forecast FLOAT"))
+            log.info("Migrated forecasts table: added 'temperature_min_forecast' column")
+        if "ensemble_min_members" not in existing:
+            conn.execute(text("ALTER TABLE forecasts ADD COLUMN ensemble_min_members TEXT"))
+            log.info("Migrated forecasts table: added 'ensemble_min_members' column")
 
 
 @contextmanager

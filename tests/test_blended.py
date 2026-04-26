@@ -36,7 +36,7 @@ class TestBlendedProbability:
         assert model == "metar_override"
 
     def test_us_short_range_hrrr_dominant(self):
-        """For US with <12h lead, HRRR should have 60% weight."""
+        """For US with <12h lead, HRRR remains the highest-weight source."""
         prob, model, details = blended_probability(
             threshold=70.0,
             direction="above",
@@ -46,11 +46,14 @@ class TestBlendedProbability:
             gfs_forecast_temp=75.0,
             ecmwf_forecast_temp=75.0,
             hrrr_forecast_temp=75.0,
+            nbm_forecast_temp=75.0,
         )
         assert details["weight_bucket"] == "short"
-        assert details["weights"]["hrrr"] == 0.60
+        assert details["weights"]["hrrr"] == 0.45
+        assert details["weights"]["nbm"] == 0.25
         assert prob > 0.5  # 75°F forecast > 70°F threshold
         assert "hrrr" in model
+        assert "nbm" in model
 
     def test_us_medium_range(self):
         prob, model, details = blended_probability(
@@ -61,9 +64,11 @@ class TestBlendedProbability:
             gfs_forecast_temp=75.0,
             ecmwf_forecast_temp=75.0,
             hrrr_forecast_temp=75.0,
+            nbm_forecast_temp=75.0,
         )
         assert details["weight_bucket"] == "medium"
-        assert details["weights"]["hrrr"] == 0.40
+        assert details["weights"]["nbm"] == 0.35
+        assert details["weights"]["hrrr"] == 0.25
 
     def test_us_long_range(self):
         prob, model, details = blended_probability(
@@ -74,10 +79,11 @@ class TestBlendedProbability:
             gfs_forecast_temp=75.0,
             ecmwf_forecast_temp=75.0,
             hrrr_forecast_temp=75.0,
+            nbm_forecast_temp=75.0,
         )
         assert details["weight_bucket"] == "long"
-        assert details["weights"]["hrrr"] == 0.20
-        assert details["weights"]["gfs_ensemble"] == 0.40
+        assert details["weights"]["nbm"] == 0.35
+        assert details["weights"]["gfs_ensemble"] == 0.30
 
     def test_non_us_no_hrrr(self):
         """Non-US cities should get 50/50 GFS/ECMWF, no HRRR."""
@@ -88,9 +94,11 @@ class TestBlendedProbability:
             ensemble_temps=[25.0] * 31,
             ecmwf_forecast_temp=25.0,
             hrrr_forecast_temp=25.0,  # should be ignored
+            nbm_forecast_temp=25.0,  # should be ignored
         )
         assert details["weight_bucket"] == "non_us"
         assert "hrrr" not in model  # HRRR not used for non-US
+        assert "nbm" not in model  # NBM not used for non-US
 
     def test_ensemble_only_fallback(self):
         """If only ensemble data available, should still produce a probability."""
@@ -126,6 +134,18 @@ class TestBlendedProbability:
         assert 0 < prob < 1
         assert model == "gaussian_fallback"
 
+    def test_nbm_point_fallback(self):
+        """If only NBM point forecast is available, use it before no-data fallback."""
+        prob, model, details = blended_probability(
+            threshold=70.0,
+            is_us_station=True,
+            lead_time_hours=24,
+            nbm_forecast_temp=75.0,
+        )
+        assert 0 < prob < 1
+        assert model == "blended_nbm"
+        assert details["nbm_prob"] > 0.5
+
     def test_probability_bounded(self):
         """All probabilities should be between 0 and 1."""
         for threshold in [50, 70, 90]:
@@ -136,6 +156,7 @@ class TestBlendedProbability:
                     gfs_forecast_temp=temp,
                     ecmwf_forecast_temp=temp,
                     hrrr_forecast_temp=temp,
+                    nbm_forecast_temp=temp,
                     is_us_station=True,
                     lead_time_hours=6,
                 )

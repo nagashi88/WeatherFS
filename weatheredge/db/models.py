@@ -52,18 +52,21 @@ class MarketPrice(Base):
 
 
 class Forecast(Base):
-    """Weather forecasts from NWF/GFS/ECMWF/HRRR models."""
+    """Weather forecasts from NWF/GFS/ECMWF/HRRR/NBM models."""
 
     __tablename__ = "forecasts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     station: Mapped[str] = mapped_column(Text, nullable=False)
     target_date: Mapped[str] = mapped_column(Text, nullable=False)
-    model: Mapped[str] = mapped_column(Text, nullable=False)  # 'gfs', 'ecmwf', 'hrrr', 'ensemble'
+    model: Mapped[str] = mapped_column(Text, nullable=False)  # 'gfs', 'ecmwf', 'hrrr', 'nbm', 'ensemble'
     forecast_timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     lead_time_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    temperature_max_forecast: Mapped[float | None] = mapped_column(Float)
+    temperature_min_forecast: Mapped[float | None] = mapped_column(Float)
     temperature_forecast: Mapped[float | None] = mapped_column(Float)
     ensemble_members: Mapped[str | None] = mapped_column(Text)  # JSON array of 31 values
+    ensemble_min_members: Mapped[str | None] = mapped_column(Text)  # JSON array of daily-min values
     precipitation_forecast: Mapped[float | None] = mapped_column(Float)
     actual_temp: Mapped[float | None] = mapped_column(Float)  # Observed temperature for RMSE calculation
     created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))

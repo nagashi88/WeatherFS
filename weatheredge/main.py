@@ -33,7 +33,7 @@ from weatheredge.data.market import (
     _title_is_one_sided_below,
 )
 from weatheredge.data.noaa import fetch_noaa_forecast, store_noaa_forecast
-from weatheredge.data.weather import fetch_forecast, fetch_ensemble, fetch_ecmwf, store_forecast
+from weatheredge.data.weather import fetch_forecast, fetch_ensemble, fetch_ecmwf, fetch_nbm, store_forecast
 from weatheredge.db.database import get_session, init_db
 from weatheredge.db.models import Forecast, MarketPrice
 from weatheredge.execution.paper_trader import Order, PaperTrader
@@ -698,6 +698,22 @@ async def _fetch_all_forecasts(state: AppState) -> None:
                 )
             except Exception as exc:
                 log.warning("Open-Meteo ensemble failed for %s: %s", city, exc)
+
+            # Open-Meteo NBM Conus — high-resolution U.S. blend, fetched as its
+            # own model so disagreement with GFS/HRRR/ECMWF remains observable.
+            try:
+                data = await fetch_nbm(lat, lon, session)
+                with get_session() as db_session:
+                    for target_date in forecast_dates:
+                        store_forecast(db_session, station_code, target_date, "nbm", data)
+                log.info(
+                    "Stored Open-Meteo NBM for %s/%s (%d dates)",
+                    city,
+                    station_code,
+                    len(forecast_dates),
+                )
+            except Exception as exc:
+                log.warning("Open-Meteo NBM failed for %s: %s", city, exc)
 
             # NOAA NWS — fetch once, store for each future date
             try:
@@ -1697,6 +1713,12 @@ def _read_latest_forecasts() -> dict[str, dict[str, dict]]:
     # seen[(station, target_date)] = set of models already recorded for that key
     seen: dict[tuple, set[str]] = {}
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _numeric_temp(value: object) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
     # Only fetch rows for today and future dates, from recent fetches (last 3h).
     # This avoids scanning the full historical archive (476k+ rows) and ensures
     # each station+date gets the most recent model run.
@@ -1729,32 +1751,57 @@ def _read_latest_forecasts() -> dict[str, dict[str, dict]]:
             if target_date not in result[station]:
                 result[station][target_date] = {
                     "temperature_forecast": None,
+                    "temperature_min_forecast": None,
+                    "temperature_max_forecast": None,
                     "ecmwf_temp": None,
+                    "ecmwf_min_temp": None,
                     "hrrr_temp": None,
+                    "hrrr_min_temp": None,
+                    "nbm_temp": None,
+                    "nbm_min_temp": None,
                     "ensemble_members": None,
+                    "ensemble_members_min": None,
                     "model": model,
                     "forecast_timestamp": row.forecast_timestamp,
                 }
 
             entry = result[station][target_date]
+            row_max_temp = _numeric_temp(getattr(row, "temperature_max_forecast", None))
+            if row_max_temp is None:
+                row_max_temp = _numeric_temp(getattr(row, "temperature_forecast", None))
+            row_min_temp = _numeric_temp(getattr(row, "temperature_min_forecast", None))
+            current_ts = entry.get("forecast_timestamp")
+            if current_ts is None or row.forecast_timestamp > current_ts:
+                entry["forecast_timestamp"] = row.forecast_timestamp
             if "ensemble" in model:
                 if row.ensemble_members:
                     try:
                         entry["ensemble_members"] = json.loads(row.ensemble_members)
                     except (json.JSONDecodeError, TypeError):
                         pass
+                if row.ensemble_min_members:
+                    try:
+                        entry["ensemble_members_min"] = json.loads(row.ensemble_min_members)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
             elif "ecmwf" in model:
-                entry["ecmwf_temp"] = row.temperature_forecast
+                entry["ecmwf_temp"] = row_max_temp
+                entry["ecmwf_min_temp"] = row_min_temp
             elif "hrrr" in model:
-                entry["hrrr_temp"] = row.temperature_forecast
+                entry["hrrr_temp"] = row_max_temp
+                entry["hrrr_min_temp"] = row_min_temp
+            elif "nbm" in model:
+                entry["nbm_temp"] = row_max_temp
+                entry["nbm_min_temp"] = row_min_temp
             else:
                 # GFS / Open-Meteo / NOAA — primary forecast.
                 # Prefer "forecast" model (Open-Meteo daily max) over noaa_nws
                 # (hourly rows that store one value per period, not the daily max).
                 is_openmeteo_daily = model == "forecast"
                 if entry["temperature_forecast"] is None or is_openmeteo_daily:
-                    entry["temperature_forecast"] = row.temperature_forecast
-                    entry["forecast_timestamp"] = row.forecast_timestamp
+                    entry["temperature_forecast"] = row_max_temp
+                    entry["temperature_max_forecast"] = row_max_temp
+                    entry["temperature_min_forecast"] = row_min_temp
     return result
 
 
@@ -2107,10 +2154,27 @@ def _build_opportunity(
             log.debug("_build_opportunity: %s skipped — NO price=%.3f < $0.10 minimum", market_id, 1.0 - yes_price)
             return None
 
-    gfs_temp = forecast.get("temperature_forecast")
-    ecmwf_temp = forecast.get("ecmwf_temp")
-    hrrr_temp = forecast.get("hrrr_temp")
-    ensemble_members = forecast.get("ensemble_members")
+    use_daily_min = market_type == "daily_low"
+    if use_daily_min:
+        gfs_temp = forecast.get("temperature_min_forecast")
+        ecmwf_temp = forecast.get("ecmwf_min_temp")
+        hrrr_temp = forecast.get("hrrr_min_temp")
+        nbm_temp = forecast.get("nbm_min_temp")
+        ensemble_members = forecast.get("ensemble_members_min")
+        if _first_not_none(gfs_temp, ecmwf_temp, hrrr_temp, nbm_temp) is None and not ensemble_members:
+            log.debug(
+                "_build_opportunity: %s skipped — daily_low requires true daily-min forecast for %s/%s",
+                market_id,
+                station,
+                market_date,
+            )
+            return None
+    else:
+        gfs_temp = forecast.get("temperature_forecast")
+        ecmwf_temp = forecast.get("ecmwf_temp")
+        hrrr_temp = forecast.get("hrrr_temp")
+        nbm_temp = forecast.get("nbm_temp")
+        ensemble_members = forecast.get("ensemble_members")
 
     # BugFix E3: Defensive °C→°F conversion for any temperature that looks like Celsius.
     # All three fetch endpoints now request fahrenheit, but old DB rows (pre-fix) may still
@@ -2133,6 +2197,7 @@ def _build_opportunity(
     gfs_temp = _guard_fahrenheit(gfs_temp, "gfs")
     ecmwf_temp = _guard_fahrenheit(ecmwf_temp, "ecmwf")
     hrrr_temp = _guard_fahrenheit(hrrr_temp, "hrrr")
+    nbm_temp = _guard_fahrenheit(nbm_temp, "nbm")
     if ensemble_members:
         # Use mean to avoid false positives from ensemble spread tails.
         mean_ens = sum(ensemble_members) / len(ensemble_members)
@@ -2141,7 +2206,9 @@ def _build_opportunity(
             log.warning("_build_opportunity: %s ensemble_members look like °C (mean=%.1f) — converting all to °F", market_id, mean_ens)
 
     # Need at least one temperature source
-    forecast_temp = _first_not_none(gfs_temp, ecmwf_temp, hrrr_temp)
+    forecast_temp = _first_not_none(nbm_temp, hrrr_temp, gfs_temp, ecmwf_temp)
+    if forecast_temp is None and ensemble_members:
+        forecast_temp = sum(ensemble_members) / len(ensemble_members)
     if forecast_temp is None:
         return None
 
@@ -2172,6 +2239,8 @@ def _build_opportunity(
     from weatheredge.probability.bias_correction import get_rmse
     is_us = station in US_STATIONS
     _primary_model = "hrrr" if (is_us and lead_time_hours < 24) else "gfs"
+    if is_us and nbm_temp is not None and lead_time_hours >= 12:
+        _primary_model = "nbm"
     rmse = get_rmse(station, _primary_model, lead_time_days)
 
     # Phase 1: Dynamic RMSE floor — ensures HRRR <12h never goes below 1.5°F, etc.
@@ -2190,7 +2259,9 @@ def _build_opportunity(
                 ecmwf_temp -= get_bias_correction(station, "ecmwf", _month)
             if hrrr_temp is not None:
                 hrrr_temp -= get_bias_correction(station, "hrrr", _month)
-            forecast_temp = _first_not_none(gfs_temp, ecmwf_temp, hrrr_temp)
+            if nbm_temp is not None:
+                nbm_temp -= get_bias_correction(station, "nbm", _month)
+            forecast_temp = _first_not_none(nbm_temp, hrrr_temp, gfs_temp, ecmwf_temp)
         except Exception as _bc_exc:
             log.debug("_build_opportunity: bias correction skipped for %s: %s", market_id, _bc_exc)
 
@@ -2217,6 +2288,7 @@ def _build_opportunity(
                 gfs_forecast_temp=gfs_temp,
                 ecmwf_forecast_temp=ecmwf_temp,
                 hrrr_forecast_temp=hrrr_temp if is_us else None,
+                nbm_forecast_temp=nbm_temp if is_us else None,
                 metar_override=None,  # pure forecast probability, no override
             )
             _contradiction_diff = abs(metar_override - _forecast_prob_only)
@@ -2387,9 +2459,10 @@ def _build_opportunity(
             _lw_gfs = state.model_weight_updater.get_model_weight(station, "gfs_ensemble", lead_time_days)
             _lw_ecmwf = state.model_weight_updater.get_model_weight(station, "ecmwf", lead_time_days)
             _lw_hrrr = state.model_weight_updater.get_model_weight(station, "hrrr", lead_time_days)
+            _lw_nbm = state.model_weight_updater.get_model_weight(station, "nbm", lead_time_days)
             # Only use learned weights if they differ from defaults (meaning we have real data)
-            if not (_lw_gfs == 1.0 and _lw_ecmwf == 1.0 and _lw_hrrr == 1.0):
-                _lw = {"gfs_ensemble": _lw_gfs, "ecmwf": _lw_ecmwf, "hrrr": _lw_hrrr}
+            if not (_lw_gfs == 1.0 and _lw_ecmwf == 1.0 and _lw_hrrr == 1.0 and _lw_nbm == 1.0):
+                _lw = {"gfs_ensemble": _lw_gfs, "ecmwf": _lw_ecmwf, "hrrr": _lw_hrrr, "nbm": _lw_nbm}
                 _learned_weights = _lw
 
         # Phase 6: TimesFM probability + NWP error correction
@@ -2422,6 +2495,7 @@ def _build_opportunity(
                 gfs_forecast_temp=gfs_temp,
                 ecmwf_forecast_temp=ecmwf_temp,
                 hrrr_forecast_temp=hrrr_temp if is_us else None,
+                nbm_forecast_temp=nbm_temp if is_us else None,
                 metar_override=metar_override,
                 learned_weights=_learned_weights,
                 timesfm_prob=_timesfm_prob,

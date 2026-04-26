@@ -364,7 +364,7 @@ class TestCrossPlatformArbitrage:
 
 
 # ===========================================================================
-# 8. HRRR short-range dominance: <12h lead time, HRRR weight 60%
+# 8. HRRR short-range dominance: <12h lead time, HRRR remains top-weighted
 # ===========================================================================
 
 class TestHRRRShortRange:
@@ -385,13 +385,14 @@ class TestHRRRShortRange:
         )
 
         assert details["weight_bucket"] == "short"
-        assert details["weights"]["hrrr"] == 0.60
+        assert details["weights"]["hrrr"] == 0.45
+        assert details["weights"]["nbm"] == 0.25
         # HRRR at 80°F strongly pushes probability above 0.5
         assert prob > 0.55
         assert "hrrr" in model_used
 
     def test_long_lead_hrrr_reduced(self):
-        """At >24h lead, HRRR weight drops to 20%."""
+        """At >24h lead, HRRR weight drops sharply and NBM/GFS/ECMWF dominate."""
         from weatheredge.probability.blended import blended_probability
 
         prob, model_used, details = blended_probability(
@@ -404,7 +405,8 @@ class TestHRRRShortRange:
         )
 
         assert details["weight_bucket"] == "long"
-        assert details["weights"]["hrrr"] == 0.20
+        assert details["weights"]["hrrr"] == 0.05
+        assert details["weights"]["nbm"] == 0.35
         # With reduced HRRR weight, probability should be lower than short-range
         assert prob < 0.55
 

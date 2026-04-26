@@ -131,6 +131,64 @@ def test_weighted_voting_below_threshold():
     rm.pre_trade_check.assert_not_called()
 
 
+def test_model_disagreement_block_skips_trade_before_risk():
+    """Severe Gaussian-vs-ensemble disagreement is a real entry block."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    opp = make_opportunity("MKT-DISAGREE-BLOCK")
+    opp.bucket_low = 72.0
+    opp.bucket_high = 78.0
+    opp.gaussian_prob = 0.90
+    opp.ensemble_prob = 0.60
+    signals = [
+        Signal(market_id=opp.market_id, side="buy_yes", confidence=1.0, agent_name="Conservative"),
+    ]
+
+    orders = pm.aggregate_signals(
+        signals_by_market={opp.market_id: signals},
+        opportunities={opp.market_id: opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+
+
+def test_model_disagreement_haircut_reduces_size():
+    """Moderate model disagreement keeps learning data but halves exposure."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    opp = make_opportunity("MKT-DISAGREE-HAIRCUT")
+    opp.bucket_low = 72.0
+    opp.bucket_high = 78.0
+    opp.gaussian_prob = 0.76
+    opp.ensemble_prob = 0.60
+    signals = [
+        Signal(market_id=opp.market_id, side="buy_yes", confidence=1.0, agent_name="Conservative"),
+    ]
+
+    orders = pm.aggregate_signals(
+        signals_by_market={opp.market_id: signals},
+        opportunities={opp.market_id: opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].amount == 25.0
+
+
 def test_opposing_weak_votes_do_not_inflate_past_threshold():
     """Regression for CCG-bughunt2 F-new-7: the gate must use the MAJORITY
     side's score, not sum(side_scores.values()). Two weak opposing votes
@@ -736,12 +794,13 @@ def test_yes_guard_rail_disabled_also_skips_haircut():
     assert orders[0].amount == 100.0  # Full size, no haircut
 
 
-def test_daily_low_entries_are_blocked_until_min_forecasts_exist():
-    """daily_low entries are disabled while forecast_temp represents daily max."""
+def test_daily_low_entries_can_be_disabled_by_config():
+    """The portfolio still honors the kill switch for daily_low entries."""
     rm = MagicMock()
     rm.pre_trade_check.return_value = {"blocked": False}
     rm.calculate_position_size.return_value = 100.0
-    pm = make_pm(rm)
+    settings = make_settings(daily_low_entry_enabled=False)
+    pm = PortfolioManager(settings, rm)
 
     signals = [
         Signal(market_id="MKT-LOW", side="buy_no", confidence=1.0, agent_name="Aggressive"),
@@ -762,6 +821,337 @@ def test_daily_low_entries_are_blocked_until_min_forecasts_exist():
 
     assert orders == []
     rm.pre_trade_check.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 entry-quality guards
+# ---------------------------------------------------------------------------
+
+def test_same_cycle_duplicate_guard_keeps_highest_edge_candidate():
+    """Same station/date/type/side candidates from one cycle should keep the
+    highest signal-side edge only. This is narrower than a max-one-event rule."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    def buy_no_signals(mid: str) -> list[Signal]:
+        return [
+            Signal(market_id=mid, side="buy_no", confidence=1.0, agent_name="Aggressive"),
+            Signal(market_id=mid, side="buy_no", confidence=1.0, agent_name="SellNO"),
+        ]
+
+    low_edge = make_opportunity("MKT-DUP-LOW", city="LAX")
+    low_edge.station = "KLAX"
+    low_edge.market_date = "2026-04-26"
+    low_edge.market_type = "daily_high"
+    low_edge.market_price = 0.70
+    low_edge.model_probability = 0.35
+    low_edge.net_edge_no = 0.20
+
+    high_edge = make_opportunity("MKT-DUP-HIGH", city="LAX")
+    high_edge.station = "KLAX"
+    high_edge.market_date = "2026-04-26"
+    high_edge.market_type = "daily_high"
+    high_edge.market_price = 0.75
+    high_edge.model_probability = 0.25
+    high_edge.net_edge_no = 0.45
+
+    orders = pm.aggregate_signals(
+        signals_by_market={
+            low_edge.market_id: buy_no_signals(low_edge.market_id),
+            high_edge.market_id: buy_no_signals(high_edge.market_id),
+        },
+        opportunities={
+            low_edge.market_id: low_edge,
+            high_edge.market_id: high_edge,
+        },
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].market_id == high_edge.market_id
+    assert orders[0].edge_at_entry == pytest.approx(0.45)
+    rm.pre_trade_check.assert_called_once()
+
+
+def test_same_cycle_duplicate_guard_disabled_allows_both_candidates():
+    """The duplicate guard remains configurable for safe rollback."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    settings = make_settings(same_cycle_duplicate_guard_enabled=False)
+    pm = PortfolioManager(settings, rm)
+
+    def buy_no_signals(mid: str) -> list[Signal]:
+        return [
+            Signal(market_id=mid, side="buy_no", confidence=1.0, agent_name="Aggressive"),
+            Signal(market_id=mid, side="buy_no", confidence=1.0, agent_name="SellNO"),
+        ]
+
+    opp_a = make_opportunity("MKT-DUP-A", city="LAX")
+    opp_a.station = "KLAX"
+    opp_a.market_date = "2026-04-26"
+    opp_a.market_type = "daily_high"
+    opp_a.market_price = 0.70
+    opp_a.model_probability = 0.35
+    opp_a.net_edge_no = 0.20
+
+    opp_b = make_opportunity("MKT-DUP-B", city="LAX")
+    opp_b.station = "KLAX"
+    opp_b.market_date = "2026-04-26"
+    opp_b.market_type = "daily_high"
+    opp_b.market_price = 0.75
+    opp_b.model_probability = 0.25
+    opp_b.net_edge_no = 0.45
+
+    orders = pm.aggregate_signals(
+        signals_by_market={
+            opp_a.market_id: buy_no_signals(opp_a.market_id),
+            opp_b.market_id: buy_no_signals(opp_b.market_id),
+        },
+        opportunities={
+            opp_a.market_id: opp_a,
+            opp_b.market_id: opp_b,
+        },
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 2
+
+
+def test_weak_long_buy_yes_guard_blocks_threshold_trade_before_risk():
+    """A weak buy_yes more than one day out is blocked on threshold markets."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-WEAK-LONG", side="buy_yes", confidence=1.0, agent_name="Conservative"),
+        Signal(market_id="MKT-WEAK-LONG", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+    ]
+    opp = make_opportunity("MKT-WEAK-LONG")
+    opp.market_date = "2026-04-27"
+    opp.lead_time_days = 2
+    opp.model_probability = 0.45
+    opp.market_price = 0.20
+    opp.net_edge = 0.23
+    opp.bucket_low = None
+    opp.bucket_high = None
+
+    orders = pm.aggregate_signals(
+        signals_by_market={opp.market_id: signals},
+        opportunities={opp.market_id: opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+
+
+def test_weak_long_buy_yes_guard_allows_same_setup_at_one_day():
+    """The guard must not block the one-day low-price YES pattern that won last week."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-WEAK-ONE-DAY", side="buy_yes", confidence=1.0, agent_name="Conservative"),
+        Signal(market_id="MKT-WEAK-ONE-DAY", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+    ]
+    opp = make_opportunity("MKT-WEAK-ONE-DAY")
+    opp.market_date = "2026-04-26"
+    opp.lead_time_days = 1
+    opp.model_probability = 0.45
+    opp.market_price = 0.20
+    opp.net_edge = 0.23
+    opp.bucket_low = None
+    opp.bucket_high = None
+
+    orders = pm.aggregate_signals(
+        signals_by_market={opp.market_id: signals},
+        opportunities={opp.market_id: opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_yes"
+
+
+def test_weak_long_buy_yes_guard_does_not_block_bucket_markets_by_default():
+    """Default scope is threshold-only so cheap bucket YES trades are not killed
+    without direct historical evidence."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 50.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-BUCKET-WEAK-LONG", side="buy_yes", confidence=1.0, agent_name="Conservative"),
+        Signal(market_id="MKT-BUCKET-WEAK-LONG", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+    ]
+    opp = make_opportunity("MKT-BUCKET-WEAK-LONG")
+    opp.market_date = "2026-04-27"
+    opp.lead_time_days = 2
+    opp.model_probability = 0.45
+    opp.market_price = 0.20
+    opp.net_edge = 0.23
+    opp.bucket_low = 70.0
+    opp.bucket_high = 75.0
+
+    orders = pm.aggregate_signals(
+        signals_by_market={opp.market_id: signals},
+        opportunities={opp.market_id: opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_yes"
+
+
+def test_bucket_raw_prob_floor_guard_blocks_buy_no_before_risk():
+    """Floor-bound bucket NO with raw YES <1% is a tail-risk regime, not edge."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-RAW-FLOOR", side="buy_no", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-RAW-FLOOR", side="buy_no", confidence=1.0, agent_name="SellNO"),
+    ]
+    opp = make_opportunity("MKT-RAW-FLOOR")
+    opp.market_price = 0.45
+    opp.model_probability = 0.10
+    opp.net_edge_no = 0.35
+    opp.bucket_low = 54.0
+    opp.bucket_high = 55.0
+    opp.raw_model_prob = 0.005
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-RAW-FLOOR": signals},
+        opportunities={"MKT-RAW-FLOOR": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+
+
+def test_bucket_raw_prob_floor_guard_allows_buy_no_above_min_raw_prob():
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-RAW-OK", side="buy_no", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-RAW-OK", side="buy_no", confidence=1.0, agent_name="SellNO"),
+    ]
+    opp = make_opportunity("MKT-RAW-OK")
+    opp.market_price = 0.45
+    opp.model_probability = 0.10
+    opp.net_edge_no = 0.35
+    opp.bucket_low = 54.0
+    opp.bucket_high = 55.0
+    opp.raw_model_prob = 0.05
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-RAW-OK": signals},
+        opportunities={"MKT-RAW-OK": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_no"
+    assert orders[0].raw_model_prob == pytest.approx(0.05)
+
+
+def test_bucket_raw_prob_floor_guard_does_not_block_buy_yes():
+    """The live guard targets floor-generated NO confidence only."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    signals = [
+        Signal(market_id="MKT-BUY-YES-RAW-LOW", side="buy_yes", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-BUY-YES-RAW-LOW", side="buy_yes", confidence=1.0, agent_name="Qualitative"),
+    ]
+    opp = make_opportunity("MKT-BUY-YES-RAW-LOW")
+    opp.market_price = 0.08
+    opp.model_probability = 0.10
+    opp.net_edge = 0.02
+    opp.bucket_low = 54.0
+    opp.bucket_high = 55.0
+    opp.raw_model_prob = 0.005
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-BUY-YES-RAW-LOW": signals},
+        opportunities={"MKT-BUY-YES-RAW-LOW": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_yes"
+
+
+def test_bucket_raw_prob_floor_guard_can_be_disabled():
+    settings = make_settings(bucket_raw_prob_floor_guard_enabled=False)
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = PortfolioManager(settings, rm)
+
+    signals = [
+        Signal(market_id="MKT-RAW-DISABLED", side="buy_no", confidence=1.0, agent_name="Aggressive"),
+        Signal(market_id="MKT-RAW-DISABLED", side="buy_no", confidence=1.0, agent_name="SellNO"),
+    ]
+    opp = make_opportunity("MKT-RAW-DISABLED")
+    opp.market_price = 0.45
+    opp.model_probability = 0.10
+    opp.net_edge_no = 0.35
+    opp.bucket_low = 54.0
+    opp.bucket_high = 55.0
+    opp.raw_model_prob = 0.005
+
+    orders = pm.aggregate_signals(
+        signals_by_market={"MKT-RAW-DISABLED": signals},
+        opportunities={"MKT-RAW-DISABLED": opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].side == "buy_no"
 
 
 def test_qualitative_caution_haircut_reduces_fragile_entry_size():
