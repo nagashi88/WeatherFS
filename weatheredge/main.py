@@ -24,7 +24,13 @@ from pathlib import Path
 import aiohttp
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from weatheredge.config import Settings, MODULES, BURST_EDGE_DISCOUNT, BURST_WINDOW_MINUTES
+from weatheredge.config import (
+    Settings,
+    MODULES,
+    BURST_EDGE_DISCOUNT,
+    BURST_MIN_EDGE_FLOOR,
+    BURST_WINDOW_MINUTES,
+)
 from weatheredge.data.actuals import fetch_daily_max_actual, store_actual_temperatures
 from weatheredge.data.market import (
     MarketScanner,
@@ -448,8 +454,8 @@ def _phase2_effective_thresholds(state: AppState) -> tuple[float, float, float]:
 
     if _is_burst_mode_active(state):
         discount = max(0.0, float(BURST_EDGE_DISCOUNT))
-        conservative = max(0.0, conservative - discount)
-        aggressive = max(0.0, aggressive - discount)
+        conservative = max(BURST_MIN_EDGE_FLOOR, conservative - discount)
+        aggressive = max(BURST_MIN_EDGE_FLOOR, aggressive - discount)
         qualitative = max(0.0, qualitative - (discount * 0.5))
 
     return conservative, aggressive, qualitative

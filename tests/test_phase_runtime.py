@@ -117,7 +117,7 @@ def test_runtime_order_mode_override_market(monkeypatch):
 
 def test_phase2_effective_thresholds_burst_on():
     from weatheredge.main import AppState, _phase2_effective_thresholds
-    from weatheredge.config import BURST_EDGE_DISCOUNT
+    from weatheredge.config import BURST_EDGE_DISCOUNT, BURST_MIN_EDGE_FLOOR
 
     original_modules = dict(cfg.MODULES)
     try:
@@ -127,9 +127,39 @@ def test_phase2_effective_thresholds_burst_on():
 
         conservative, aggressive, qualitative = _phase2_effective_thresholds(state)
 
-        assert abs(conservative - max(0.0, state._base_conservative_min_edge - BURST_EDGE_DISCOUNT)) < 1e-9
-        assert abs(aggressive - max(0.0, state._base_aggressive_min_edge - BURST_EDGE_DISCOUNT)) < 1e-9
+        assert abs(conservative - max(BURST_MIN_EDGE_FLOOR, state._base_conservative_min_edge - BURST_EDGE_DISCOUNT)) < 1e-9
+        assert abs(aggressive - max(BURST_MIN_EDGE_FLOOR, state._base_aggressive_min_edge - BURST_EDGE_DISCOUNT)) < 1e-9
         assert abs(qualitative - max(0.0, 0.05 - (BURST_EDGE_DISCOUNT * 0.5))) < 1e-9
+    finally:
+        cfg.MODULES.clear()
+        cfg.MODULES.update(original_modules)
+
+
+def test_phase2_burst_floor_protects_against_oversized_discount():
+    """If BURST_EDGE_DISCOUNT >= conservative_min_edge, the lexical max(0.0,...)
+    floor would have dropped the threshold to 0 and let through edge-less
+    trades during a model-run window. BURST_MIN_EDGE_FLOOR clamps at 0.05.
+    """
+    from unittest.mock import patch
+
+    from weatheredge.main import AppState, _phase2_effective_thresholds
+    from weatheredge.config import BURST_MIN_EDGE_FLOOR
+
+    original_modules = dict(cfg.MODULES)
+    try:
+        cfg.MODULES["burst_mode"] = True
+        state = AppState()
+        state._base_conservative_min_edge = 0.10
+        state._base_aggressive_min_edge = 0.08
+        state._burst_mode_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+        # An over-large discount (e.g. misconfigured to 0.20) would have
+        # dropped both thresholds below zero pre-fix.
+        with patch("weatheredge.main.BURST_EDGE_DISCOUNT", 0.20):
+            conservative, aggressive, _ = _phase2_effective_thresholds(state)
+
+        assert conservative == BURST_MIN_EDGE_FLOOR
+        assert aggressive == BURST_MIN_EDGE_FLOOR
     finally:
         cfg.MODULES.clear()
         cfg.MODULES.update(original_modules)

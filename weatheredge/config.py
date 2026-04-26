@@ -74,6 +74,10 @@ MAX_SPREAD_PCT: float = 0.08
 # Burst mode (Phase 2)
 BURST_EDGE_DISCOUNT: float = 0.05
 BURST_WINDOW_MINUTES: int = 30
+# Hard floor for conservative/aggressive thresholds after burst discount.
+# Prevents a misconfigured discount from dropping entry gates to 0 and
+# letting through edge-less trades during a model-run window.
+BURST_MIN_EDGE_FLOOR: float = 0.05
 
 # Convergence gate (Phase 3)
 CONVERGENCE_GATE_RATIO: float = 3.0
