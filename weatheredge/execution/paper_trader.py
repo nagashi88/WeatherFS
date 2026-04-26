@@ -54,6 +54,7 @@ class Order:
     market_price_timestamp: datetime | None = None
     signal_ids: list[int] | None = None
     cash_capped: bool = False  # propagated from TradeOrder; persisted on Trade row
+    regime: str | None = None  # strategy regime tag, persisted on Trade row
 
 
 @dataclass
@@ -268,6 +269,7 @@ class PaperTrader:
             "status": t.status,
             "created_at": PaperTrader._coerce_utc_datetime(t.created_at),
             "pnl": t.pnl,
+            "regime": t.regime,
         }
 
     def _persist_new_trade(self, trade_dict: dict) -> int | None:
@@ -302,6 +304,7 @@ class PaperTrader:
                 forecast_timestamp=trade_dict.get("forecast_timestamp"),
                 market_price_timestamp=trade_dict.get("market_price_timestamp"),
                 status=trade_dict.get("status", "open"),
+                regime=trade_dict.get("regime"),
             )
             session.add(db_trade)
             session.flush()
@@ -421,6 +424,7 @@ class PaperTrader:
                 "status": "pending",
                 "created_at": datetime.now(timezone.utc),
                 "pnl": None,
+                "regime": order.regime,
             }
             try:
                 db_id = self._persist_new_trade(pending)
@@ -473,6 +477,7 @@ class PaperTrader:
             "status": "open",
             "created_at": datetime.now(timezone.utc),
             "pnl": None,
+            "regime": order.regime,
         }
 
         try:
@@ -573,6 +578,7 @@ class PaperTrader:
                 "status": "open",
                 "created_at": o.get("created_at") or datetime.now(timezone.utc),
                 "pnl": None,
+                "regime": o.get("regime"),
             }
 
             db_id = o.get("db_id")

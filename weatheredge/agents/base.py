@@ -34,6 +34,7 @@ class TradeOrder:
     forecast_timestamp: datetime | None = None
     market_price_timestamp: datetime | None = None
     signal_ids: list[int] = field(default_factory=list)
+    regime: str | None = None  # Strategy regime tag, frozen at decision time
 
 @dataclass
 class MarketOpportunity:
@@ -69,6 +70,9 @@ class MarketOpportunity:
     bucket_metar_high: float | None = None  # Observed daily_high °F when invalidation detected
     metar_daily_high: float | None = None
     metar_daily_low: float | None = None
+    # Probability forced by METAR observation (in-range bucket override).
+    # None means no override is active for this opportunity.
+    metar_override: float | None = None
     # Per-market price freshness: timestamp of the price row used to build this
     # opportunity. Used by the per-market freshness gate so an illiquid market
     # with a stale row is skipped even when the global newest-row age is fresh.

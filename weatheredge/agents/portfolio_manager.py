@@ -15,6 +15,7 @@ from weatheredge.agents.base import MarketOpportunity, Signal, TradeOrder
 from weatheredge.agents.risk_manager import RiskManager
 from weatheredge.config import Settings
 from weatheredge.data.station_time import hours_until_market_close
+from weatheredge.regime import classify_regime
 
 log = logging.getLogger(__name__)
 
@@ -632,6 +633,18 @@ class PortfolioManager:
             if amount <= 0:
                 continue
 
+            is_bucket_market = bool(
+                opp
+                and opp.bucket_low is not None
+                and opp.bucket_high is not None
+            )
+            regime = classify_regime(
+                side=majority_side,
+                is_bucket=is_bucket_market,
+                raw_model_prob=opp.raw_model_prob if opp else None,
+                metar_override=getattr(opp, "metar_override", None) if opp else None,
+            )
+
             order = TradeOrder(
                 market_id=market_id,
                 side=majority_side,
@@ -652,6 +665,7 @@ class PortfolioManager:
                 cash_capped=cash_capped,
                 forecast_timestamp=getattr(opp, "forecast_timestamp", None) if opp else None,
                 market_price_timestamp=getattr(opp, "market_price_timestamp", None) if opp else None,
+                regime=regime,
             )
             orders.append(order)
 

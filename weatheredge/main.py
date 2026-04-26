@@ -1411,6 +1411,7 @@ def _run_decision_cycle(state: AppState) -> None:
                 market_price_timestamp=trade_order.market_price_timestamp,
                 signal_ids=trade_order.signal_ids,
                 cash_capped=trade_order.cash_capped,
+                regime=trade_order.regime,
             )
             result = state.paper_trader.place_order(order)
             filled = bool(result.get("filled"))
@@ -2684,6 +2685,7 @@ def _build_opportunity(
         bucket_metar_high=_bucket_metar_high,
         metar_daily_high=_metar_daily_high,
         metar_daily_low=_metar_daily_low,
+        metar_override=metar_override,
         market_price_timestamp=price_data.get("timestamp"),
         forecast_timestamp=forecast.get("forecast_timestamp"),
     )
