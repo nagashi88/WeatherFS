@@ -6,6 +6,7 @@ Fallback when pmxt returns 0 results for Kalshi.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import aiohttp
 
@@ -13,6 +14,54 @@ log = logging.getLogger(__name__)
 
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 WEATHER_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHDEN"]
+
+# Retry policy mirrors data/weather.py and data/noaa.py: 3 attempts with
+# exponential backoff (1s / 4s / 16s). 5xx and network errors retry; 4xx
+# is treated as a config error and returns None without retrying.
+_RETRY_DELAYS = [1, 4, 16]
+
+
+async def _get_with_retry(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: dict | None = None,
+) -> dict | None:
+    """GET *url* with up to 3 attempts and exponential backoff.
+
+    Returns the parsed JSON dict on success, or None if every attempt
+    failed (caller skips the series rather than aborting the cycle).
+    """
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate(_RETRY_DELAYS):
+        try:
+            async with session.get(url, params=params or {}) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                if 400 <= resp.status < 500:
+                    log.warning(
+                        "Kalshi API returned %d for %s — not retrying (4xx)",
+                        resp.status, url,
+                    )
+                    return None
+                # 5xx → fall through to retry path
+                raise aiohttp.ClientResponseError(
+                    resp.request_info, resp.history, status=resp.status,
+                )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < len(_RETRY_DELAYS) - 1:
+                next_delay = _RETRY_DELAYS[attempt + 1]
+                log.warning(
+                    "Kalshi fetch attempt %d/%d failed (%s). Retrying in %ds.",
+                    attempt + 1, len(_RETRY_DELAYS), exc, next_delay,
+                )
+                await asyncio.sleep(next_delay)
+            else:
+                log.error(
+                    "Kalshi fetch failed after %d attempts for %s: %s",
+                    len(_RETRY_DELAYS), url, exc,
+                )
+    return None
 
 
 def _parse_dollar_price(value: object) -> float | None:
@@ -57,13 +106,11 @@ async def fetch_kalshi_weather_markets(
             url = f"{KALSHI_API_BASE}/markets"
             params = {"series_ticker": series, "status": "open"}
             try:
-                async with session.get(url, params=params) as resp:
-                    if resp.status != 200:
-                        log.warning("Kalshi API returned %d for %s", resp.status, series)
-                        continue
-                    data = await resp.json()
-                    markets = data.get("markets", [])
-                    for m in markets:
+                data = await _get_with_retry(session, url, params)
+                if data is None:
+                    continue
+                markets = data.get("markets", [])
+                for m in markets:
                         # Kalshi public API returns prices as dollar strings (e.g. '0.1600')
                         # in `yes_ask_dollars`/`no_ask_dollars`. None / 0 / out-of-range → None.
                         yes_price = _parse_dollar_price(m.get("yes_ask_dollars"))
