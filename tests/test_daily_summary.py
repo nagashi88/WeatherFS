@@ -91,6 +91,7 @@ def test_empty_day_returns_zeroed_summary(engine, patched_session):
     assert s["realized_pnl"] == 0.0
     assert s["per_agent_pnl"] == {}
     assert s["per_regime_pnl"] == {}
+    assert s["fee_burn_total"] == 0.0
     assert s["signal_count"] == 0
     assert s["agent_disagreement_rate"] == 0.0
     assert s["cash_cap_hits"] == 0
@@ -233,6 +234,65 @@ def test_per_regime_pnl_bucketizes_missing_regime_as_unknown(engine, patched_ses
     s = compute_daily_summary()
     assert "unknown" in s["per_regime_pnl"]
     assert s["per_regime_pnl"]["unknown"]["wins"] == 1
+
+
+def test_fee_burn_kalshi_round_trip_at_0_10(engine, patched_session):
+    """At p=0.10 the Kalshi taker fee ceil's to $0.01/contract; round-trip
+    is 2× that. With amount=10 contracts, total fee burn = $0.20.
+    """
+    from weatheredge.daily_summary import compute_daily_summary
+
+    _add_trade(
+        engine, status="edge_stop", pnl=0.0,
+        platform="kalshi", price=0.10, amount=10.0,
+        regime="floor_bound_buy_no",
+    )
+
+    s = compute_daily_summary()
+    assert s["fee_burn_total"] == pytest.approx(0.20)
+    assert s["per_regime_pnl"]["floor_bound_buy_no"]["fee_burn"] == pytest.approx(0.20)
+
+
+def test_fee_burn_zero_for_polymarket_trades(engine, patched_session):
+    from weatheredge.daily_summary import compute_daily_summary
+
+    _add_trade(
+        engine, status="won", pnl=2.0,
+        platform="polymarket", price=0.50, amount=10.0,
+        regime="threshold_yes",
+    )
+
+    s = compute_daily_summary()
+    assert s["fee_burn_total"] == 0.0
+    assert s["per_regime_pnl"]["threshold_yes"]["fee_burn"] == 0.0
+
+
+def test_fee_burn_aggregates_across_regimes(engine, patched_session):
+    from weatheredge.daily_summary import compute_daily_summary
+
+    _add_trade(
+        engine, status="edge_stop", pnl=-0.1,
+        platform="kalshi", price=0.10, amount=5.0,
+        regime="floor_bound_buy_no",
+    )
+    _add_trade(
+        engine, status="ev_based", pnl=0.4,
+        platform="kalshi", price=0.10, amount=5.0,
+        regime="floor_bound_buy_no",
+    )
+    _add_trade(
+        engine, status="won", pnl=4.0,
+        platform="kalshi", price=0.50, amount=2.0,
+        regime="metar_override_yes",
+    )
+
+    s = compute_daily_summary()
+    # floor_bound_buy_no: 2 trades × 5 contracts × $0.02 RT each = $0.20
+    assert s["per_regime_pnl"]["floor_bound_buy_no"]["fee_burn"] == pytest.approx(0.20)
+    # metar_override_yes at p=0.50: ceil(0.07·0.25·100)/100 = $0.02/contract,
+    # RT = $0.04, ×2 contracts = $0.08
+    assert s["per_regime_pnl"]["metar_override_yes"]["fee_burn"] == pytest.approx(0.08)
+    assert s["fee_burn_total"] == pytest.approx(0.28)
 
 
 def test_early_exit_status_counts_in_resolved_pnl(engine, patched_session):
@@ -380,11 +440,12 @@ def test_format_text_includes_per_regime_section_when_present():
         "day": "2026-04-26",
         "trades": 4, "resolved_trades": 3, "winning_trades": 1,
         "losing_trades": 1, "win_rate": 1 / 3, "realized_pnl": 0.5,
+        "fee_burn_total": 0.30,
         "per_agent_pnl": {},
         "per_regime_pnl": {
             "floor_bound_buy_no": {
                 "trades": 3, "resolved": 3, "wins": 1, "losses": 1,
-                "edge_stop": 1, "ev_based": 0, "pnl": 0.5,
+                "edge_stop": 1, "ev_based": 0, "pnl": 0.5, "fee_burn": 0.30,
             },
         },
         "parser_failures": {"attempts": 0, "failures": 0, "failure_rate": 0.0},
@@ -396,6 +457,8 @@ def test_format_text_includes_per_regime_section_when_present():
     assert "floor_bound_buy_no" in text
     assert "1 edge_stop" in text
     assert "0 ev_based" in text
+    assert "fee burn $0.30" in text  # daily total
+    assert "fee $0.30" in text       # per-regime row
 
 
 def test_format_text_handles_zero_parser_attempts():

@@ -22,6 +22,7 @@ from weatheredge.data.market_parser import get_parse_failure_stats
 from weatheredge.db.database import get_session
 from weatheredge.db.models import Signal as SignalRow
 from weatheredge.db.models import Trade as TradeRow
+from weatheredge.probability.edge import kalshi_taker_fee
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,22 @@ _RESOLVED_STATUSES = {
     "won", "lost", "edge_stop", "capital_protect", "time_decay",
     "ev_based", "bucket_invalidated", "abandoned",
 }
+
+
+def _round_trip_fee(price: float | None, amount: float | None, platform: str | None) -> float:
+    """Estimated round-trip taker fee for a resolved trade.
+
+    Kalshi charges ceil(0.07·p·(1-p)·100)/100 per contract per fill, so a
+    round-trip is 2× that — entry + exit at the same canonical YES price.
+    Exit slippage is ignored: the goal is to surface the fee burn that
+    edge_stop / ev_based exits pay even when their net P&L looks flat.
+    Polymarket has no taker fee in our model → 0.
+    """
+    if not amount or price is None:
+        return 0.0
+    if (platform or "polymarket").lower() != "kalshi":
+        return 0.0
+    return 2.0 * kalshi_taker_fee(float(price)) * float(amount)
 
 
 def _utc_day_window(target_day: date | None = None) -> tuple[datetime, datetime]:
@@ -73,6 +90,7 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
         "losing_trades": 0,
         "win_rate": 0.0,
         "realized_pnl": 0.0,
+        "fee_burn_total": 0.0,
         "per_agent_pnl": {},
         "per_regime_pnl": {},
         "parser_failures": {},
@@ -112,7 +130,11 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
         # win-rate, resolved counts). Filtered by resolved_at, not created_at,
         # so cross-day positions land on the correct settlement day.
         resolved_rows = [
-            (tr.agent_name, tr.status, tr.pnl, getattr(tr, "regime", None))
+            (
+                tr.agent_name, tr.status, tr.pnl,
+                getattr(tr, "regime", None),
+                tr.price, tr.amount, tr.platform,
+            )
             for tr in session.execute(
                 select(TradeRow).where(
                     TradeRow.resolved_at >= start_utc,
@@ -142,9 +164,12 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
         # edge_stop / ev_based exposed as first-class counters: they're the
         # primary indicators for H7 (edge_flip too reactive) and Phase 1
         # success (EV-based exit competing against edge_flip).
+        # fee_burn tracks taker fees paid on the round-trip — most punishing
+        # on edge_stop trades that exit near break-even but still pay both
+        # legs of the Kalshi taker fee.
         return {
             "trades": 0, "resolved": 0, "wins": 0, "losses": 0,
-            "edge_stop": 0, "ev_based": 0, "pnl": 0.0,
+            "edge_stop": 0, "ev_based": 0, "pnl": 0.0, "fee_burn": 0.0,
         }
 
     agent_buckets: dict[str, dict[str, float]] = defaultdict(_new_agent_bucket)
@@ -165,8 +190,8 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
         if cash_capped:
             out["cash_cap_hits"] += 1
 
-    # Pass 2: trades that settled today → P&L, wins/losses
-    for agent_name, status, pnl, regime in resolved_rows:
+    # Pass 2: trades that settled today → P&L, wins/losses, fee burn
+    for agent_name, status, pnl, regime, price, amount, platform in resolved_rows:
         agent = agent_name or "unknown"
         bucket = agent_buckets[agent]
         rbucket = regime_buckets[regime or "unknown"]
@@ -177,6 +202,9 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
         bucket["pnl"] += pnl_val
         rbucket["pnl"] += pnl_val
         out["realized_pnl"] += pnl_val
+        fee_val = _round_trip_fee(price, amount, platform)
+        rbucket["fee_burn"] += fee_val
+        out["fee_burn_total"] += fee_val
         if status == "won":
             bucket["wins"] += 1
             rbucket["wins"] += 1
@@ -192,6 +220,7 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
 
     if out["resolved_trades"] > 0:
         out["win_rate"] = out["winning_trades"] / out["resolved_trades"]
+    out["fee_burn_total"] = round(out["fee_burn_total"], 4)
 
     out["per_agent_pnl"] = {
         agent: {
@@ -212,6 +241,7 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
             "edge_stop": int(rbucket["edge_stop"]),
             "ev_based": int(rbucket["ev_based"]),
             "pnl": round(rbucket["pnl"], 4),
+            "fee_burn": round(rbucket["fee_burn"], 4),
         }
         for regime, rbucket in sorted(regime_buckets.items())
     }
@@ -255,7 +285,8 @@ def format_daily_summary_text(summary: dict[str, Any]) -> str:
         f"  Trades: {summary['trades']} placed | {summary['resolved_trades']} resolved",
         f"  W/L: {summary['winning_trades']}/{summary['losing_trades']} "
         f"(win rate {summary['win_rate'] * 100:.1f}%)",
-        f"  Realized P&L: ${summary['realized_pnl']:+,.2f}",
+        f"  Realized P&L: ${summary['realized_pnl']:+,.2f} "
+        f"(fee burn ${summary.get('fee_burn_total', 0.0):,.2f})",
         f"  Cash-cap hits: {summary['cash_cap_hits']}",
         f"  Signals: {summary['signal_count']} | "
         f"agent disagreement {summary['agent_disagreement_rate'] * 100:.1f}%",
@@ -281,6 +312,7 @@ def format_daily_summary_text(summary: dict[str, Any]) -> str:
             lines.append(
                 f"    {regime}: {stats['wins']}W/{stats['losses']}L "
                 f"({stats['edge_stop']} edge_stop, {stats['ev_based']} ev_based) "
-                f"of {stats['resolved']} resolved → ${stats['pnl']:+,.2f}"
+                f"of {stats['resolved']} resolved → ${stats['pnl']:+,.2f} "
+                f"(fee ${stats.get('fee_burn', 0.0):,.2f})"
             )
     return "\n".join(lines)
