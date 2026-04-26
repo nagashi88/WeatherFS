@@ -312,6 +312,40 @@ class PaperTrader:
 
         return db_id
 
+    def has_active_order_in_db(self, market_id: str) -> bool:
+        """Return True when DB already has an open/pending paper row.
+
+        The in-memory guard is not enough when two bot processes are running:
+        each process has its own ``open_orders``/``open_positions`` lists. This
+        DB-backed check is the final source of truth before accepting exposure.
+        """
+        if self._engine is None:
+            return False
+
+        from sqlalchemy import select
+        from weatheredge.db.database import get_session
+        from weatheredge.db.models import Trade
+
+        target_market_id = self._market_id_key(market_id)
+        try:
+            with get_session(self._engine) as session:
+                return session.execute(
+                    select(Trade.id)
+                    .where(
+                        Trade.mode == "paper",
+                        Trade.market_id == str(target_market_id),
+                        Trade.status.in_(["open", "pending"]),
+                    )
+                    .limit(1)
+                ).first() is not None
+        except Exception as exc:
+            log.warning(
+                "has_active_order_in_db failed for %s: %s — falling back to in-memory trading",
+                target_market_id,
+                exc,
+            )
+            return False
+
     def _update_trade_in_db(self, db_id: int | None, status: str, pnl: float) -> None:
         """Update an existing trade's status and pnl in the DB."""
         if self._engine is None or db_id is None:
@@ -390,6 +424,12 @@ class PaperTrader:
                 return {"filled": False, "reason": "temporal_leakage", "error": str(exc)}
 
         market_id = self._market_id_key(order.market_id)
+        if self.has_active_order_in_db(market_id):
+            log.warning(
+                "place_order: duplicate active DB order blocked for market=%s",
+                market_id,
+            )
+            return {"filled": False, "reason": "duplicate_active_order"}
 
         if order.order_type == "limit":
             from weatheredge.config import Settings

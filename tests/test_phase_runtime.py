@@ -483,6 +483,17 @@ def test_dashboard_start_does_not_pass_phase_to_launcher():
     assert '[str(VENV_PYTHON), str(PROJECT_ROOT / "launch.py")]' in source
 
 
+def test_dashboard_start_has_process_scan_fallback():
+    """Dashboard Start must not rely only on a PID file to avoid duplicate bots."""
+    from pathlib import Path
+
+    source = Path("weatheredge/dashboard/control_panel.py").read_text()
+
+    assert "def _find_running_launch_pid()" in source
+    assert "_find_running_launch_pid()" in source
+    assert '["ps", "-axo", "pid=,command="]' in source
+
+
 def _phase1_gate_trade(i: int, created_at: datetime, pnl: float = 1.0):
     from weatheredge.db.models import Trade
 

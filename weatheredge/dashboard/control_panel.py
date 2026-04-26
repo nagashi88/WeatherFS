@@ -184,23 +184,74 @@ st.markdown("""
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 def _is_running() -> tuple[bool, int | None]:
+    launch_pid = _find_running_launch_pid()
     if not PID_FILE.exists():
+        if launch_pid is not None:
+            PID_FILE.write_text(str(launch_pid))
+            return True, launch_pid
         return False, None
     try:
         pid = int(PID_FILE.read_text().strip())
     except ValueError:
         PID_FILE.unlink(missing_ok=True)
+        if launch_pid is not None:
+            PID_FILE.write_text(str(launch_pid))
+            return True, launch_pid
         return False, None
     try:
         os.kill(pid, 0)
         return True, pid
     except ProcessLookupError:
         PID_FILE.unlink(missing_ok=True)
+        if launch_pid is not None:
+            PID_FILE.write_text(str(launch_pid))
+            return True, launch_pid
         return False, None
     except PermissionError:
         # Sandboxed dashboard sessions may be unable to signal a live bot
         # process. Treat this as running to avoid starting a duplicate.
         return True, pid
+
+
+def _find_running_launch_pid() -> int | None:
+    """Detect a WeatherEdge launch.py process even when the PID file is stale."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+
+    project = str(PROJECT_ROOT)
+    current_pid = os.getpid()
+    candidates: list[int] = []
+    for line in result.stdout.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        pid_text, _, command = raw.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if "launch.py" not in command:
+            continue
+        if "python" not in command:
+            continue
+        if "tmux new-session" in command or " rg " in command:
+            continue
+        if project not in command and "Weather FS" not in command:
+            continue
+        candidates.append(pid)
+    return min(candidates) if candidates else None
 
 
 def _start_bot():

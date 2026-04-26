@@ -840,6 +840,28 @@ class TestDbPersistencePaths:
         assert result["filled"] is True
         assert trader.open_positions[0]["db_id"] is not None
 
+    def test_place_order_blocks_duplicate_active_trade_from_db(self):
+        """A second process must not duplicate an open/pending DB exposure."""
+        eng = _fresh_engine()
+        first = PaperTrader(initial_bankroll=1000.0)
+        first.connect_db(eng)
+        first.place_order(Order(
+            market_id="duplicate_db", side="buy_yes", price=0.40,
+            amount=10.0, market_date="2030-05-01",
+        ))
+
+        second = PaperTrader(initial_bankroll=1000.0)
+        second.connect_db(eng)
+        second.open_positions.clear()  # simulate a stale/desynced process memory
+        second.open_orders.clear()
+        result = second.place_order(Order(
+            market_id="duplicate_db", side="buy_yes", price=0.45,
+            amount=10.0, market_date="2030-05-01",
+        ))
+
+        assert result == {"filled": False, "reason": "duplicate_active_order"}
+        assert second.open_positions == []
+
     def test_resolve_position_persists_status_and_pnl(self):
         """resolve_position with engine attached updates DB via _update_trade_in_db."""
         eng = _fresh_engine()
