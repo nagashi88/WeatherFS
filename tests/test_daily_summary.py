@@ -90,6 +90,7 @@ def test_empty_day_returns_zeroed_summary(engine, patched_session):
     assert s["win_rate"] == 0.0
     assert s["realized_pnl"] == 0.0
     assert s["per_agent_pnl"] == {}
+    assert s["per_regime_pnl"] == {}
     assert s["signal_count"] == 0
     assert s["agent_disagreement_rate"] == 0.0
     assert s["cash_cap_hits"] == 0
@@ -181,6 +182,57 @@ def test_per_agent_pnl_splits_correctly(engine, patched_session):
     assert s["per_agent_pnl"]["Aggressive"]["losses"] == 1
     assert s["per_agent_pnl"]["Conservative"]["pnl"] == pytest.approx(4.0)
     assert s["per_agent_pnl"]["Conservative"]["wins"] == 1
+
+
+def test_per_regime_pnl_splits_correctly(engine, patched_session):
+    from weatheredge.daily_summary import compute_daily_summary
+
+    _add_trade(engine, status="won", pnl=2.0, regime="floor_bound_buy_no")
+    _add_trade(engine, status="lost", pnl=-1.0, regime="floor_bound_buy_no")
+    _add_trade(engine, status="won", pnl=4.0, regime="metar_override_yes")
+
+    s = compute_daily_summary()
+
+    assert set(s["per_regime_pnl"].keys()) == {
+        "floor_bound_buy_no", "metar_override_yes",
+    }
+    fb = s["per_regime_pnl"]["floor_bound_buy_no"]
+    assert fb["pnl"] == pytest.approx(1.0)
+    assert fb["wins"] == 1
+    assert fb["losses"] == 1
+    assert s["per_regime_pnl"]["metar_override_yes"]["pnl"] == pytest.approx(4.0)
+
+
+def test_per_regime_pnl_counts_edge_stop_and_ev_based(engine, patched_session):
+    """edge_stop and ev_based are surfaced as first-class regime counters
+    so H7 (edge_flip reactiveness) and Phase 1 EV-exit success are visible."""
+    from weatheredge.daily_summary import compute_daily_summary
+
+    _add_trade(engine, status="edge_stop", pnl=-0.5, regime="floor_bound_buy_no")
+    _add_trade(engine, status="edge_stop", pnl=0.3, regime="floor_bound_buy_no")
+    _add_trade(engine, status="ev_based", pnl=1.2, regime="floor_bound_buy_no")
+
+    s = compute_daily_summary()
+
+    fb = s["per_regime_pnl"]["floor_bound_buy_no"]
+    assert fb["edge_stop"] == 2
+    assert fb["ev_based"] == 1
+    assert fb["wins"] == 0
+    assert fb["losses"] == 0
+    assert fb["resolved"] == 3
+    assert fb["pnl"] == pytest.approx(1.0)
+
+
+def test_per_regime_pnl_bucketizes_missing_regime_as_unknown(engine, patched_session):
+    """Trades pre-dating the live tagger or backfilled with NULL get
+    aggregated under 'unknown' rather than dropping them silently."""
+    from weatheredge.daily_summary import compute_daily_summary
+
+    _add_trade(engine, status="won", pnl=1.0, regime=None)
+
+    s = compute_daily_summary()
+    assert "unknown" in s["per_regime_pnl"]
+    assert s["per_regime_pnl"]["unknown"]["wins"] == 1
 
 
 def test_early_exit_status_counts_in_resolved_pnl(engine, patched_session):
@@ -319,6 +371,31 @@ def test_format_text_includes_key_fields():
     assert "20.0%" in text  # disagreement
     assert "Cash-cap hits: 2" in text
     assert "Parser: 4/100" in text
+
+
+def test_format_text_includes_per_regime_section_when_present():
+    from weatheredge.daily_summary import format_daily_summary_text
+
+    summary = {
+        "day": "2026-04-26",
+        "trades": 4, "resolved_trades": 3, "winning_trades": 1,
+        "losing_trades": 1, "win_rate": 1 / 3, "realized_pnl": 0.5,
+        "per_agent_pnl": {},
+        "per_regime_pnl": {
+            "floor_bound_buy_no": {
+                "trades": 3, "resolved": 3, "wins": 1, "losses": 1,
+                "edge_stop": 1, "ev_based": 0, "pnl": 0.5,
+            },
+        },
+        "parser_failures": {"attempts": 0, "failures": 0, "failure_rate": 0.0},
+        "signal_count": 0, "agent_disagreement_rate": 0.0, "cash_cap_hits": 0,
+    }
+    text = format_daily_summary_text(summary)
+
+    assert "Per-regime P&L" in text
+    assert "floor_bound_buy_no" in text
+    assert "1 edge_stop" in text
+    assert "0 ev_based" in text
 
 
 def test_format_text_handles_zero_parser_attempts():

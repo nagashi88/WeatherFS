@@ -74,6 +74,7 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
         "win_rate": 0.0,
         "realized_pnl": 0.0,
         "per_agent_pnl": {},
+        "per_regime_pnl": {},
         "parser_failures": {},
         "signal_count": 0,
         "agent_disagreement_rate": 0.0,
@@ -98,7 +99,8 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
             # getattr-with-default keeps this resilient if the cash_capped
             # column hasn't been added yet (Fix #7 rollout) — pre-column rows
             # fall back to the legacy amount<1.0 heuristic below.
-            (tr.agent_name, tr.amount, getattr(tr, "cash_capped", None))
+            (tr.agent_name, tr.amount, getattr(tr, "cash_capped", None),
+             getattr(tr, "regime", None))
             for tr in session.execute(
                 select(TradeRow).where(
                     TradeRow.created_at >= start_utc,
@@ -110,7 +112,7 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
         # win-rate, resolved counts). Filtered by resolved_at, not created_at,
         # so cross-day positions land on the correct settlement day.
         resolved_rows = [
-            (tr.agent_name, tr.status, tr.pnl)
+            (tr.agent_name, tr.status, tr.pnl, getattr(tr, "regime", None))
             for tr in session.execute(
                 select(TradeRow).where(
                     TradeRow.resolved_at >= start_utc,
@@ -132,15 +134,28 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
     out["trades"] = len(placed_rows)
     out["signal_count"] = len(signal_rows)
 
-    # --- Per-agent buckets ---
-    agent_buckets: dict[str, dict[str, float]] = defaultdict(
-        lambda: {"trades": 0, "resolved": 0, "wins": 0, "losses": 0, "pnl": 0.0}
-    )
+    # --- Per-agent + per-regime buckets ---
+    def _new_agent_bucket() -> dict[str, float]:
+        return {"trades": 0, "resolved": 0, "wins": 0, "losses": 0, "pnl": 0.0}
 
-    # Pass 1: placed trades → per-agent placement counts + cash-cap detection
-    for agent_name, _amount, cash_capped in placed_rows:
+    def _new_regime_bucket() -> dict[str, float]:
+        # edge_stop / ev_based exposed as first-class counters: they're the
+        # primary indicators for H7 (edge_flip too reactive) and Phase 1
+        # success (EV-based exit competing against edge_flip).
+        return {
+            "trades": 0, "resolved": 0, "wins": 0, "losses": 0,
+            "edge_stop": 0, "ev_based": 0, "pnl": 0.0,
+        }
+
+    agent_buckets: dict[str, dict[str, float]] = defaultdict(_new_agent_bucket)
+    regime_buckets: dict[str, dict[str, float]] = defaultdict(_new_regime_bucket)
+
+    # Pass 1: placed trades → per-agent + per-regime placement counts +
+    # cash-cap detection
+    for agent_name, _amount, cash_capped, regime in placed_rows:
         agent = agent_name or "unknown"
         agent_buckets[agent]["trades"] += 1
+        regime_buckets[regime or "unknown"]["trades"] += 1
         # cash_capped is the authoritative flag written by portfolio_manager
         # when the cap path reduced size. Legacy rows pre-dating the column
         # read as False (ALTER TABLE DEFAULT 0) and simply don't count —
@@ -151,20 +166,29 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
             out["cash_cap_hits"] += 1
 
     # Pass 2: trades that settled today → P&L, wins/losses
-    for agent_name, status, pnl in resolved_rows:
+    for agent_name, status, pnl, regime in resolved_rows:
         agent = agent_name or "unknown"
         bucket = agent_buckets[agent]
+        rbucket = regime_buckets[regime or "unknown"]
         bucket["resolved"] += 1
+        rbucket["resolved"] += 1
         out["resolved_trades"] += 1
         pnl_val = float(pnl or 0.0)
         bucket["pnl"] += pnl_val
+        rbucket["pnl"] += pnl_val
         out["realized_pnl"] += pnl_val
         if status == "won":
             bucket["wins"] += 1
+            rbucket["wins"] += 1
             out["winning_trades"] += 1
         elif status == "lost":
             bucket["losses"] += 1
+            rbucket["losses"] += 1
             out["losing_trades"] += 1
+        elif status == "edge_stop":
+            rbucket["edge_stop"] += 1
+        elif status == "ev_based":
+            rbucket["ev_based"] += 1
 
     if out["resolved_trades"] > 0:
         out["win_rate"] = out["winning_trades"] / out["resolved_trades"]
@@ -178,6 +202,18 @@ def compute_daily_summary(target_day: date | None = None) -> dict[str, Any]:
             "pnl": round(bucket["pnl"], 4),
         }
         for agent, bucket in sorted(agent_buckets.items())
+    }
+    out["per_regime_pnl"] = {
+        regime: {
+            "trades": int(rbucket["trades"]),
+            "resolved": int(rbucket["resolved"]),
+            "wins": int(rbucket["wins"]),
+            "losses": int(rbucket["losses"]),
+            "edge_stop": int(rbucket["edge_stop"]),
+            "ev_based": int(rbucket["ev_based"]),
+            "pnl": round(rbucket["pnl"], 4),
+        }
+        for regime, rbucket in sorted(regime_buckets.items())
     }
 
     # --- Agent disagreement: % of multi-agent markets with conflicting BUY sides ---
@@ -237,6 +273,14 @@ def format_daily_summary_text(summary: dict[str, Any]) -> str:
         for agent, stats in summary["per_agent_pnl"].items():
             lines.append(
                 f"    {agent}: {stats['wins']}W/{stats['losses']}L "
+                f"of {stats['resolved']} resolved → ${stats['pnl']:+,.2f}"
+            )
+    if summary.get("per_regime_pnl"):
+        lines.append("  Per-regime P&L:")
+        for regime, stats in summary["per_regime_pnl"].items():
+            lines.append(
+                f"    {regime}: {stats['wins']}W/{stats['losses']}L "
+                f"({stats['edge_stop']} edge_stop, {stats['ev_based']} ev_based) "
                 f"of {stats['resolved']} resolved → ${stats['pnl']:+,.2f}"
             )
     return "\n".join(lines)
