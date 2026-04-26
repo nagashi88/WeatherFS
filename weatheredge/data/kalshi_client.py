@@ -16,9 +16,10 @@ KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 WEATHER_SERIES = ["KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHDEN"]
 
 # Retry policy mirrors data/weather.py and data/noaa.py: 3 attempts with
-# exponential backoff (1s / 4s / 16s). 5xx and network errors retry; 4xx
+# exponential backoff between attempts (1s / 4s). 5xx and network errors retry; 4xx
 # is treated as a config error and returns None without retrying.
-_RETRY_DELAYS = [1, 4, 16]
+_MAX_ATTEMPTS = 3
+_RETRY_DELAYS = [1, 4]
 
 
 async def _get_with_retry(
@@ -32,7 +33,7 @@ async def _get_with_retry(
     failed (caller skips the series rather than aborting the cycle).
     """
     last_exc: Exception | None = None
-    for attempt, delay in enumerate(_RETRY_DELAYS):
+    for attempt in range(_MAX_ATTEMPTS):
         try:
             async with session.get(url, params=params or {}) as resp:
                 if resp.status == 200:
@@ -49,17 +50,17 @@ async def _get_with_retry(
                 )
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            if attempt < len(_RETRY_DELAYS) - 1:
-                next_delay = _RETRY_DELAYS[attempt + 1]
+            if attempt < _MAX_ATTEMPTS - 1:
+                next_delay = _RETRY_DELAYS[attempt]
                 log.warning(
                     "Kalshi fetch attempt %d/%d failed (%s). Retrying in %ds.",
-                    attempt + 1, len(_RETRY_DELAYS), exc, next_delay,
+                    attempt + 1, _MAX_ATTEMPTS, exc, next_delay,
                 )
                 await asyncio.sleep(next_delay)
             else:
                 log.error(
                     "Kalshi fetch failed after %d attempts for %s: %s",
-                    len(_RETRY_DELAYS), url, exc,
+                    _MAX_ATTEMPTS, url, exc,
                 )
     return None
 

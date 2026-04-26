@@ -211,18 +211,25 @@ async def test_prices_none_when_missing():
 @pytest.mark.asyncio
 async def test_fetch_continues_after_one_series_exception(caplog):
     """If one series raises an exception, remaining series are still fetched."""
-    # First call raises, second returns a market
+    # First series exhausts its retry budget, second series still returns a market.
     boom = MagicMock()
     boom.__aenter__ = AsyncMock(side_effect=Exception("network error"))
     boom.__aexit__ = AsyncMock(return_value=False)
+    boom2 = MagicMock()
+    boom2.__aenter__ = AsyncMock(side_effect=Exception("network error"))
+    boom2.__aexit__ = AsyncMock(return_value=False)
+    boom3 = MagicMock()
+    boom3.__aenter__ = AsyncMock(side_effect=Exception("network error"))
+    boom3.__aexit__ = AsyncMock(return_value=False)
     resp_chi = _make_mock_response(200, {"markets": [_sample_market("KXHIGHCHI-26MAR29")]})
 
-    session = _make_mock_session([boom, resp_chi])
+    session = _make_mock_session([boom, boom2, boom3, resp_chi])
 
-    with caplog.at_level(logging.WARNING, logger="weatheredge.data.kalshi_client"):
-        results = await fetch_kalshi_weather_markets(
-            session=session, series_tickers=["KXHIGHNY", "KXHIGHCHI"]
-        )
+    with patch("weatheredge.data.kalshi_client.asyncio.sleep", new=AsyncMock()):
+        with caplog.at_level(logging.WARNING, logger="weatheredge.data.kalshi_client"):
+            results = await fetch_kalshi_weather_markets(
+                session=session, series_tickers=["KXHIGHNY", "KXHIGHCHI"]
+            )
 
     assert len(results) == 1
     assert results[0]["ticker"] == "KXHIGHCHI"

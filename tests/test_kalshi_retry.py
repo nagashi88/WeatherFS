@@ -70,6 +70,8 @@ async def test_get_with_retry_retries_on_5xx_then_succeeds():
         assert session.get.call_count == 3
         # 2 sleeps between 3 attempts.
         assert sleep.await_count == 2
+        sleep.assert_any_await(1)
+        sleep.assert_any_await(4)
 
 
 @pytest.mark.asyncio
