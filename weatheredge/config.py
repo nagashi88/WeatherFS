@@ -206,10 +206,53 @@ class Settings(BaseSettings):
     # Cities
     target_cities: str = "NYC,Chicago,Miami,Denver,LAX"
 
+    # Shadow twin experiments. These never route orders through PaperTrader and
+    # never affect main paper bankroll; they only write to shadow_twin_trades.
+    shadow_twin_enabled: bool = True
+    shadow_twin_extended_cities: str = "Austin,Seattle,Atlanta,Dallas,Phoenix,Houston,San Francisco,Boston"
+    shadow_twin_broad_enabled: bool = True
+    shadow_twin_broad_cities: str = (
+        "London,Buenos Aires,Ankara,Seoul,Tokyo,Moscow,Milan,Madrid,Istanbul,"
+        "Singapore,Munich,Taipei,Paris,Toronto,Shanghai,Beijing,Wellington,"
+        "Warsaw,Tel Aviv,Chengdu,Chongqing,Wuhan,Shenzhen,Lucknow,Sao Paulo,"
+        "Hong Kong,Mexico City,Rome,Cape Town,Lagos,Helsinki,Amsterdam,Jeddah,"
+        "Karachi,Jakarta,Manila,Kuala Lumpur,Guangzhou,Busan,Panama City,Qingdao"
+    )
+    shadow_twin_min_net_edge: float = 0.10
+    shadow_twin_cost_per_trade: float = 1.0
+    shadow_twin_adaptive_liquidity_enabled: bool = True
+    shadow_twin_adaptive_liquidity_min_volume: float = 250.0
+    shadow_twin_adaptive_liquidity_volume_multiple: float = 100.0
+    shadow_twin_adaptive_liquidity_max_spread_pct: float = 0.08
+    # Broad shadow is discovery-only; skip expensive ensemble calls by default
+    # so core/expanded evidence is not starved by Open-Meteo rate limits.
+    shadow_twin_broad_fetch_ensemble: bool = False
+
+    # Basket-level shadow strategy for mutually exclusive daily-high bucket NOs.
+    # This is paper/shadow only: it logs robust payoff surfaces and does not
+    # route orders through PaperTrader.
+    shadow_basket_enabled: bool = True
+    shadow_basket_min_legs: int = 3
+    shadow_basket_max_legs: int = 6
+    shadow_basket_cost_per_leg: float = 1.0
+    shadow_basket_max_cost: float = 6.0
+    shadow_basket_min_net_edge: float = 0.10
+    shadow_basket_min_volume: float = 300.0
+    shadow_basket_max_spread_pct: float = 0.05
+    shadow_basket_adverse_tick: float = 0.01
+    shadow_basket_min_worst_case_abs: float = 0.20
+    shadow_basket_min_worst_case_fraction: float = 0.05
+    shadow_basket_min_no_hit_fraction: float = 0.20
+    shadow_basket_min_ev_fraction: float = 0.08
+    shadow_basket_stress_yes_prob_add: float = 0.05
+    shadow_basket_require_contiguous: bool = True
+
     # Scheduling
     forecast_poll_interval_minutes: int = 15
+    open_meteo_rate_limit_cooldown_minutes: int = 60
     actuals_poll_interval_minutes: int = 180
     actuals_lookback_days: int = 30
+    run_actuals_backfill_on_startup: bool = False
     market_scan_interval_minutes: int = 5
     decision_loop_interval_minutes: int = 5
     resolution_check_time: str = "08:00"
@@ -282,12 +325,44 @@ class Settings(BaseSettings):
     # Fee estimates (Addendum Gap 2)
     polymarket_fee_rate: float = 0.00
     polymarket_avg_spread: float = 0.03
+    polymarket_orderbook_quotes_enabled: bool = True
+    polymarket_orderbook_min_volume: float = 2000.0
+    polymarket_orderbook_max_markets_per_scan: int = 120
     kalshi_fee_on_winnings: float = 0.02
     kalshi_avg_spread: float = 0.02
 
     @property
     def cities_list(self) -> list[str]:
         return [c.strip() for c in self.target_cities.split(",")]
+
+    @property
+    def shadow_twin_extended_cities_list(self) -> list[str]:
+        return [c.strip() for c in self.shadow_twin_extended_cities.split(",") if c.strip()]
+
+    @property
+    def shadow_twin_broad_cities_list(self) -> list[str]:
+        return [c.strip() for c in self.shadow_twin_broad_cities.split(",") if c.strip()]
+
+    @property
+    def tracked_cities_list(self) -> list[str]:
+        """Cities whose market/forecast data should be fetched.
+
+        Main trading still uses ``cities_list`` only. When shadow twins are
+        enabled, fetch extra data so expanded/broad twins can simulate without
+        making those markets eligible for the main bot.
+        """
+        cities: list[str] = []
+        for city in self.cities_list:
+            if city and city not in cities:
+                cities.append(city)
+        if self.shadow_twin_enabled:
+            shadow_cities = list(self.shadow_twin_extended_cities_list)
+            if self.shadow_twin_broad_enabled:
+                shadow_cities.extend(self.shadow_twin_broad_cities_list)
+            for city in shadow_cities:
+                if city and city not in cities:
+                    cities.append(city)
+        return cities
 
     @property
     def risk_params(self) -> dict[str, float]:

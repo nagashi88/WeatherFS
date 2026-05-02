@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 
 from weatheredge.agents.base import MarketOpportunity, Signal, TradeOrder
 from weatheredge.agents.risk_manager import RiskManager
 from weatheredge.config import Settings
-from weatheredge.data.station_time import hours_until_market_close
+from weatheredge.data.station_time import hours_until_market_close, station_local_today_str
+from weatheredge.phase_config import get_current_phase
 from weatheredge.regime import classify_regime
 
 log = logging.getLogger(__name__)
+
+Phase1ShadowRecorder = Callable[..., bool]
 
 
 def _dedupe_agent_votes(signals: list[Signal]) -> list[Signal]:
@@ -64,6 +68,29 @@ def _is_fragile_entry_context(opp: MarketOpportunity, majority_side: str) -> boo
         if lead_hours is not None and lead_hours <= 12.0:
             return True
     return False
+
+
+def _is_narrow_bucket(bucket_low: object, bucket_high: object) -> bool:
+    try:
+        return (float(bucket_high) - float(bucket_low)) <= 2.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_phase1_active() -> bool:
+    try:
+        return get_current_phase() == "phase_1"
+    except Exception:
+        return False
+
+
+def _is_station_local_today(opp: MarketOpportunity) -> bool:
+    explicit = getattr(opp, "is_target_date_today_local", None)
+    if isinstance(explicit, bool):
+        return explicit
+    if not opp.market_date or not opp.station:
+        return False
+    return opp.market_date == station_local_today_str(opp.station)
 
 
 def _same_cycle_duplicate_key(candidate: dict) -> tuple[str, str, str, str] | None:
@@ -146,9 +173,17 @@ class PortfolioManager:
     # the distinct-agent gate; lower-weight agents still need a partner.
     CONVICTION_THRESHOLD: float = 0.30
 
-    def __init__(self, settings: Settings, risk_manager: RiskManager) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        risk_manager: RiskManager,
+        phase1_shadow_recorder: Phase1ShadowRecorder | None = None,
+        phase1_same_day_narrow_block_enabled: bool = True,
+    ) -> None:
         self.settings = settings
         self.risk_manager = risk_manager
+        self.phase1_shadow_recorder = phase1_shadow_recorder
+        self.phase1_same_day_narrow_block_enabled = phase1_same_day_narrow_block_enabled
 
     def aggregate_signals(
         self,
@@ -274,6 +309,107 @@ class PortfolioManager:
             volume = opp.volume if (opp and hasattr(opp, "volume")) else None
             bucket_low = getattr(opp, "bucket_low", None) if opp else None
             bucket_high = getattr(opp, "bucket_high", None) if opp else None
+            is_narrow_buy_no_bucket = (
+                opp is not None
+                and majority_side == "buy_no"
+                and bucket_low is not None
+                and bucket_high is not None
+                and _is_narrow_bucket(bucket_low, bucket_high)
+            )
+            if (
+                is_narrow_buy_no_bucket
+                and self.phase1_same_day_narrow_block_enabled
+                and _is_phase1_active()
+                and _is_station_local_today(opp)
+            ):
+                if self.phase1_shadow_recorder is not None:
+                    try:
+                        self.phase1_shadow_recorder(
+                            opp,
+                            reason="phase1_same_day_narrow_bucket_buy_no",
+                            majority_side=majority_side,
+                            majority_score=majority_side_score,
+                            side_margin=majority_side_score - minority_side_score,
+                            distinct_majority=majority_distinct,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - audit logging must not block voting
+                        log.warning(
+                            "Voting: phase1 shadow recorder failed for %s: %s",
+                            market_id,
+                            exc,
+                        )
+                log.info(
+                    "Voting: market=%s skipped — phase1 same-day narrow-bucket buy_no shadow-only "
+                    "(bucket=[%.1f,%.1f])",
+                    market_id,
+                    float(bucket_low),
+                    float(bucket_high),
+                )
+                continue
+
+            if (
+                is_narrow_buy_no_bucket
+                and majority_distinct < self.MIN_DISTINCT_AGENTS
+                and _is_fragile_entry_context(opp, majority_side)
+            ):
+                log.info(
+                    "Voting: market=%s skipped — single-agent buy_no on narrow bucket "
+                    "(%d distinct agent(s), bucket=[%.1f,%.1f])",
+                    market_id,
+                    majority_distinct,
+                    float(bucket_low),
+                    float(bucket_high),
+                )
+                continue
+
+            if is_narrow_buy_no_bucket:
+                guard_opposed = any(
+                    sig.agent_name in {"Conservative", "Qualitative"}
+                    and _is_opposing_signal(sig.side, majority_side)
+                    for sig in signals
+                )
+                if guard_opposed:
+                    log.info(
+                        "Voting: market=%s skipped — guard opposition on narrow bucket buy_no "
+                        "(bucket=[%.1f,%.1f])",
+                        market_id,
+                        float(bucket_low),
+                        float(bucket_high),
+                    )
+                    continue
+
+            if (
+                majority_side == "buy_no"
+                and bucket_low is not None
+                and bucket_high is not None
+                and bool(getattr(opp, "forecast_inside_bucket", False))
+            ):
+                log.info(
+                    "Voting: market=%s skipped — bucket NO forecast inside bucket "
+                    "(bucket=[%.1f,%.1f], forecast=%.1f)",
+                    market_id,
+                    float(bucket_low),
+                    float(bucket_high),
+                    float(getattr(opp, "forecast_temp", 0.0) or 0.0),
+                )
+                continue
+
+            if (
+                majority_side == "buy_no"
+                and bucket_low is not None
+                and bucket_high is not None
+                and bool(getattr(opp, "forecast_near_bucket", False))
+            ):
+                log.info(
+                    "Voting: market=%s skipped — bucket NO forecast near bucket "
+                    "(bucket=[%.1f,%.1f], forecast=%.1f)",
+                    market_id,
+                    float(bucket_low),
+                    float(bucket_high),
+                    float(getattr(opp, "forecast_temp", 0.0) or 0.0),
+                )
+                continue
+
             effective_edge = (
                 opp.net_edge_no if (opp and majority_side == "buy_no")
                 else (opp.net_edge if opp else 0.0)
@@ -317,14 +453,16 @@ class PortfolioManager:
                     sig.agent_name == "Conservative" and sig.side == "no_trade"
                     for sig in signals
                 )
-                qualitative_against = any(
-                    sig.agent_name == "Qualitative"
-                    and _is_opposing_signal(sig.side, majority_side)
-                    for sig in signals
+                qualitative_not_confirming = (
+                    any(sig.agent_name == "Qualitative" for sig in signals)
+                    and not any(
+                        sig.agent_name == "Qualitative" and sig.side == majority_side
+                        for sig in signals
+                    )
                 )
                 if (
                     conservative_abstained
-                    and qualitative_against
+                    and qualitative_not_confirming
                     and _is_fragile_entry_context(opp, majority_side)
                 ):
                     caution_haircut = getattr(
@@ -533,7 +671,7 @@ class PortfolioManager:
                 preliminary_size = round(preliminary_size * caution_haircut, 2)
                 log.warning(
                     "Qualitative caution HAIRCUT: market=%s side=%s preliminary size %.2f→%.2f "
-                    "(x%.2f; Conservative=no_trade, Qualitative opposed, fragile context)",
+                    "(x%.2f; Conservative=no_trade, Qualitative not confirming, fragile context)",
                     market_id,
                     majority_side,
                     pre_haircut,

@@ -25,6 +25,11 @@ class TestExpandedCityMapping:
         assert CITY_TO_STATION["dallas"] == "KDFW"
         assert CITY_TO_STATION["phoenix"] == "KPHX"
         assert CITY_TO_STATION["houston"] == "KIAH"
+        assert CITY_TO_STATION["rome"] == "LIRF"
+        assert CITY_TO_STATION["amsterdam"] == "EHAM"
+        assert CITY_TO_STATION["cape town"] == "FACT"
+        assert CITY_TO_STATION["kuala lumpur"] == "WMKK"
+        assert CITY_TO_STATION["qingdao"] == "ZSQD"
 
     def test_us_stations_set(self):
         assert "KNYC" in US_STATIONS

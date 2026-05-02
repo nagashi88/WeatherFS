@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -145,6 +145,268 @@ class Trade(Base):
     # full-size order isn't misreported as a cash-cap event.
     cash_capped: Mapped[bool | None] = mapped_column(Boolean, default=False)
     regime: Mapped[str | None] = mapped_column(Text)
+
+
+class ShadowTwinTrade(Base):
+    """Isolated shadow simulation ledger.
+
+    Rows here are not PaperTrader positions and must never affect main paper
+    bankroll, risk limits, calibration, or phase gates. Each twin owns a single
+    hold-to-resolution buy_no simulation per market.
+    """
+
+    __tablename__ = "shadow_twin_trades"
+    __table_args__ = (
+        UniqueConstraint("twin_name", "market_id", name="uq_shadow_twin_market"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    twin_name: Mapped[str] = mapped_column(Text, nullable=False)
+    market_id: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(Text, nullable=False, default="buy_no")
+    entry_yes_price: Mapped[float] = mapped_column(Float, nullable=False)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    cost: Mapped[float] = mapped_column(Float, nullable=False)
+    model_probability: Mapped[float | None] = mapped_column(Float)
+    raw_model_prob: Mapped[float | None] = mapped_column(Float)
+    net_edge_at_entry: Mapped[float | None] = mapped_column(Float)
+    station: Mapped[str | None] = mapped_column(Text)
+    market_date: Mapped[str | None] = mapped_column(Text)
+    bucket_low: Mapped[float | None] = mapped_column(Float)
+    bucket_high: Mapped[float | None] = mapped_column(Float)
+    entry_volume: Mapped[float | None] = mapped_column(Float)
+    entry_spread: Mapped[float | None] = mapped_column(Float)
+    liquidity_min_volume: Mapped[float | None] = mapped_column(Float)
+    forecast_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    market_price_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open")
+    outcome: Mapped[str | None] = mapped_column(Text)
+    pnl: Mapped[float | None] = mapped_column(Float)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ShadowPolicyTrade(Base):
+    """Counterfactual shadow policy ledger.
+
+    Each row simulates one predefined policy for the same entry opportunity.
+    This table is experimental-only and must never feed bankroll, risk limits,
+    calibration, or phase gates.
+    """
+
+    __tablename__ = "shadow_policy_trades"
+    __table_args__ = (
+        UniqueConstraint("universe_name", "policy_name", "market_id", name="uq_shadow_policy_market"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    universe_name: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_name: Mapped[str] = mapped_column(Text, nullable=False)
+    opportunity_basket: Mapped[str] = mapped_column(Text, nullable=False)
+    market_id: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(Text, nullable=False, default="buy_no")
+    entry_yes_price: Mapped[float] = mapped_column(Float, nullable=False)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    cost: Mapped[float] = mapped_column(Float, nullable=False)
+    model_probability: Mapped[float | None] = mapped_column(Float)
+    raw_model_prob: Mapped[float | None] = mapped_column(Float)
+    net_edge_at_entry: Mapped[float | None] = mapped_column(Float)
+    station: Mapped[str | None] = mapped_column(Text)
+    market_date: Mapped[str | None] = mapped_column(Text)
+    bucket_low: Mapped[float | None] = mapped_column(Float)
+    bucket_high: Mapped[float | None] = mapped_column(Float)
+    entry_volume: Mapped[float | None] = mapped_column(Float)
+    entry_spread: Mapped[float | None] = mapped_column(Float)
+    liquidity_min_volume: Mapped[float | None] = mapped_column(Float)
+    forecast_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    market_price_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open")
+    exit_reason: Mapped[str | None] = mapped_column(Text)
+    outcome: Mapped[str | None] = mapped_column(Text)
+    pnl: Mapped[float | None] = mapped_column(Float)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class PaperVariantTrade(Base):
+    """Isolated paper variant ledger for main-like counterfactual fills.
+
+    Unlike shadow twins, these rows are generated from the main signal/voting/
+    sizing pipeline. They are still isolated from PaperTrader bankroll, phase
+    gates, risk limits, calibration, and fill-quality learning.
+    """
+
+    __tablename__ = "paper_variant_trades"
+    __table_args__ = (
+        UniqueConstraint("variant_name", "market_id", name="uq_paper_variant_market"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    variant_name: Mapped[str] = mapped_column(Text, nullable=False)
+    market_id: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(Text, nullable=False)
+    entry_yes_price: Mapped[float] = mapped_column(Float, nullable=False)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    cost: Mapped[float] = mapped_column(Float, nullable=False)
+    agent_name: Mapped[str | None] = mapped_column(Text)
+    model_probability: Mapped[float | None] = mapped_column(Float)
+    gaussian_prob: Mapped[float | None] = mapped_column(Float)
+    ensemble_prob: Mapped[float | None] = mapped_column(Float)
+    blended_prob: Mapped[float | None] = mapped_column(Float)
+    raw_model_prob: Mapped[float | None] = mapped_column(Float)
+    edge_at_entry: Mapped[float | None] = mapped_column(Float)
+    station: Mapped[str | None] = mapped_column(Text)
+    market_date: Mapped[str | None] = mapped_column(Text)
+    bucket_low: Mapped[float | None] = mapped_column(Float)
+    bucket_high: Mapped[float | None] = mapped_column(Float)
+    entry_volume: Mapped[float | None] = mapped_column(Float)
+    entry_spread: Mapped[float | None] = mapped_column(Float)
+    liquidity_min_volume: Mapped[float | None] = mapped_column(Float)
+    forecast_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    market_price_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open")
+    outcome: Mapped[str | None] = mapped_column(Text)
+    pnl: Mapped[float | None] = mapped_column(Float)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ShadowBasketTrade(Base):
+    """Basket-level shadow ledger for mutually exclusive bucket-NO structures.
+
+    These rows are paper/shadow only. They aggregate several NO legs that share
+    the same event identity and must never affect the main PaperTrader bankroll.
+    """
+
+    __tablename__ = "shadow_basket_trades"
+    __table_args__ = (
+        UniqueConstraint("policy_name", "event_identity", name="uq_shadow_basket_event"),
+        UniqueConstraint("basket_id", name="uq_shadow_basket_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    basket_id: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_name: Mapped[str] = mapped_column(Text, nullable=False)
+    event_identity: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    station: Mapped[str] = mapped_column(Text, nullable=False)
+    market_date: Mapped[str] = mapped_column(Text, nullable=False)
+    market_type: Mapped[str] = mapped_column(Text, nullable=False)
+    sizing_method: Mapped[str] = mapped_column(Text, nullable=False)
+    execution_model: Mapped[str] = mapped_column(Text, nullable=False)
+    leg_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount_per_leg: Mapped[float] = mapped_column(Float, nullable=False)
+    cost: Mapped[float] = mapped_column(Float, nullable=False)
+    payoff_none: Mapped[float] = mapped_column(Float, nullable=False)
+    worst_case_payoff: Mapped[float] = mapped_column(Float, nullable=False)
+    worst_case_threshold: Mapped[float] = mapped_column(Float, nullable=False)
+    expected_pnl: Mapped[float | None] = mapped_column(Float)
+    stressed_expected_pnl: Mapped[float | None] = mapped_column(Float)
+    market_yes_mass: Mapped[float | None] = mapped_column(Float)
+    model_yes_mass: Mapped[float | None] = mapped_column(Float)
+    min_bucket_low: Mapped[float | None] = mapped_column(Float)
+    max_bucket_high: Mapped[float | None] = mapped_column(Float)
+    min_entry_volume: Mapped[float | None] = mapped_column(Float)
+    max_entry_spread: Mapped[float | None] = mapped_column(Float)
+    scenario_payoffs: Mapped[str | None] = mapped_column(Text)
+    forecast_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    market_price_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open")
+    outcome_market_id: Mapped[str | None] = mapped_column(Text)
+    pnl: Mapped[float | None] = mapped_column(Float)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ShadowBasketLeg(Base):
+    """Leg-level details for a shadow basket entry."""
+
+    __tablename__ = "shadow_basket_legs"
+    __table_args__ = (
+        UniqueConstraint("basket_id", "market_id", name="uq_shadow_basket_leg_market"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    basket_id: Mapped[str] = mapped_column(Text, ForeignKey("shadow_basket_trades.basket_id"), nullable=False)
+    market_id: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(Text, nullable=False, default="buy_no")
+    entry_yes_price: Mapped[float] = mapped_column(Float, nullable=False)
+    entry_no_price: Mapped[float] = mapped_column(Float, nullable=False)
+    fill_no_price: Mapped[float] = mapped_column(Float, nullable=False)
+    fee_per_contract: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    cost: Mapped[float] = mapped_column(Float, nullable=False)
+    model_probability: Mapped[float | None] = mapped_column(Float)
+    raw_model_prob: Mapped[float | None] = mapped_column(Float)
+    net_edge_at_entry: Mapped[float | None] = mapped_column(Float)
+    station: Mapped[str | None] = mapped_column(Text)
+    market_date: Mapped[str | None] = mapped_column(Text)
+    bucket_low: Mapped[float | None] = mapped_column(Float)
+    bucket_high: Mapped[float | None] = mapped_column(Float)
+    entry_volume: Mapped[float | None] = mapped_column(Float)
+    entry_spread: Mapped[float | None] = mapped_column(Float)
+    forecast_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    market_price_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open")
+    outcome: Mapped[str | None] = mapped_column(Text)
+    pnl: Mapped[float | None] = mapped_column(Float)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class Phase1ShadowRejection(Base):
+    """Counterfactual ledger for Phase-1 entries intentionally kept shadow-only.
+
+    These rows record main-bot candidates blocked by Phase-1 production guards
+    before risk sizing. They are not PaperTrader positions and must never affect
+    bankroll, risk limits, calibration, or agent weights.
+    """
+
+    __tablename__ = "phase1_shadow_rejections"
+    __table_args__ = (
+        UniqueConstraint("policy_name", "market_id", name="uq_phase1_shadow_rejection_market"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    policy_name: Mapped[str] = mapped_column(Text, nullable=False)
+    market_id: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(Text, nullable=False, default="buy_no")
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    entry_yes_price: Mapped[float] = mapped_column(Float, nullable=False)
+    entry_no_price: Mapped[float] = mapped_column(Float, nullable=False)
+    fee_per_contract: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    cost: Mapped[float] = mapped_column(Float, nullable=False)
+    model_probability: Mapped[float | None] = mapped_column(Float)
+    raw_model_prob: Mapped[float | None] = mapped_column(Float)
+    net_edge_at_entry: Mapped[float | None] = mapped_column(Float)
+    net_edge_yes: Mapped[float | None] = mapped_column(Float)
+    station: Mapped[str | None] = mapped_column(Text)
+    market_date: Mapped[str | None] = mapped_column(Text)
+    market_type: Mapped[str | None] = mapped_column(Text)
+    bucket_low: Mapped[float | None] = mapped_column(Float)
+    bucket_high: Mapped[float | None] = mapped_column(Float)
+    forecast_temp: Mapped[float | None] = mapped_column(Float)
+    entry_volume: Mapped[float | None] = mapped_column(Float)
+    entry_spread: Mapped[float | None] = mapped_column(Float)
+    majority_score: Mapped[float | None] = mapped_column(Float)
+    side_margin: Mapped[float | None] = mapped_column(Float)
+    distinct_majority: Mapped[int | None] = mapped_column(Integer)
+    forecast_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    market_price_timestamp: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open")
+    outcome: Mapped[str | None] = mapped_column(Text)
+    pnl: Mapped[float | None] = mapped_column(Float)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime)
+    observation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class DailyPerformance(Base):

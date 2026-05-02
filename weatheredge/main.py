@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import threading
@@ -46,11 +47,39 @@ from weatheredge.execution.paper_trader import Order, PaperTrader
 from weatheredge.execution.exit_manager import ExitManager
 from weatheredge.execution.fill_monitor import FillMonitor, FillRecord
 from weatheredge.execution.cross_platform import CrossPlatformArbitrage
+from weatheredge.execution.shadow_twin import (
+    adaptive_liquidity_min_volume,
+    adaptive_liquidity_passes,
+    core_shadow_stations,
+    expanded_shadow_stations,
+    is_main_trading_station,
+    record_adaptive_liquidity_shadow_twins,
+    record_shadow_twins,
+    resolve_shadow_trades_for_market,
+    update_shadow_policy_exits,
+)
+from weatheredge.execution.paper_variant import (
+    VARIANT_MAIN_ADAPTIVE_CORE,
+    VARIANT_MAIN_ADAPTIVE_EXPANDED,
+    load_open_variant_positions,
+    paper_variant_pnl_state,
+    record_paper_variant_orders,
+    resolve_paper_variant_trades_for_market,
+)
+from weatheredge.execution.shadow_basket import (
+    record_shadow_baskets,
+    resolve_shadow_baskets_for_market,
+)
+from weatheredge.execution.phase1_shadow import (
+    record_phase1_shadow_only_rejection,
+    resolve_phase1_shadow_rejections_for_market,
+)
 from weatheredge.probability.edge import calculate_net_edge
 from weatheredge.probability.engine import calculate_probability, calculate_blended_probability
 from weatheredge.data.metar import CurrentConditionsTracker
 from weatheredge.data.station_time import hours_until_market_close, station_local_today_str
 from weatheredge.data.model_run_detector import ModelRunDetector, ModelRunEvent
+from weatheredge.data.market_parser import CITY_TO_STATION as PARSED_CITY_TO_STATION
 from weatheredge.data.market_parser import US_STATIONS
 from weatheredge.agents.base import MarketOpportunity, Signal
 from weatheredge.agents.risk_manager import RiskManager
@@ -75,6 +104,171 @@ from weatheredge.probability.timesfm_forecaster import TimesFMForecaster
 
 log = logging.getLogger(__name__)
 
+
+def _bucket_settlement_bounds(
+    platform: object,
+    bucket_low: float,
+    bucket_high: float,
+    *,
+    unit: str = "F",
+) -> tuple[float, float]:
+    """Return model/settlement bounds while keeping DB/display bounds unchanged."""
+    low = float(bucket_low)
+    high = float(bucket_high)
+    if str(platform or "").lower() != "polymarket":
+        return low, high
+    if abs(low - round(low)) > 1e-9 or abs(high - round(high)) > 1e-9:
+        return low, high
+
+    # Polymarket weather ladders display integer buckets like "60-61°F";
+    # settlement covers both endpoint integer outcomes, so model them as the
+    # corresponding rounded-temperature bin instead of [60, 61).
+    margin = 0.9 if str(unit).upper() == "C" else 0.5
+    return low - margin, high + margin
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    if status == 429:
+        return True
+    message = str(exc).lower()
+    return "429" in message or "too many requests" in message
+
+
+def _open_meteo_cooldown_file() -> Path:
+    configured = os.environ.get(_OPEN_METEO_COOLDOWN_FILE_ENV_VAR)
+    return Path(configured).expanduser() if configured else _DEFAULT_OPEN_METEO_COOLDOWN_FILE
+
+
+def _parse_open_meteo_cooldown(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _read_persisted_open_meteo_cooldown() -> datetime | None:
+    path = _open_meteo_cooldown_file()
+    try:
+        if not path.exists():
+            return None
+        return _parse_open_meteo_cooldown(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.debug("Could not read Open-Meteo cooldown file %s: %s", path, exc)
+        return None
+
+
+def _write_persisted_open_meteo_cooldown(until: datetime) -> None:
+    path = _open_meteo_cooldown_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(until.astimezone(timezone.utc).isoformat(), encoding="utf-8")
+    except Exception as exc:
+        log.debug("Could not write Open-Meteo cooldown file %s: %s", path, exc)
+
+
+def _clear_persisted_open_meteo_cooldown() -> None:
+    path = _open_meteo_cooldown_file()
+    try:
+        path.unlink(missing_ok=True)
+    except Exception as exc:
+        log.debug("Could not clear Open-Meteo cooldown file %s: %s", path, exc)
+
+
+def _restore_open_meteo_cooldown(state: "AppState", now: datetime | None = None) -> None:
+    """Enable restart-safe Open-Meteo cooldown persistence for the live app."""
+    state.persist_open_meteo_cooldown = True
+    until = _read_persisted_open_meteo_cooldown()
+    if until is None:
+        return
+
+    now = now or datetime.now(timezone.utc)
+    if until <= now:
+        _clear_persisted_open_meteo_cooldown()
+        return
+
+    state.open_meteo_cooldown_until = until
+    log.warning(
+        "Restored Open-Meteo cooldown until %s; startup will skip Open-Meteo calls if still active",
+        until.isoformat(),
+    )
+
+
+def _open_meteo_cooldown_active(state: "AppState", now: datetime | None = None) -> bool:
+    until = getattr(state, "open_meteo_cooldown_until", None)
+    if until is None and getattr(state, "persist_open_meteo_cooldown", False):
+        until = _read_persisted_open_meteo_cooldown()
+        state.open_meteo_cooldown_until = until
+    if until is None:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    if until <= now:
+        state.open_meteo_cooldown_until = None
+        if getattr(state, "persist_open_meteo_cooldown", False):
+            _clear_persisted_open_meteo_cooldown()
+        return False
+    return True
+
+
+def _activate_open_meteo_cooldown(
+    state: "AppState",
+    *,
+    city: str,
+    endpoint: str,
+    now: datetime | None = None,
+) -> None:
+    minutes = max(0, int(getattr(state.settings, "open_meteo_rate_limit_cooldown_minutes", 60)))
+    if minutes <= 0:
+        return
+    now = now or datetime.now(timezone.utc)
+    until = now + timedelta(minutes=minutes)
+    existing = getattr(state, "open_meteo_cooldown_until", None)
+    if existing is not None and existing.tzinfo is None:
+        existing = existing.replace(tzinfo=timezone.utc)
+    if existing is None or existing < until:
+        state.open_meteo_cooldown_until = until
+        if getattr(state, "persist_open_meteo_cooldown", False):
+            _write_persisted_open_meteo_cooldown(until)
+    log.warning(
+        "Open-Meteo rate limit hit on %s/%s; cooling down all Open-Meteo endpoints until %s",
+        city,
+        endpoint,
+        state.open_meteo_cooldown_until.isoformat(),
+    )
+
+
+def _bucket_integer_bounds(bucket_low: float | None, bucket_high: float | None) -> tuple[int | None, int | None]:
+    if bucket_low is None or bucket_high is None:
+        return None, None
+    try:
+        return int(math.ceil(float(bucket_low) - 1e-9)), int(math.floor(float(bucket_high) + 1e-9))
+    except (TypeError, ValueError, OverflowError):
+        return None, None
+
+
+def _rounded_integer_temp(temp: float) -> int:
+    # Avoid Python banker's rounding; settlement/display buckets are integer outcomes.
+    return int(math.floor(float(temp) + 0.5))
+
+
+def _temp_inside_integer_bucket(temp: float, low_int: int, high_int: int) -> bool:
+    rounded = _rounded_integer_temp(temp)
+    return low_int <= rounded <= high_int
+
+
+def _temp_near_integer_bucket(temp: float, low_int: int, high_int: int, margin_f: float) -> bool:
+    value = float(temp)
+    if value < low_int:
+        return (low_int - value) <= margin_f
+    if value > high_int:
+        return (value - high_int) <= margin_f
+    return True
+
 # ---------------------------------------------------------------------------
 # Logging setup (Addendum Gap 13)
 # ---------------------------------------------------------------------------
@@ -85,6 +279,11 @@ _LOG_FILE = _LOG_DIR / "weatheredge.log"
 _LOG_FILE_ENV_VAR = "WEATHEREDGE_LOG_FILE"
 _PHASE_ENV_VAR = "WEATHEREDGE_PHASE"
 _ORDER_MODE_ENV_VAR = "WEATHEREDGE_ORDER_MODE"
+_DECISION_GRADE_CUTOFF_ENV_VAR = "WEATHEREDGE_DECISION_GRADE_CUTOFF"
+_OPEN_METEO_COOLDOWN_FILE_ENV_VAR = "WEATHEREDGE_OPEN_METEO_COOLDOWN_FILE"
+_DEFAULT_OPEN_METEO_COOLDOWN_FILE = _PROJECT_ROOT / "artifacts" / "open_meteo_cooldown_until.txt"
+_DEFAULT_DECISION_GRADE_CUTOFF = "2026-04-29T08:36:23Z"
+_DECISION_LOOP_MARKET_SCAN_LAG_SECONDS = 90
 _LOG_FORMAT = "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
 
 
@@ -123,6 +322,66 @@ def _observed_temp_or_none(value: object) -> float | None:
     return temp
 
 
+def _as_utc_aware(ts: datetime) -> datetime:
+    """Normalize SQLite-naive datetimes to UTC for causal timestamp checks."""
+    if ts.tzinfo is None or ts.tzinfo.utcoffset(ts) is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _parse_utc_naive_timestamp(value: object) -> datetime | None:
+    """Parse a timestamp into SQLite-compatible naive UTC."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _max_timestamp_floor(*values: object) -> datetime | None:
+    parsed = [ts for ts in (_parse_utc_naive_timestamp(value) for value in values) if ts is not None]
+    return max(parsed) if parsed else None
+
+
+def _decision_grade_since_for_db() -> datetime | None:
+    """Cutoff for post-fix, decision-grade Phase 1 evidence."""
+    return _parse_utc_naive_timestamp(
+        os.getenv(_DECISION_GRADE_CUTOFF_ENV_VAR, _DEFAULT_DECISION_GRADE_CUTOFF)
+    )
+
+
+_LAST_BUILD_SKIP_REASON: str | None = None
+
+
+def _mark_build_skip(reason: str) -> None:
+    """Store the most recent _build_opportunity skip reason for cycle diagnostics."""
+    global _LAST_BUILD_SKIP_REASON
+    _LAST_BUILD_SKIP_REASON = reason
+
+
+def _clear_build_skip_reason() -> None:
+    global _LAST_BUILD_SKIP_REASON
+    _LAST_BUILD_SKIP_REASON = None
+
+
+def _pop_build_skip_reason() -> str:
+    global _LAST_BUILD_SKIP_REASON
+    reason = _LAST_BUILD_SKIP_REASON or "build_none_unknown"
+    _LAST_BUILD_SKIP_REASON = None
+    return reason
+
+
+def _bump_counter(counters: dict[str, int], key: str, amount: int = 1) -> None:
+    counters[key] = counters.get(key, 0) + amount
+
+
 def should_evaluate_market(volume: float, spread_pct: float) -> tuple[bool, str]:
     """Check if a market passes volume/liquidity filters.
 
@@ -136,6 +395,200 @@ def should_evaluate_market(volume: float, spread_pct: float) -> tuple[bool, str]
     if spread_pct > MAX_SPREAD_PCT:
         return (False, "wide_spread")
     return (True, "")
+
+
+def _build_signals_for_variant_opportunities(
+    state,
+    opportunities: dict[str, MarketOpportunity],
+    llm_edge_threshold: float,
+) -> dict[str, list[Signal]]:
+    """Run the main signal stack for isolated paper variants."""
+    signals_by_market: dict[str, list[Signal]] = {}
+    if not opportunities:
+        return signals_by_market
+
+    opps_by_city: dict[str, list[MarketOpportunity]] = {}
+    for opp in opportunities.values():
+        opps_by_city.setdefault(opp.city, []).append(opp)
+
+    for market_id, opp in opportunities.items():
+        market_signals: list[Signal] = []
+
+        if not MODULES.get("agent_voting", False):
+            min_edge = float(getattr(state.settings, "min_edge_percent", 10.0)) / 100.0
+            if opp.net_edge >= opp.net_edge_no:
+                baseline_side = "buy_yes"
+                baseline_edge = opp.net_edge
+            else:
+                baseline_side = "buy_no"
+                baseline_edge = opp.net_edge_no
+            if baseline_edge >= min_edge:
+                market_signals.append(Signal(
+                    market_id=market_id,
+                    side=baseline_side,
+                    confidence=1.0,
+                    agent_name="Baseline",
+                    reasoning=f"Variant blended edge {baseline_edge:.2f} >= fixed gate {min_edge:.2f}",
+                ))
+                if state.settings.enable_conservative_agent:
+                    try:
+                        market_signals.append(conservative_strategy(opp, state.settings))
+                    except Exception as exc:
+                        log.debug("variant conservative guard failed for %s: %s", market_id, exc)
+                if getattr(state.settings, "qualitative_caution_guard_enabled", True):
+                    try:
+                        market_signals.append(state.rules_qualitative_engine.analyze(
+                            opp,
+                            conditions_tracker=state.conditions_tracker,
+                            calibration_tracker=state.calibration_tracker,
+                        ))
+                    except Exception as exc:
+                        log.debug("variant qualitative guard failed for %s: %s", market_id, exc)
+
+        if MODULES.get("agent_voting", False) and state.settings.enable_conservative_agent:
+            try:
+                market_signals.append(conservative_strategy(opp, state.settings))
+            except Exception as exc:
+                log.debug("variant conservative_strategy failed for %s: %s", market_id, exc)
+
+        if MODULES.get("agent_voting", False) and state.settings.enable_aggressive_agent:
+            try:
+                bucket_markets = [o for o in opps_by_city.get(opp.city, []) if o.market_id != market_id]
+                for sig in aggressive_strategy(opp, bucket_markets, state.settings):
+                    if sig.market_id == market_id:
+                        market_signals.append(sig)
+                    elif sig.market_id in opportunities:
+                        signals_by_market.setdefault(sig.market_id, []).append(sig)
+            except Exception as exc:
+                log.debug("variant aggressive_strategy failed for %s: %s", market_id, exc)
+
+        if MODULES["agent_mean_reversion"] and state.settings.enable_mean_reversion_agent:
+            history = state._price_history.setdefault(market_id, [])
+            if opp.market_price > 0:
+                history.append(opp.market_price)
+                max_hist = state.settings.mean_reversion_lookback_hours * 2
+                if len(history) > max_hist:
+                    state._price_history[market_id] = history[-state.settings.mean_reversion_lookback_hours:]
+            if len(history) >= 20:
+                try:
+                    market_signals.append(mean_reversion_strategy(market_id, history, state.settings))
+                except Exception as exc:
+                    log.debug("variant mean_reversion_strategy failed for %s: %s", market_id, exc)
+
+        if MODULES.get("agent_voting", False):
+            try:
+                sig = sell_no_strategy(opp, state.settings)
+                if sig.side != "no_trade":
+                    market_signals.append(sig)
+            except Exception as exc:
+                log.debug("variant sell_no_strategy failed for %s: %s", market_id, exc)
+
+        if (
+            MODULES.get("agent_voting", False)
+            and getattr(state.settings, "enable_timesfm_agent", False)
+            and state.timesfm_forecaster is not None
+        ):
+            try:
+                from weatheredge.agents.strategies.timesfm_quantile import timesfm_quantile_strategy
+                sig = timesfm_quantile_strategy(opp, state.settings)
+                if sig.side != "no_trade":
+                    market_signals.append(sig)
+            except Exception as exc:
+                log.debug("variant timesfm_quantile_strategy failed for %s: %s", market_id, exc)
+
+        if MODULES.get("agent_qualitative", False):
+            try:
+                if max(opp.net_edge, opp.net_edge_no) >= llm_edge_threshold:
+                    qual_signal = state.rules_qualitative_engine.analyze(
+                        opp,
+                        conditions_tracker=state.conditions_tracker,
+                        calibration_tracker=state.calibration_tracker,
+                    )
+                    if qual_signal.side != "no_trade":
+                        market_signals.append(qual_signal)
+            except Exception as exc:
+                log.debug("variant rules_qualitative_engine failed for %s: %s", market_id, exc)
+
+        if market_signals:
+            signals_by_market.setdefault(market_id, []).extend(market_signals)
+
+    return signals_by_market
+
+
+def _record_main_adaptive_paper_variants(
+    state,
+    adaptive_opportunities: dict[str, MarketOpportunity],
+    llm_edge_threshold: float,
+) -> dict[str, int]:
+    """Record main-like paper variants for adaptive-liquidity candidates."""
+    counts = {
+        VARIANT_MAIN_ADAPTIVE_CORE: 0,
+        VARIANT_MAIN_ADAPTIVE_EXPANDED: 0,
+    }
+    if not adaptive_opportunities:
+        return counts
+
+    core_stations = core_shadow_stations(state.settings)
+    expanded_stations = expanded_shadow_stations(state.settings)
+    liquidity_min = adaptive_liquidity_min_volume(
+        float(getattr(state.settings, "shadow_twin_cost_per_trade", 1.0)),
+        state.settings,
+    )
+
+    for variant_name, allowed_stations in (
+        (VARIANT_MAIN_ADAPTIVE_CORE, core_stations),
+        (VARIANT_MAIN_ADAPTIVE_EXPANDED, expanded_stations),
+    ):
+        variant_opportunities = {
+            market_id: opp
+            for market_id, opp in adaptive_opportunities.items()
+            if str(opp.station or "").upper() in allowed_stations
+        }
+        if not variant_opportunities:
+            continue
+
+        signals_by_market = _build_signals_for_variant_opportunities(
+            state,
+            variant_opportunities,
+            llm_edge_threshold,
+        )
+        if not signals_by_market:
+            continue
+
+        open_positions = load_open_variant_positions(variant_name)
+        realized_pnl, open_cost = paper_variant_pnl_state(variant_name)
+        variant_bankroll = max(
+            0.0,
+            float(state.settings.initial_bankroll) + float(realized_pnl) - float(open_cost),
+        )
+        variant_manager = PortfolioManager(
+            state.settings,
+            state.risk_manager,
+            phase1_shadow_recorder=None,
+            phase1_same_day_narrow_block_enabled=False,
+        )
+        try:
+            trade_orders = variant_manager.aggregate_signals(
+                signals_by_market=signals_by_market,
+                opportunities=variant_opportunities,
+                bankroll=variant_bankroll,
+                open_positions=open_positions,
+                daily_pnl=0.0,
+                total_pnl=float(realized_pnl),
+                recent_fills=None,
+            )
+        except Exception as exc:
+            log.warning("paper_variant: portfolio aggregation failed for %s: %s", variant_name, exc)
+            continue
+
+        counts[variant_name] = record_paper_variant_orders(
+            variant_name,
+            trade_orders,
+            variant_opportunities,
+            liquidity_min_volume=liquidity_min,
+        )
+
+    return counts
 
 
 def _resolve_log_file() -> Path:
@@ -309,6 +762,47 @@ CITY_COORDS: dict[str, tuple[float, float]] = {
     "Houston": (29.7604, -95.3698),
     "San Francisco": (37.7749, -122.4194),
     "Boston": (42.3601, -71.0589),
+    "London": (51.5053, 0.0553),
+    "Buenos Aires": (-34.8222, -58.5358),
+    "Ankara": (40.1281, 32.9951),
+    "Seoul": (37.5583, 126.7906),
+    "Tokyo": (35.5494, 139.7798),
+    "Moscow": (55.9726, 37.4146),
+    "Milan": (45.4451, 9.2767),
+    "Rome": (41.8003, 12.2389),
+    "Madrid": (40.4983, -3.5676),
+    "Istanbul": (41.2753, 28.7519),
+    "Singapore": (1.3644, 103.9915),
+    "Munich": (48.3538, 11.7861),
+    "Taipei": (25.0797, 121.2342),
+    "Paris": (49.0097, 2.5479),
+    "Toronto": (43.6777, -79.6248),
+    "Shanghai": (31.1443, 121.8083),
+    "Beijing": (40.0799, 116.6031),
+    "Wellington": (-41.3272, 174.8053),
+    "Warsaw": (52.1657, 20.9671),
+    "Tel Aviv": (32.0114, 34.8867),
+    "Chengdu": (30.5785, 103.9471),
+    "Chongqing": (29.7192, 106.6417),
+    "Wuhan": (30.7838, 114.2081),
+    "Shenzhen": (22.6393, 113.8107),
+    "Lucknow": (26.7606, 80.8893),
+    "Sao Paulo": (-23.4356, -46.4731),
+    "Hong Kong": (22.3080, 113.9185),
+    "Mexico City": (19.4363, -99.0721),
+    "Cape Town": (-33.9715, 18.6021),
+    "Lagos": (6.5774, 3.3212),
+    "Helsinki": (60.3172, 24.9633),
+    "Amsterdam": (52.3105, 4.7683),
+    "Jeddah": (21.6796, 39.1565),
+    "Karachi": (24.9065, 67.1608),
+    "Jakarta": (-6.1256, 106.6558),
+    "Manila": (14.5086, 121.0198),
+    "Kuala Lumpur": (2.7456, 101.7099),
+    "Guangzhou": (23.3924, 113.2988),
+    "Busan": (35.1795, 128.9382),
+    "Panama City": (9.0714, -79.3835),
+    "Qingdao": (36.3619, 120.0882),
 }
 
 # Station code → city name (reverse lookup for METAR tracker)
@@ -330,7 +824,14 @@ METAR_STATIONS: list[str] = list(STATION_TO_CITY.keys())
 
 def _canonical_station_code(station_or_city: str) -> str:
     """Return canonical station code (e.g. KNYC) when known."""
-    return CITY_TO_STATION.get(station_or_city, station_or_city)
+    raw = str(station_or_city or "").strip()
+    upper = raw.upper()
+    mapped = CITY_TO_STATION.get(raw) or PARSED_CITY_TO_STATION.get(raw.lower())
+    if mapped:
+        return mapped
+    if len(upper) == 4 and upper[0].isalpha():
+        return upper
+    return raw
 
 
 def _canonical_model_name(model: str | None) -> str | None:
@@ -345,6 +846,15 @@ def _canonical_model_name(model: str | None) -> str | None:
     if model_lc == "hrrr":
         return "hrrr"
     return None
+
+
+def _tracked_station_codes(settings: Settings) -> set[str]:
+    """Stations currently relevant for decisions/shadow evidence."""
+    return {
+        _canonical_station_code(city)
+        for city in settings.tracked_cities_list
+        if str(city or "").strip()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +876,9 @@ class AppState:
         )
         self.market_scanner: MarketScanner = MarketScanner(self.settings)
         self.portfolio_manager: PortfolioManager = PortfolioManager(
-            self.settings, self.risk_manager
+            self.settings,
+            self.risk_manager,
+            phase1_shadow_recorder=record_phase1_shadow_only_rejection,
         )
         self.fill_monitor: FillMonitor | None = None  # Initialised after DB in main()
         self.cross_platform_arb: CrossPlatformArbitrage = CrossPlatformArbitrage()
@@ -400,6 +912,9 @@ class AppState:
         self.timesfm_forecaster: TimesFMForecaster | None = None
         # Runtime cache: market_id → enriched metadata from scanning pipeline
         self.market_metadata: dict[str, dict] = {}
+        # Stops forecast/ensemble/NBM retry storms after an Open-Meteo 429.
+        self.open_meteo_cooldown_until: datetime | None = None
+        self.persist_open_meteo_cooldown: bool = False
         # Overlap guard — prevents concurrent decision cycles (e.g. scheduler + check_model_runs)
         self._decision_cycle_lock: threading.Lock = threading.Lock()
 
@@ -596,10 +1111,16 @@ def fetch_market_data() -> None:
                     # BugFix M8: store_market_price is now sync — no asyncio.run needed
                     yes_price = market.get("yes_price")
                     no_price = market.get("no_price")
-                    spread = None
+                    spread = market.get("spread")
                     try:
-                        if yes_price is not None and no_price is not None:
-                            spread = abs(float(yes_price) + float(no_price) - 1.0)
+                        if (
+                            spread is None
+                            and market.get("platform") != "polymarket"
+                            and yes_price is not None
+                            and no_price is not None
+                        ):
+                            spread_candidate = abs(float(yes_price) + float(no_price) - 1.0)
+                            spread = spread_candidate
                     except (TypeError, ValueError):
                         spread = None
                     state.market_scanner.store_market_price(
@@ -612,6 +1133,10 @@ def fetch_market_data() -> None:
                             if market.get("volume_24h") is not None
                             else market.get("volume"),
                             "spread": spread,
+                            "best_bid": market.get("best_bid"),
+                            "best_ask": market.get("best_ask"),
+                            "bid_size": market.get("bid_size"),
+                            "ask_size": market.get("ask_size"),
                         },
                     )
     except Exception as exc:
@@ -664,7 +1189,21 @@ async def _fetch_all_forecasts(state: AppState) -> None:
         (now_utc + timedelta(days=d)).strftime("%Y-%m-%d")
         for d in range(7)
     ]
-    cities = state.settings.cities_list
+    cities = state.settings.tracked_cities_list
+    main_or_extended_cities = {
+        c.strip().lower()
+        for c in (
+            state.settings.cities_list
+            + (state.settings.shadow_twin_extended_cities_list if state.settings.shadow_twin_enabled else [])
+        )
+        if c.strip()
+    }
+    open_meteo_rate_limited = _open_meteo_cooldown_active(state, now_utc)
+    if open_meteo_rate_limited:
+        log.warning(
+            "Open-Meteo cooldown active until %s; skipping forecast/ensemble/NBM this cycle",
+            state.open_meteo_cooldown_until.isoformat() if state.open_meteo_cooldown_until else "unknown",
+        )
 
     async with aiohttp.ClientSession() as session:
         for city in cities:
@@ -674,68 +1213,108 @@ async def _fetch_all_forecasts(state: AppState) -> None:
                 continue
             lat, lon = coords
             station_code = _canonical_station_code(city)
+            city_key = city.strip().lower()
+            is_broad_only_city = city_key not in main_or_extended_cities
 
             # Open-Meteo forecast — fetch once, store for each future date
-            try:
-                data = await fetch_forecast(lat, lon, session)
-                with get_session() as db_session:
-                    for target_date in forecast_dates:
-                        store_forecast(db_session, station_code, target_date, "forecast", data)
-                log.info(
-                    "Stored Open-Meteo forecast for %s/%s (%d dates)",
+            if open_meteo_rate_limited:
+                log.warning(
+                    "Skipping Open-Meteo forecast for %s/%s during rate-limit cooldown",
                     city,
                     station_code,
-                    len(forecast_dates),
                 )
-            except Exception as exc:
-                log.warning("Open-Meteo forecast failed for %s: %s", city, exc)
+            else:
+                try:
+                    data = await fetch_forecast(lat, lon, session)
+                    with get_session() as db_session:
+                        for target_date in forecast_dates:
+                            store_forecast(db_session, station_code, target_date, "forecast", data)
+                    log.info(
+                        "Stored Open-Meteo forecast for %s/%s (%d dates)",
+                        city,
+                        station_code,
+                        len(forecast_dates),
+                    )
+                except Exception as exc:
+                    if _is_rate_limit_error(exc):
+                        open_meteo_rate_limited = True
+                        _activate_open_meteo_cooldown(state, city=city, endpoint="forecast")
+                    log.warning("Open-Meteo forecast failed for %s: %s", city, exc)
 
-            # Open-Meteo ensemble — fetch once, store for each future date
-            try:
-                data = await fetch_ensemble(lat, lon, session)
-                with get_session() as db_session:
-                    for target_date in forecast_dates:
-                        store_forecast(db_session, station_code, target_date, "ensemble", data)
-                log.info(
-                    "Stored Open-Meteo ensemble for %s/%s (%d dates)",
+            fetch_city_ensemble = (
+                not is_broad_only_city
+                or bool(getattr(state.settings, "shadow_twin_broad_fetch_ensemble", False))
+            )
+            if open_meteo_rate_limited:
+                log.warning(
+                    "Skipping Open-Meteo ensemble for %s/%s during rate-limit cooldown",
                     city,
                     station_code,
-                    len(forecast_dates),
                 )
-            except Exception as exc:
-                log.warning("Open-Meteo ensemble failed for %s: %s", city, exc)
+            elif fetch_city_ensemble:
+                # Open-Meteo ensemble — fetch once, store for each future date
+                try:
+                    data = await fetch_ensemble(lat, lon, session)
+                    with get_session() as db_session:
+                        for target_date in forecast_dates:
+                            store_forecast(db_session, station_code, target_date, "ensemble", data)
+                    log.info(
+                        "Stored Open-Meteo ensemble for %s/%s (%d dates)",
+                        city,
+                        station_code,
+                        len(forecast_dates),
+                    )
+                except Exception as exc:
+                    if _is_rate_limit_error(exc):
+                        open_meteo_rate_limited = True
+                        _activate_open_meteo_cooldown(state, city=city, endpoint="ensemble")
+                    log.warning("Open-Meteo ensemble failed for %s: %s", city, exc)
+            else:
+                log.debug("Skipping Open-Meteo ensemble for broad shadow city %s/%s", city, station_code)
 
-            # Open-Meteo NBM Conus — high-resolution U.S. blend, fetched as its
-            # own model so disagreement with GFS/HRRR/ECMWF remains observable.
-            try:
-                data = await fetch_nbm(lat, lon, session)
-                with get_session() as db_session:
-                    for target_date in forecast_dates:
-                        store_forecast(db_session, station_code, target_date, "nbm", data)
-                log.info(
-                    "Stored Open-Meteo NBM for %s/%s (%d dates)",
-                    city,
-                    station_code,
-                    len(forecast_dates),
-                )
-            except Exception as exc:
-                log.warning("Open-Meteo NBM failed for %s: %s", city, exc)
+            if station_code in US_STATIONS:
+                # Open-Meteo NBM Conus — high-resolution U.S. blend, fetched as
+                # its own model so disagreement remains observable.
+                if open_meteo_rate_limited:
+                    log.warning(
+                        "Skipping Open-Meteo NBM for %s/%s during rate-limit cooldown",
+                        city,
+                        station_code,
+                    )
+                else:
+                    try:
+                        data = await fetch_nbm(lat, lon, session)
+                        with get_session() as db_session:
+                            for target_date in forecast_dates:
+                                store_forecast(db_session, station_code, target_date, "nbm", data)
+                        log.info(
+                            "Stored Open-Meteo NBM for %s/%s (%d dates)",
+                            city,
+                            station_code,
+                            len(forecast_dates),
+                        )
+                    except Exception as exc:
+                        if _is_rate_limit_error(exc):
+                            open_meteo_rate_limited = True
+                            _activate_open_meteo_cooldown(state, city=city, endpoint="nbm")
+                        log.warning("Open-Meteo NBM failed for %s: %s", city, exc)
 
-            # NOAA NWS — fetch once, store for each future date
-            try:
-                from weatheredge.data.noaa import fetch_noaa_forecast as _fetch_noaa, store_noaa_forecast as _store_noaa
-                noaa_data = await _fetch_noaa(lat, lon, session)
-                with get_session() as db_session:
-                    for target_date in forecast_dates:
-                        _store_noaa(db_session, station_code, target_date, noaa_data)
-                log.info(
-                    "Stored NOAA forecast for %s/%s (%d dates)",
-                    city,
-                    station_code,
-                    len(forecast_dates),
-                )
-            except Exception as exc:
-                log.warning("NOAA forecast failed for %s: %s", city, exc)
+                # NOAA NWS — U.S. only; international broad-shadow cities use
+                # Open-Meteo forecast/ensemble so we do not spam failing calls.
+                try:
+                    from weatheredge.data.noaa import fetch_noaa_forecast as _fetch_noaa, store_noaa_forecast as _store_noaa
+                    noaa_data = await _fetch_noaa(lat, lon, session)
+                    with get_session() as db_session:
+                        for target_date in forecast_dates:
+                            _store_noaa(db_session, station_code, target_date, noaa_data)
+                    log.info(
+                        "Stored NOAA forecast for %s/%s (%d dates)",
+                        city,
+                        station_code,
+                        len(forecast_dates),
+                    )
+                except Exception as exc:
+                    log.warning("NOAA forecast failed for %s: %s", city, exc)
 
 
 def run_actuals_backfill() -> None:
@@ -771,6 +1350,13 @@ def _normalize_forecast_station_labels() -> None:
 
 async def _fetch_and_store_actuals(state: AppState) -> dict[str, int]:
     """Fetch daily observed max temps and write Forecast.actual_temp."""
+    if _open_meteo_cooldown_active(state):
+        log.warning(
+            "Skipping actuals backfill during Open-Meteo cooldown until %s",
+            state.open_meteo_cooldown_until.isoformat() if state.open_meteo_cooldown_until else "unknown",
+        )
+        return {"stations": 0, "rows_updated": 0}
+
     end_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
     lookback_days = max(1, int(getattr(state.settings, "actuals_lookback_days", 30)))
     start_date = end_date - timedelta(days=lookback_days - 1)
@@ -783,7 +1369,7 @@ async def _fetch_and_store_actuals(state: AppState) -> dict[str, int]:
     end_str = end_date.isoformat()
 
     async with aiohttp.ClientSession() as session:
-        for city in state.settings.cities_list:
+        for city in state.settings.tracked_cities_list:
             coords = CITY_COORDS.get(city)
             if coords is None:
                 continue
@@ -800,6 +1386,9 @@ async def _fetch_and_store_actuals(state: AppState) -> dict[str, int]:
                     session=session,
                 )
             except Exception as exc:
+                if _is_rate_limit_error(exc):
+                    _activate_open_meteo_cooldown(state, city=city, endpoint="archive")
+                    break
                 log.warning("actuals fetch failed for %s/%s: %s", city, station_code, exc)
                 continue
 
@@ -920,6 +1509,7 @@ def _run_decision_cycle(state: AppState) -> None:
     # --- (c) Build opportunities and collect signals per market ---
     signals_by_market: dict[str, list[Signal]] = {}
     opportunities: dict[str, MarketOpportunity] = {}
+    adaptive_shadow_opportunities: dict[str, MarketOpportunity] = {}
 
     # Tracking markets by platform for cross-platform arb scan
     poly_markets_raw: list[dict] = []
@@ -970,27 +1560,52 @@ def _run_decision_cycle(state: AppState) -> None:
     per_market_ttl = state.settings.market_data_ttl_minutes
     _now_utc = datetime.now(timezone.utc)
     stale_market_count = 0
+    gate_counts: dict[str, int] = {}
 
     # H5 fix: Pre-pass — build ALL opportunities before running any strategy.
     # Previously _opps_by_city was populated mid-loop, so the first market in a
     # city saw 0 companions while later ones saw all predecessors (asymmetric ladder).
     # Now every market sees the full city bucket when strategies execute.
     for market_id, price_data in market_prices.items():
+        adaptive_shadow_only = False
         # US-VF: Volume/spread filter — skip illiquid markets before building opportunity
         if MODULES.get("volume_filter", False):
             _vol = price_data.get("volume")
             _spread = price_data.get("spread")
-            if _vol is not None and _spread is not None:
+            if _vol is None or _spread is None:
+                _bump_counter(gate_counts, "liquidity_missing_inputs")
+                continue
+            else:
                 _ok, _reason = should_evaluate_market(float(_vol), float(_spread))
                 if not _ok:
-                    log.debug("run_decision_loop: skipping %s — %s (vol=%.0f spread=%.4f)", market_id, _reason, _vol, _spread)
-                    continue
+                    if _reason == "low_volume" and getattr(state.settings, "shadow_twin_adaptive_liquidity_enabled", True):
+                        _bump_counter(gate_counts, "low_volume")
+                        _expected_cost = float(getattr(state.settings, "shadow_twin_cost_per_trade", 1.0))
+                        _shadow_ok, _shadow_reason, _shadow_min_volume = adaptive_liquidity_passes(
+                            float(_vol), float(_spread), _expected_cost, state.settings
+                        )
+                        if _shadow_ok:
+                            adaptive_shadow_only = True
+                            _bump_counter(gate_counts, "adaptive_shadow_only_candidate")
+                            log.debug(
+                                "run_decision_loop: building %s for adaptive liquidity shadow only (vol=%.0f min=%.0f spread=%.4f)",
+                                market_id, _vol, _shadow_min_volume, _spread,
+                            )
+                        else:
+                            _bump_counter(gate_counts, _shadow_reason)
+                            log.debug(
+                                "run_decision_loop: skipping %s — %s (main=%s vol=%.0f min=%.0f spread=%.4f)",
+                                market_id, _shadow_reason, _reason, _vol, _shadow_min_volume, _spread,
+                            )
+                            continue
+                    else:
+                        _bump_counter(gate_counts, _reason)
+                        log.debug("run_decision_loop: skipping %s — %s (vol=%.0f spread=%.4f)", market_id, _reason, _vol, _spread)
+                        continue
 
-        # Per-market freshness check. Missing timestamp is treated as
-        # "freshness unknown" and not blocking — the global gate already
-        # ensured at least one row is fresh, and test fixtures pass dicts
-        # without a timestamp. This check only rejects rows we can
-        # confidently prove stale.
+        # Per-market freshness check. Missing timestamp is handled by the
+        # causal timestamp gate in _build_opportunity when temporal_guard is
+        # active; this age check only rejects rows we can prove stale.
         _ts = price_data.get("timestamp")
         if isinstance(_ts, datetime):
             if _ts.tzinfo is None:
@@ -1002,8 +1617,10 @@ def _run_decision_cycle(state: AppState) -> None:
                     market_id, _age_minutes, per_market_ttl,
                 )
                 stale_market_count += 1
+                _bump_counter(gate_counts, "per_market_stale")
                 continue
 
+        _clear_build_skip_reason()
         try:
             opp = _build_opportunity(market_id, price_data, forecasts)
         except Exception as exc:
@@ -1011,12 +1628,57 @@ def _run_decision_cycle(state: AppState) -> None:
                 "run_decision_loop: failed to build opportunity for %s: %s",
                 market_id, exc, exc_info=True,
             )
+            _bump_counter(gate_counts, "build_exception")
             continue
         if opp is None:
+            _bump_counter(gate_counts, _pop_build_skip_reason())
+            continue
+        if adaptive_shadow_only:
+            adaptive_shadow_opportunities[market_id] = opp
+            _bump_counter(gate_counts, "adaptive_shadow_only_built")
             continue
         built_count += 1
         opportunities[market_id] = opp
         _opps_by_city.setdefault(opp.city, []).append(opp)
+
+    try:
+        shadow_counts = record_shadow_twins(opportunities, state.settings)
+        adaptive_shadow_counts = record_adaptive_liquidity_shadow_twins(adaptive_shadow_opportunities, state.settings)
+        paper_variant_counts = _record_main_adaptive_paper_variants(
+            state,
+            adaptive_shadow_opportunities,
+            LLM_EDGE_THRESHOLD,
+        )
+        basket_shadow_counts = record_shadow_baskets(opportunities, state.settings)
+        shadow_counts.update(adaptive_shadow_counts)
+        shadow_exit_opportunities = dict(opportunities)
+        shadow_exit_opportunities.update(adaptive_shadow_opportunities)
+        shadow_policy_exits = update_shadow_policy_exits(shadow_exit_opportunities, state.market_metadata)
+        if any(shadow_counts.values()):
+            log.info(
+                "run_decision_loop: shadow twins recorded core=%d expanded=%d broad=%d adaptive_core=%d adaptive_expanded=%d adaptive_broad=%d",
+                shadow_counts.get("floor_no_core", 0),
+                shadow_counts.get("floor_no_expanded", 0),
+                shadow_counts.get("floor_no_broad", 0),
+                shadow_counts.get("floor_no_core_adaptive_liquidity", 0),
+                shadow_counts.get("floor_no_expanded_adaptive_liquidity", 0),
+                shadow_counts.get("floor_no_broad_adaptive_liquidity", 0),
+            )
+        if any(paper_variant_counts.values()):
+            log.info(
+                "run_decision_loop: paper variants recorded main_adaptive_core=%d main_adaptive_expanded=%d",
+                paper_variant_counts.get(VARIANT_MAIN_ADAPTIVE_CORE, 0),
+                paper_variant_counts.get(VARIANT_MAIN_ADAPTIVE_EXPANDED, 0),
+            )
+        if shadow_policy_exits:
+            log.info("run_decision_loop: shadow policy exits=%d", shadow_policy_exits)
+        if any(basket_shadow_counts.values()):
+            log.info(
+                "run_decision_loop: shadow baskets recorded expanded=%d",
+                basket_shadow_counts.get("expanded_no_basket_v1", 0),
+            )
+    except Exception as exc:
+        log.warning("run_decision_loop: shadow twin recording failed: %s", exc)
 
     # CCG-bughunt2 F-new-3: ensure every open position has an exit-side opp
     # even when its price has drifted into the 0.10/0.90 entry-band tails.
@@ -1049,9 +1711,25 @@ def _run_decision_cycle(state: AppState) -> None:
     for market_id, opp in opportunities.items():
         price_data = market_prices.get(market_id, {})
 
+        # Expanded shadow-twin markets are fetched into the shared DB so they
+        # can be simulated, but the main bot must only trade the configured
+        # target_cities universe. Exits still see all opportunities below.
+        _opp_station = getattr(opp, "station", "")
+        if _opp_station is None:
+            _bump_counter(gate_counts, "not_main_station")
+            continue
+        if isinstance(_opp_station, str):
+            if not _opp_station or not is_main_trading_station(_opp_station, state.settings):
+                _bump_counter(gate_counts, "not_main_station")
+                continue
+        else:
+            _bump_counter(gate_counts, "not_main_station")
+            continue
+
         # Skip markets where we already have an open position
         if state.paper_trader.has_open_position(market_id):
             position_skipped += 1
+            _bump_counter(gate_counts, "already_open")
             continue
 
         # Re-entry guard: skip if we already entered this market 2+ times today.
@@ -1065,6 +1743,7 @@ def _run_decision_cycle(state: AppState) -> None:
                 market_id, opp.market_date,
             )
             position_skipped += 1
+            _bump_counter(gate_counts, "daily_entry_limit")
             continue
 
         # Adjacent-bucket correlation guard: skip bucket markets when we already
@@ -1102,6 +1781,7 @@ def _run_decision_cycle(state: AppState) -> None:
                     break
             if _adjacent_skip:
                 position_skipped += 1
+                _bump_counter(gate_counts, "adjacent_bucket")
                 continue
 
         # Collect raw dicts for arb scan
@@ -1166,6 +1846,8 @@ def _run_decision_cycle(state: AppState) -> None:
                         market_signals.append(qual_signal)
                     except Exception as exc:
                         log.warning("baseline qualitative guard failed for %s: %s", market_id, exc)
+            else:
+                _bump_counter(gate_counts, "baseline_edge_below_threshold")
 
         # Conservative strategy
         if MODULES.get("agent_voting", False) and state.settings.enable_conservative_agent:
@@ -1242,6 +1924,8 @@ def _run_decision_cycle(state: AppState) -> None:
 
         if market_signals:
             signals_by_market.setdefault(market_id, []).extend(market_signals)
+        else:
+            _bump_counter(gate_counts, "no_strategy_signal")
 
     # --- (d/e) Aggregate signals via portfolio manager ---
     bankroll = state.paper_trader.bankroll
@@ -1289,6 +1973,39 @@ def _run_decision_cycle(state: AppState) -> None:
         built_count, len(market_prices), len(signals_by_market),
         llm_calls, llm_skipped, int(LLM_EDGE_THRESHOLD * 100), position_skipped,
         stale_market_count,
+    )
+    log.info(
+        "run_decision_loop gate_counts: "
+        "low_volume=%d adaptive_only_candidates=%d adaptive_only_built=%d adaptive_low_volume=%d "
+        "adaptive_wide_spread=%d adaptive_missing=%d liquidity_missing=%d wide_spread=%d stale=%d "
+        "no_forecast=%d missing_ts=%d causal_skip=%d "
+        "bad_price=%d extreme_price=%d gross_edge_cap=%d raw_prob_floor=%d "
+        "not_main_station=%d already_open=%d daily_entry_limit=%d adjacent_bucket=%d "
+        "baseline_edge_below=%d no_strategy_signal=%d build_unknown=%d build_exception=%d",
+        gate_counts.get("low_volume", 0),
+        gate_counts.get("adaptive_shadow_only_candidate", 0),
+        gate_counts.get("adaptive_shadow_only_built", 0),
+        gate_counts.get("adaptive_liquidity_low_volume", 0),
+        gate_counts.get("adaptive_liquidity_wide_spread", 0),
+        gate_counts.get("adaptive_liquidity_missing_inputs", 0),
+        gate_counts.get("liquidity_missing_inputs", 0),
+        gate_counts.get("wide_spread", 0),
+        gate_counts.get("per_market_stale", 0),
+        gate_counts.get("no_forecast", 0),
+        gate_counts.get("missing_causal_timestamp", 0),
+        gate_counts.get("forecast_newer_than_price", 0),
+        gate_counts.get("bad_price", 0),
+        gate_counts.get("entry_price_too_extreme", 0),
+        gate_counts.get("gross_edge_cap", 0),
+        gate_counts.get("raw_prob_below_floor", 0),
+        gate_counts.get("not_main_station", 0),
+        gate_counts.get("already_open", 0),
+        gate_counts.get("daily_entry_limit", 0),
+        gate_counts.get("adjacent_bucket", 0),
+        gate_counts.get("baseline_edge_below_threshold", 0),
+        gate_counts.get("no_strategy_signal", 0),
+        gate_counts.get("build_none_unknown", 0),
+        gate_counts.get("build_exception", 0),
     )
 
     # Collect recent fills for VPIN toxic flow detection (C5 fix)
@@ -1380,10 +2097,13 @@ def _run_decision_cycle(state: AppState) -> None:
     # --- (g) Execute TradeOrders via paper trader ---
     current_prices = {mid: opp.market_price for mid, opp in opportunities.items()}
 
-    # Set limit order type when enabled, and check existing pending limit orders
-    if MODULES.get("limit_orders", False):
+    # Set limit order type when enabled. Existing pending limits still need fill
+    # checks even if new limit placement has since been disabled.
+    limit_orders_enabled = MODULES.get("limit_orders", False)
+    if limit_orders_enabled:
         for trade_order in trade_orders:
             trade_order.order_type = "limit"
+    if limit_orders_enabled or getattr(state.paper_trader, "open_orders", []):
         limit_fills = state.paper_trader.check_limit_fills(current_prices)
         if limit_fills > 0:
             log.info("run_decision_loop: %d limit orders filled this cycle", limit_fills)
@@ -1726,6 +2446,14 @@ def _read_latest_forecasts() -> dict[str, dict[str, dict]]:
             return float(value)
         return None
 
+    def _set_source_timestamp(entry: dict, key: str, ts: object) -> None:
+        if not isinstance(ts, datetime):
+            return
+        entry[key] = ts
+        current_ts = entry.get("forecast_timestamp")
+        if not isinstance(current_ts, datetime) or ts > current_ts:
+            entry["forecast_timestamp"] = ts
+
     # Only fetch rows for today and future dates, from recent fetches (last 3h).
     # This avoids scanning the full historical archive (476k+ rows) and ensures
     # each station+date gets the most recent model run.
@@ -1735,7 +2463,10 @@ def _read_latest_forecasts() -> dict[str, dict[str, dict]]:
             session.query(Forecast)
             .filter(Forecast.target_date >= today_str)
             .filter(Forecast.forecast_timestamp >= cutoff_ts)
-            .order_by(Forecast.forecast_timestamp.desc())
+            # NOAA hourly rows are numerous enough to crowd daily model rows out
+            # of the safety limit after the shadow-city expansion. Keep them as
+            # fallback, but order compact daily model rows first.
+            .order_by((Forecast.model == "noaa_nws").asc(), Forecast.forecast_timestamp.desc())
             .limit(5000)
             .all()
         )
@@ -1751,7 +2482,6 @@ def _read_latest_forecasts() -> dict[str, dict[str, dict]]:
                 seen[key] = set()
             if model in seen[key]:
                 continue
-            seen[key].add(model)
 
             if station not in result:
                 result[station] = {}
@@ -1769,7 +2499,7 @@ def _read_latest_forecasts() -> dict[str, dict[str, dict]]:
                     "ensemble_members": None,
                     "ensemble_members_min": None,
                     "model": model,
-                    "forecast_timestamp": row.forecast_timestamp,
+                    "forecast_timestamp": None,
                 }
 
             entry = result[station][target_date]
@@ -1777,38 +2507,71 @@ def _read_latest_forecasts() -> dict[str, dict[str, dict]]:
             if row_max_temp is None:
                 row_max_temp = _numeric_temp(getattr(row, "temperature_forecast", None))
             row_min_temp = _numeric_temp(getattr(row, "temperature_min_forecast", None))
-            current_ts = entry.get("forecast_timestamp")
-            if current_ts is None or row.forecast_timestamp > current_ts:
-                entry["forecast_timestamp"] = row.forecast_timestamp
+            row_useful = False
             if "ensemble" in model:
                 if row.ensemble_members:
                     try:
-                        entry["ensemble_members"] = json.loads(row.ensemble_members)
+                        parsed_members = json.loads(row.ensemble_members)
+                        if parsed_members:
+                            entry["ensemble_members"] = parsed_members
+                            _set_source_timestamp(entry, "ensemble_members_ts", row.forecast_timestamp)
+                            row_useful = True
                     except (json.JSONDecodeError, TypeError):
                         pass
                 if row.ensemble_min_members:
                     try:
-                        entry["ensemble_members_min"] = json.loads(row.ensemble_min_members)
+                        parsed_min_members = json.loads(row.ensemble_min_members)
+                        if parsed_min_members:
+                            entry["ensemble_members_min"] = parsed_min_members
+                            _set_source_timestamp(entry, "ensemble_members_min_ts", row.forecast_timestamp)
+                            row_useful = True
                     except (json.JSONDecodeError, TypeError):
                         pass
             elif "ecmwf" in model:
-                entry["ecmwf_temp"] = row_max_temp
-                entry["ecmwf_min_temp"] = row_min_temp
+                if row_max_temp is not None:
+                    entry["ecmwf_temp"] = row_max_temp
+                    _set_source_timestamp(entry, "ecmwf_temp_ts", row.forecast_timestamp)
+                    row_useful = True
+                if row_min_temp is not None:
+                    entry["ecmwf_min_temp"] = row_min_temp
+                    _set_source_timestamp(entry, "ecmwf_min_temp_ts", row.forecast_timestamp)
+                    row_useful = True
             elif "hrrr" in model:
-                entry["hrrr_temp"] = row_max_temp
-                entry["hrrr_min_temp"] = row_min_temp
+                if row_max_temp is not None:
+                    entry["hrrr_temp"] = row_max_temp
+                    _set_source_timestamp(entry, "hrrr_temp_ts", row.forecast_timestamp)
+                    row_useful = True
+                if row_min_temp is not None:
+                    entry["hrrr_min_temp"] = row_min_temp
+                    _set_source_timestamp(entry, "hrrr_min_temp_ts", row.forecast_timestamp)
+                    row_useful = True
             elif "nbm" in model:
-                entry["nbm_temp"] = row_max_temp
-                entry["nbm_min_temp"] = row_min_temp
+                if row_max_temp is not None:
+                    entry["nbm_temp"] = row_max_temp
+                    _set_source_timestamp(entry, "nbm_temp_ts", row.forecast_timestamp)
+                    row_useful = True
+                if row_min_temp is not None:
+                    entry["nbm_min_temp"] = row_min_temp
+                    _set_source_timestamp(entry, "nbm_min_temp_ts", row.forecast_timestamp)
+                    row_useful = True
             else:
                 # GFS / Open-Meteo / NOAA — primary forecast.
                 # Prefer "forecast" model (Open-Meteo daily max) over noaa_nws
                 # (hourly rows that store one value per period, not the daily max).
                 is_openmeteo_daily = model == "forecast"
                 if entry["temperature_forecast"] is None or is_openmeteo_daily:
-                    entry["temperature_forecast"] = row_max_temp
-                    entry["temperature_max_forecast"] = row_max_temp
-                    entry["temperature_min_forecast"] = row_min_temp
+                    if row_max_temp is not None:
+                        entry["temperature_forecast"] = row_max_temp
+                        entry["temperature_max_forecast"] = row_max_temp
+                        _set_source_timestamp(entry, "temperature_forecast_ts", row.forecast_timestamp)
+                        _set_source_timestamp(entry, "temperature_max_forecast_ts", row.forecast_timestamp)
+                        row_useful = True
+                    if row_min_temp is not None:
+                        entry["temperature_min_forecast"] = row_min_temp
+                        _set_source_timestamp(entry, "temperature_min_forecast_ts", row.forecast_timestamp)
+                        row_useful = True
+            if row_useful:
+                seen[key].add(model)
     return result
 
 
@@ -1881,28 +2644,83 @@ def _get_forecast_for_date(
     return None
 
 
+def _effective_forecast_timestamp(forecast: dict, *, use_daily_min: bool) -> datetime | None:
+    """Return the latest timestamp among forecast sources used by this market type."""
+    if use_daily_min:
+        pairs = (
+            ("temperature_min_forecast", "temperature_min_forecast_ts"),
+            ("ecmwf_min_temp", "ecmwf_min_temp_ts"),
+            ("hrrr_min_temp", "hrrr_min_temp_ts"),
+            ("nbm_min_temp", "nbm_min_temp_ts"),
+            ("ensemble_members_min", "ensemble_members_min_ts"),
+        )
+    else:
+        pairs = (
+            ("temperature_forecast", "temperature_forecast_ts"),
+            ("temperature_max_forecast", "temperature_max_forecast_ts"),
+            ("ecmwf_temp", "ecmwf_temp_ts"),
+            ("hrrr_temp", "hrrr_temp_ts"),
+            ("nbm_temp", "nbm_temp_ts"),
+            ("ensemble_members", "ensemble_members_ts"),
+        )
+    timestamps: list[datetime] = []
+    for value_key, ts_key in pairs:
+        if forecast.get(value_key) is None:
+            continue
+        ts = forecast.get(ts_key)
+        if isinstance(ts, datetime):
+            timestamps.append(ts)
+    if timestamps:
+        return max(timestamps)
+    fallback = forecast.get("forecast_timestamp")
+    return fallback if isinstance(fallback, datetime) else None
+
+
 def _read_latest_market_prices() -> dict[str, dict]:
     """Read the most recent price snapshot per market from DB.
 
-    Returns mapping: market_id -> {yes_price, no_price, volume, spread}
+    Returns mapping: market_id -> {yes_price, no_price, volume, spread}.
+    Polymarket spreads are trusted only when persisted with two-sided order-book
+    quote provenance; legacy YES+NO-derived spreads are masked out here.
     """
+    from weatheredge.db.models import Market as MarketModel
+
     result: dict[str, dict] = {}
     with get_session() as session:
         # BugFix H4: Removed hard LIMIT 200 that silently dropped less-active markets.
         # Use LIMIT 5000 as safety cap; Python-side first-seen dedup keeps latest per market.
         rows = (
-            session.query(MarketPrice)
+            session.query(MarketPrice, MarketModel.platform)
+            .outerjoin(MarketModel, MarketModel.id == MarketPrice.market_id)
             .order_by(MarketPrice.timestamp.desc())
             .limit(5000)
             .all()
         )
-        for row in rows:
+        for item in rows:
+            if isinstance(item, tuple):
+                row, platform = item
+            elif hasattr(item, "market_id"):
+                row, platform = item, None
+            else:
+                row, platform = item[0], item[1]
             if row.market_id and row.market_id not in result:
+                platform_label = platform
+                if platform_label is None:
+                    market_id_text = str(row.market_id).upper()
+                    platform_label = "kalshi" if market_id_text.startswith("KX") else "polymarket"
+                spread = row.spread
+                if platform_label == "polymarket" and (row.best_bid is None or row.best_ask is None):
+                    spread = None
                 result[row.market_id] = {
                     "yes_price": row.yes_price,
                     "no_price": row.no_price,
                     "volume": row.volume,
-                    "spread": row.spread,
+                    "spread": spread,
+                    "platform": platform_label,
+                    "best_bid": row.best_bid,
+                    "best_ask": row.best_ask,
+                    "bid_size": row.bid_size,
+                    "ask_size": row.ask_size,
                     "timestamp": row.timestamp,
                 }
     return result
@@ -2029,6 +2847,7 @@ def _build_opportunity(
     into the tails (CCG-bughunt2 F-new-3). Entry-side callers keep the
     default; exit-side callers pass True.
     """
+    _clear_build_skip_reason()
     state = get_state()
 
     # --- Resolve market metadata ---
@@ -2057,10 +2876,12 @@ def _build_opportunity(
                     break
 
     if resolution_source is None:
+        _mark_build_skip("no_resolution_source")
         return None
 
     station = resolution_source.get("station")
     if station is None:
+        _mark_build_skip("no_station")
         return None
 
     # --- Extract market parameters from parsed data or defaults ---
@@ -2071,6 +2892,7 @@ def _build_opportunity(
         market_date = parsed.date  # "YYYY-MM-DD"
         bucket_low = parsed.threshold_low
         bucket_high = parsed.threshold_high
+        bucket_unit = getattr(parsed, "unit", "F")
         # BugFix C6: For bucket markets, keep midpoint as fallback threshold but
         # actual probability is calculated below using bucket_probability()
         if bucket_low is not None and bucket_high is not None and parsed.threshold is None:
@@ -2098,6 +2920,7 @@ def _build_opportunity(
         market_date = None
         bucket_low = None
         bucket_high = None
+        bucket_unit = "F"
         title_is_below = _title_is_one_sided_below(metadata.get("title") if metadata else None)
         # Try to parse Kalshi contract-level threshold from market_id
         parts = market_id.split("-")
@@ -2106,6 +2929,8 @@ def _build_opportunity(
             try:
                 if tail.startswith("T"):
                     threshold = float(tail[1:])
+                    if title_is_below:
+                        direction = "below"
                 elif tail.startswith("B"):
                     if title_is_below:
                         threshold = float(tail[1:])
@@ -2137,15 +2962,31 @@ def _build_opportunity(
                 except ValueError:
                     pass
 
+    bucket_model_low = bucket_low
+    bucket_model_high = bucket_high
+    bucket_low_int: int | None = None
+    bucket_high_int: int | None = None
+    is_narrow_bucket = False
+    if bucket_low is not None and bucket_high is not None:
+        bucket_model_low, bucket_model_high = _bucket_settlement_bounds(
+            platform, bucket_low, bucket_high, unit=bucket_unit,
+        )
+        bucket_low_int, bucket_high_int = _bucket_integer_bounds(bucket_low, bucket_high)
+        is_narrow_bucket = (bucket_high_int is not None and bucket_low_int is not None and (bucket_high_int - bucket_low_int + 1) <= 2)
+
     # --- Look up forecast for the specific market date ---
     forecast = _get_forecast_for_date(forecasts, station, market_date)
     if forecast is None:
         log.debug("_build_opportunity: no forecast for station %s date %s", station, market_date)
+        _mark_build_skip("no_forecast")
         return None
 
     yes_price = price_data.get("yes_price")
     if yes_price is None or yes_price <= 0.0 or yes_price >= 1.0:
+        _mark_build_skip("bad_price")
         return None
+
+    price_ts = price_data.get("timestamp")
 
     # FIX 3: Never trade contracts priced below $0.10 — below that we have no edge over market consensus
     # Applies symmetrically: skip YES under $0.10 AND NO under $0.10 (i.e. yes_price > $0.90)
@@ -2156,9 +2997,11 @@ def _build_opportunity(
     if not allow_extreme_price:
         if yes_price < 0.10:
             log.debug("_build_opportunity: %s skipped — yes_price=%.3f < $0.10 minimum", market_id, yes_price)
+            _mark_build_skip("entry_price_too_extreme")
             return None
         if yes_price > 0.90:
             log.debug("_build_opportunity: %s skipped — NO price=%.3f < $0.10 minimum", market_id, 1.0 - yes_price)
+            _mark_build_skip("entry_price_too_extreme")
             return None
 
     use_daily_min = market_type == "daily_low"
@@ -2175,6 +3018,7 @@ def _build_opportunity(
                 station,
                 market_date,
             )
+            _mark_build_skip("daily_low_missing_min_forecast")
             return None
     else:
         gfs_temp = forecast.get("temperature_forecast")
@@ -2182,6 +3026,31 @@ def _build_opportunity(
         hrrr_temp = forecast.get("hrrr_temp")
         nbm_temp = forecast.get("nbm_temp")
         ensemble_members = forecast.get("ensemble_members")
+
+    forecast_ts = _effective_forecast_timestamp(forecast, use_daily_min=use_daily_min)
+    if MODULES.get("temporal_guard", False) and not allow_extreme_price:
+        if not isinstance(forecast_ts, datetime) or not isinstance(price_ts, datetime):
+            log.info(
+                "_build_opportunity: %s skipped — missing causal timestamp(s) forecast_ts=%s price_ts=%s",
+                market_id,
+                forecast_ts,
+                price_ts,
+            )
+            _mark_build_skip("missing_causal_timestamp")
+            return None
+    if isinstance(forecast_ts, datetime) and isinstance(price_ts, datetime):
+        forecast_ts_utc = _as_utc_aware(forecast_ts)
+        price_ts_utc = _as_utc_aware(price_ts)
+        if forecast_ts_utc > price_ts_utc:
+            log.info(
+                "_build_opportunity: %s skipped — forecast_ts=%s newer than price_ts=%s "
+                "(waiting for post-forecast market price)",
+                market_id,
+                forecast_ts_utc.isoformat(),
+                price_ts_utc.isoformat(),
+            )
+            _mark_build_skip("forecast_newer_than_price")
+            return None
 
     # BugFix E3: Defensive °C→°F conversion for any temperature that looks like Celsius.
     # All three fetch endpoints now request fahrenheit, but old DB rows (pre-fix) may still
@@ -2217,6 +3086,7 @@ def _build_opportunity(
     if forecast_temp is None and ensemble_members:
         forecast_temp = sum(ensemble_members) / len(ensemble_members)
     if forecast_temp is None:
+        _mark_build_skip("missing_temperature_forecast")
         return None
 
     # Calculate lead time from market date
@@ -2236,6 +3106,7 @@ def _build_opportunity(
             # BugFix C5: Skip markets whose resolution date has passed
             if delta_hours <= 0:
                 log.debug("_build_opportunity: %s skipped — market date %s is in the past", market_id, market_date)
+                _mark_build_skip("expired_market_date")
                 return None
             lead_time_hours = delta_hours
             lead_time_days = max(0, int(delta_hours / 24.0))
@@ -2271,6 +3142,26 @@ def _build_opportunity(
             forecast_temp = _first_not_none(nbm_temp, hrrr_temp, gfs_temp, ecmwf_temp)
         except Exception as _bc_exc:
             log.debug("_build_opportunity: bias correction skipped for %s: %s", market_id, _bc_exc)
+
+    is_target_date_today_local = bool(market_date and market_date == station_local_today_str(station))
+    forecast_inside_bucket = False
+    forecast_near_bucket = False
+    if bucket_low_int is not None and bucket_high_int is not None:
+        bucket_forecast_sources = [
+            temp for temp in (forecast_temp, nbm_temp, hrrr_temp, gfs_temp, ecmwf_temp)
+            if temp is not None
+        ]
+        if ensemble_members:
+            bucket_forecast_sources.append(sum(ensemble_members) / len(ensemble_members))
+        forecast_inside_bucket = any(
+            _temp_inside_integer_bucket(temp, bucket_low_int, bucket_high_int)
+            for temp in bucket_forecast_sources
+        )
+        near_margin = 1.0 if is_target_date_today_local else 0.5
+        forecast_near_bucket = any(
+            _temp_near_integer_bucket(temp, bucket_low_int, bucket_high_int, near_margin)
+            for temp in bucket_forecast_sources
+        )
 
     # Enhancement 3: Check METAR override
     metar_override = state.conditions_tracker.metar_probability_override(
@@ -2315,6 +3206,7 @@ def _build_opportunity(
                 except Exception as _tg_exc:
                     log.warning("contradiction telegram alert failed: %s", _tg_exc)
                 if not allow_extreme_price:
+                    _mark_build_skip("metar_forecast_contradiction")
                     return None
                 log.warning(
                     "METAR-FORECAST CONTRADICTION %s: keeping exit-side opportunity "
@@ -2374,9 +3266,9 @@ def _build_opportunity(
                     )
                     bucket_rmse = _spread
             _raw_bucket_prob = bucket_probability(
-                forecast_temp, bucket_low, bucket_high, bucket_rmse, clamp=False,
+                forecast_temp, bucket_model_low, bucket_model_high, bucket_rmse, clamp=False,
             )
-            probability = bucket_probability(forecast_temp, bucket_low, bucket_high, bucket_rmse)
+            probability = bucket_probability(forecast_temp, bucket_model_low, bucket_model_high, bucket_rmse)
             model_used = "bucket_gaussian"
             log.debug(
                 "_build_opportunity: bucket market %s — P(%.0f<=T<=%.0f)=%.3f (raw=%.3f) σ=%.2f",
@@ -2387,9 +3279,9 @@ def _build_opportunity(
             # Without this, the bot computes bucket_probability from a stale forecast
             # mean that ignores the temperature already observed today, then enters
             # buy_no on buckets the temperature has already entered or passed.
-            # If observed daily_high already lies in [bucket_low, bucket_high], the
+            # If observed daily_high already lies in the settlement bucket, the
             # bucket is on track to resolve YES (unless temp climbs out). If it
-            # already exceeds bucket_high, the bucket will resolve NO.
+            # already exceeds the settlement high, the bucket will resolve NO.
             # tracker.date is UTC-stamped and disagrees with the station-local
             # market_date across the UTC-midnight window; gate on station-local
             # today instead so the override fires during evening UTC hours when
@@ -2408,14 +3300,14 @@ def _build_opportunity(
                     observed_low = _observed_temp_or_none(getattr(tracker, "daily_low_f", None))
                     if market_type == "daily_high" and observed_high is not None and observed_high > -900.0:
                         observed_value = observed_high
-                        invalidated = observed_value >= bucket_high
+                        invalidated = observed_value >= bucket_model_high
                     elif market_type == "daily_low" and observed_low is not None and observed_low < 900.0:
                         observed_value = observed_low
-                        invalidated = observed_value < bucket_low
+                        invalidated = observed_value < bucket_model_low
 
                     if observed_value is None:
                         pass
-                    elif bucket_low <= observed_value < bucket_high:
+                    elif bucket_model_low <= observed_value < bucket_model_high:
                         # CCG-bug-7: running max inside the bucket is NOT a
                         # YES signal — temp can still climb past bucket_high
                         # before close. Trade #28 lost $2.85 because this
@@ -2426,9 +3318,9 @@ def _build_opportunity(
                         if _hrs_to_close is not None and _hrs_to_close <= 2.0:
                             adjusted = max(probability, 0.85)
                             log.info(
-                                "BUCKET METAR override %s: observed %s %.1f in [%.0f,%.0f) "
+                                "BUCKET METAR override %s: observed %s %.1f in settlement [%.1f,%.1f) "
                                 "hrs_to_close=%.1f → prob %.2f→%.2f",
-                                market_id, market_type, observed_value, bucket_low, bucket_high,
+                                market_id, market_type, observed_value, bucket_model_low, bucket_model_high,
                                 _hrs_to_close, probability, adjusted,
                             )
                             probability = adjusted
@@ -2436,9 +3328,9 @@ def _build_opportunity(
                         else:
                             log.debug(
                                 "BUCKET METAR in-range (day open): %s %s=%.1f "
-                                "in [%.0f,%.0f) hrs_to_close=%s — NOT overriding "
+                                "in settlement [%.1f,%.1f) hrs_to_close=%s — NOT overriding "
                                 "(running max can still exit bucket)",
-                                market_id, market_type, observed_value, bucket_low, bucket_high,
+                                market_id, market_type, observed_value, bucket_model_low, bucket_model_high,
                                 f"{_hrs_to_close:.1f}" if _hrs_to_close is not None else "?",
                             )
                     elif invalidated:
@@ -2446,8 +3338,8 @@ def _build_opportunity(
                         # daily low can only stay/fall below a low bucket.
                         adjusted = min(probability, 0.05)
                         log.info(
-                            "BUCKET METAR override %s: observed %s %.1f outside [%.0f,%.0f) → prob %.2f→%.2f",
-                            market_id, market_type, observed_value, bucket_low, bucket_high, probability, adjusted,
+                            "BUCKET METAR override %s: observed %s %.1f outside settlement [%.1f,%.1f) → prob %.2f→%.2f",
+                            market_id, market_type, observed_value, bucket_model_low, bucket_model_high, probability, adjusted,
                         )
                         probability = adjusted
                         model_used = "metar_bucket_exceeded"
@@ -2456,6 +3348,7 @@ def _build_opportunity(
                         _bucket_metar_high = observed_value
         except Exception as exc:
             log.warning("_build_opportunity: bucket_probability failed for %s: %s", market_id, exc)
+            _mark_build_skip("bucket_probability_failed")
             return None
     else:
         # Enhancement 5: Use blended probability with HRRR weighting
@@ -2520,6 +3413,7 @@ def _build_opportunity(
                 )
             except Exception as exc2:
                 log.warning("_build_opportunity: probability calc failed for %s: %s", market_id, exc2)
+                _mark_build_skip("probability_calc_failed")
                 return None
 
     try:
@@ -2527,6 +3421,7 @@ def _build_opportunity(
         net_edge_no = calculate_net_edge(1.0 - probability, 1.0 - yes_price, platform)
     except Exception as exc:
         log.warning("_build_opportunity: edge calc failed for %s: %s", market_id, exc)
+        _mark_build_skip("edge_calc_failed")
         return None
 
     # CCG-bug-4 (audit-2): the previous P0-6 phantom-edge guard required
@@ -2547,6 +3442,7 @@ def _build_opportunity(
             "Unrealistic edge %.1f%% for %s: model=%.3f market=%.3f — likely model error. Skipping.",
             _gross_edge * 100, market_id, probability, yes_price,
         )
+        _mark_build_skip("gross_edge_cap")
         return None
 
     city = STATION_TO_CITY.get(station, station)
@@ -2567,17 +3463,17 @@ def _build_opportunity(
         # individual tails before subtracting destroys the bucket-band information
         # for forecasts far from the bucket.
         _p_above_low = gaussian_probability(
-            forecast_temp, bucket_low, rmse, "above", clamp=False,
+            forecast_temp, bucket_model_low, rmse, "above", clamp=False,
         )
         _p_above_high = gaussian_probability(
-            forecast_temp, bucket_high, rmse, "above", clamp=False,
+            forecast_temp, bucket_model_high, rmse, "above", clamp=False,
         )
         gaussian_prob = max(_p_above_low - _p_above_high, 0.0)
         if ensemble_members and len(ensemble_members) >= 20:
             # CCG-bug-8: settlement is upper-exclusive (`low <= actual < high`,
             # see _determine_market_outcome). Ensemble audit-prob must use the
             # same boundary — `t == bucket_high` is a NO outcome, not YES.
-            _in_bucket = sum(1 for t in ensemble_members if bucket_low <= t < bucket_high)
+            _in_bucket = sum(1 for t in ensemble_members if bucket_model_low <= t < bucket_model_high)
             ensemble_prob = _in_bucket / len(ensemble_members)
     else:
         gaussian_prob = gaussian_probability(forecast_temp, threshold, rmse, direction)
@@ -2619,6 +3515,7 @@ def _build_opportunity(
                 "Post-floor-escape edge %.1f%% for %s: model=%.3f market=%.3f — skipping.",
                 _gross_edge_post * 100, market_id, probability, yes_price,
             )
+            _mark_build_skip("gross_edge_cap")
             return None
 
     log.debug(
@@ -2659,6 +3556,7 @@ def _build_opportunity(
             "_build_opportunity: %s skipped — raw_prob=%.4f below floor %.2f (phantom NO guard)",
             market_id, raw_model_prob, _PROB_FLOOR,
         )
+        _mark_build_skip("raw_prob_below_floor")
         return None
 
     return MarketOpportunity(
@@ -2675,6 +3573,11 @@ def _build_opportunity(
         market_type=market_type,
         market_date=market_date or "",
         volume=price_data.get("volume"),
+        no_market_price=price_data.get("no_price"),
+        best_bid=price_data.get("best_bid"),
+        best_ask=price_data.get("best_ask"),
+        bid_size=price_data.get("bid_size"),
+        ask_size=price_data.get("ask_size"),
         ensemble_temps=ensemble_members,
         forecast_temp=forecast_temp,
         rmse=rmse,
@@ -2683,17 +3586,24 @@ def _build_opportunity(
         ensemble_prob=ensemble_prob,
         blended_prob=probability,
         raw_model_prob=raw_model_prob,
+        spread=price_data.get("spread"),
         timesfm_prob=_timesfm_prob,
         timesfm_error_adj=_timesfm_error_adj,
         bucket_low=bucket_low,
         bucket_high=bucket_high,
+        bucket_low_int=bucket_low_int,
+        bucket_high_int=bucket_high_int,
+        is_narrow_bucket=is_narrow_bucket,
+        is_target_date_today_local=is_target_date_today_local,
+        forecast_inside_bucket=forecast_inside_bucket,
+        forecast_near_bucket=forecast_near_bucket,
         bucket_invalidated_for_yes=_bucket_invalidated_for_yes,
         bucket_metar_high=_bucket_metar_high,
         metar_daily_high=_metar_daily_high,
         metar_daily_low=_metar_daily_low,
         metar_override=metar_override,
         market_price_timestamp=price_data.get("timestamp"),
-        forecast_timestamp=forecast.get("forecast_timestamp"),
+        forecast_timestamp=forecast_ts,
     )
 
 
@@ -2777,6 +3687,7 @@ def run_resolution_check() -> None:
 
         log.info("run_resolution_check: %d candidate market(s)", len(candidates))
         resolved_count = 0
+        shadow_resolved_count = 0
         calibration_count = 0
 
         for market_id in candidates:
@@ -2794,6 +3705,11 @@ def run_resolution_check() -> None:
                     # Resolve in-memory positions (updates bankroll).
                     if state.paper_trader is not None:
                         state.paper_trader.resolve_position(market_id, outcome)
+
+                shadow_resolved_count += resolve_shadow_trades_for_market(market_id, outcome)
+                shadow_resolved_count += resolve_shadow_baskets_for_market(market_id, outcome)
+                shadow_resolved_count += resolve_phase1_shadow_rejections_for_market(market_id, outcome)
+                shadow_resolved_count += resolve_paper_variant_trades_for_market(market_id, outcome)
             else:
                 log.debug(
                     "run_resolution_check: cannot determine market outcome for %s yet",
@@ -2806,8 +3722,9 @@ def run_resolution_check() -> None:
             calibration_count += _record_calibration_for_market(state, market_id, outcome)
 
         log.info(
-            "run_resolution_check: resolved=%d, calibration_records_added=%d",
+            "run_resolution_check: resolved=%d, shadow_resolved=%d, calibration_records_added=%d",
             resolved_count,
+            shadow_resolved_count,
             calibration_count,
         )
     except Exception as exc:
@@ -2817,7 +3734,13 @@ def run_resolution_check() -> None:
 def _get_resolution_candidate_markets() -> list[str]:
     """Return markets that may need resolution and/or calibration backfill."""
     from sqlalchemy import select
-    from weatheredge.db.models import Trade
+    from weatheredge.db.models import (
+        Phase1ShadowRejection,
+        ShadowBasketLeg,
+        ShadowPolicyTrade,
+        ShadowTwinTrade,
+        Trade,
+    )
 
     tracked_statuses = [
         "open",
@@ -2839,7 +3762,38 @@ def _get_resolution_candidate_markets() -> list[str]:
             ).distinct()
         ).scalars().all()
 
-    return sorted(str(m) for m in rows if m)
+        shadow_rows = session.execute(
+            select(ShadowTwinTrade.market_id).where(
+                ShadowTwinTrade.status == "open",
+            ).distinct()
+        ).scalars().all()
+        shadow_policy_rows = session.execute(
+            select(ShadowPolicyTrade.market_id).where(
+                ShadowPolicyTrade.status == "open",
+            ).distinct()
+        ).scalars().all()
+        shadow_basket_rows = session.execute(
+            select(ShadowBasketLeg.market_id).where(
+                ShadowBasketLeg.status == "open",
+            ).distinct()
+        ).scalars().all()
+        phase1_shadow_rows = session.execute(
+            select(Phase1ShadowRejection.market_id).where(
+                Phase1ShadowRejection.status == "open",
+            ).distinct()
+        ).scalars().all()
+
+    return sorted({
+        str(m)
+        for m in (
+            list(rows)
+            + list(shadow_rows)
+            + list(shadow_policy_rows)
+            + list(shadow_basket_rows)
+            + list(phase1_shadow_rows)
+        )
+        if m
+    })
 
 
 def _record_calibration_for_market(
@@ -3076,8 +4030,12 @@ def _determine_market_outcome(state: "AppState", market_id: str) -> str | None:
                     pass
 
             if threshold_low is not None and threshold_high is not None:
-                # Bucket market: yes if low <= actual < high
-                return "yes" if threshold_low <= actual_temp < threshold_high else "no"
+                # Bucket market: stored low/high are display bounds. Polymarket
+                # integer ranges settle on both displayed endpoint outcomes.
+                settlement_low, settlement_high = _bucket_settlement_bounds(
+                    market.platform, threshold_low, threshold_high,
+                )
+                return "yes" if settlement_low <= actual_temp < settlement_high else "no"
             elif threshold_high is not None:
                 if direction == "below":
                     # "below X" market stored in threshold_high: yes if actual < threshold
@@ -3204,13 +4162,7 @@ def _phase_activated_since_for_db() -> datetime | None:
     try:
         from weatheredge.phase_config import get_phase_activated_at
 
-        activated_at = get_phase_activated_at()
-        if not activated_at:
-            return None
-        parsed = datetime.fromisoformat(str(activated_at).replace("Z", "+00:00"))
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
+        return _parse_utc_naive_timestamp(get_phase_activated_at())
     except Exception as exc:
         log.warning("phase gate: could not parse activated_at: %s", exc)
         return None
@@ -3229,14 +4181,17 @@ def check_phase1_gate() -> bool:
             from weatheredge.learning.calibration import compute_reliability_data
 
             phase_since = _phase_activated_since_for_db()
+            decision_grade_since = _decision_grade_since_for_db()
+            gate_since = _max_timestamp_floor(phase_since, decision_grade_since)
             closed_stmt = select(Trade).where(
                 Trade.mode == "paper",
                 Trade.status.in_(closed_statuses),
+                Trade.order_type == "market",
             )
             leakage_stmt = select(func.count(LeakageViolation.id))
-            if phase_since is not None:
-                closed_stmt = closed_stmt.where(Trade.created_at >= phase_since)
-                leakage_stmt = leakage_stmt.where(LeakageViolation.violated_at >= phase_since)
+            if gate_since is not None:
+                closed_stmt = closed_stmt.where(Trade.created_at >= gate_since)
+                leakage_stmt = leakage_stmt.where(LeakageViolation.violated_at >= gate_since)
 
             closed_trades = session.execute(closed_stmt).scalars().all()
             leakage_count = int(session.execute(leakage_stmt).scalar_one())
@@ -3246,7 +4201,7 @@ def check_phase1_gate() -> bool:
                 return False
 
             if leakage_count > 0:
-                log.error("Phase 1 FAILED: temporal leakage violations=%d after phase activation", leakage_count)
+                log.error("Phase 1 FAILED: temporal leakage violations=%d after decision-grade cutoff", leakage_count)
                 return False
 
             records: list[dict[str, float | int]] = []
@@ -3333,9 +4288,13 @@ def run_rmse_recalculation() -> None:
     if state.rmse_updater is None:
         log.debug("run_rmse_recalculation: rmse_updater not initialised — skipping")
         return
-    log.info("run_rmse_recalculation: starting monthly RMSE recalculation")
+    stations = _tracked_station_codes(state.settings)
+    log.info(
+        "run_rmse_recalculation: starting monthly RMSE recalculation for %d tracked station(s)",
+        len(stations),
+    )
     try:
-        state.rmse_updater.update_all_rmse()
+        state.rmse_updater.update_all_rmse(stations=stations)
         log.info("run_rmse_recalculation: complete")
     except Exception as exc:
         log.error("run_rmse_recalculation failed: %s", exc, exc_info=True)
@@ -3362,6 +4321,7 @@ def run_bias_correction_refresh() -> None:
         from weatheredge.probability.bias_correction import BiasAnalyzer, BiasRecord
         from datetime import date as _date
 
+        tracked_stations = _tracked_station_codes(get_state().settings)
         with get_session() as session:
             rows = session.execute(
                 _sa_select(
@@ -3388,6 +4348,8 @@ def run_bias_correction_refresh() -> None:
 
         for station, model, target_date, temp_forecast, actual_temp in rows:
             station = _canonical_station_code(str(station))
+            if tracked_stations and station not in tracked_stations:
+                continue
             model_name = _canonical_model_name(model)
             if model_name is None:
                 continue
@@ -3752,6 +4714,7 @@ def main() -> None:
 
     state = init_app()
     settings = state.settings
+    _restore_open_meteo_cooldown(state)
 
     # Operational warning if the YES calibration guard-rail is disabled.
     # This guard is the circuit-breaker protecting against the April-2026
@@ -3826,11 +4789,15 @@ def main() -> None:
     except Exception as exc:
         log.warning("Phase 3 learning components init failed: %s", exc)
 
-    # Seed live calibration inputs (Forecast.actual_temp) at startup.
-    try:
-        run_actuals_backfill()
-    except Exception as exc:
-        log.warning("Startup actuals backfill failed: %s", exc)
+    # Actuals are calibration data, not an entry prerequisite. Keep them on the
+    # scheduler by default so restarts prioritize market scanning and decisions.
+    if getattr(settings, "run_actuals_backfill_on_startup", False):
+        try:
+            run_actuals_backfill()
+        except Exception as exc:
+            log.warning("Startup actuals backfill failed: %s", exc)
+    else:
+        log.info("Startup actuals backfill skipped; scheduled job remains active")
 
     # Phase 1: Bias correction — warm up tables from DB at startup
     if MODULES.get("bias_correction", False):
@@ -3935,6 +4902,8 @@ def main() -> None:
         "interval",
         minutes=settings.market_scan_interval_minutes,
         id="market_scan",
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         fetch_forecast_data,
@@ -3980,6 +4949,13 @@ def main() -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=120,
+        next_run_time=(
+            datetime.now(timezone.utc)
+            + timedelta(
+                minutes=settings.decision_loop_interval_minutes,
+                seconds=_DECISION_LOOP_MARKET_SCAN_LAG_SECONDS,
+            )
+        ),
     )
 
     # Phase 3: Self-learning jobs

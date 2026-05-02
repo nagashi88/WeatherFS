@@ -68,6 +68,7 @@ class TestFetchAllForecasts:
         from weatheredge.main import _fetch_all_forecasts, init_app
         state = init_app()
         state.settings.target_cities = "NYC"
+        state.settings.shadow_twin_enabled = False
 
         with patch("weatheredge.main.fetch_forecast", new_callable=AsyncMock, return_value={"hourly": {}}), \
              patch("weatheredge.main.fetch_ensemble", new_callable=AsyncMock, return_value={"hourly": {}}), \
@@ -81,10 +82,69 @@ class TestFetchAllForecasts:
             assert mock_store.call_count >= 2
 
     @pytest.mark.asyncio
+    async def test_broad_shadow_skips_ensemble_by_default(self):
+        from weatheredge.main import _fetch_all_forecasts, init_app
+        state = init_app()
+        state.settings.target_cities = "NYC"
+        state.settings.shadow_twin_enabled = True
+        state.settings.shadow_twin_extended_cities = ""
+        state.settings.shadow_twin_broad_enabled = True
+        state.settings.shadow_twin_broad_cities = "London"
+        state.settings.shadow_twin_broad_fetch_ensemble = False
+
+        with patch("weatheredge.main.fetch_forecast", new_callable=AsyncMock, return_value={"hourly": {}}), \
+             patch("weatheredge.main.fetch_ensemble", new_callable=AsyncMock, return_value={"hourly": {}}) as mock_ensemble, \
+             patch("weatheredge.main.fetch_nbm", new_callable=AsyncMock, return_value={"hourly": {}}), \
+             patch("weatheredge.data.noaa.fetch_noaa_forecast", new_callable=AsyncMock, return_value={"properties": {}}), \
+             patch("weatheredge.data.noaa.store_noaa_forecast"), \
+             patch("weatheredge.main.store_forecast"), \
+             patch("weatheredge.main.get_session") as mock_session:
+            mock_session.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_session.return_value.__exit__ = MagicMock(return_value=False)
+            await _fetch_all_forecasts(state)
+
+        # NYC still gets ensemble; broad-only London does not.
+        assert mock_ensemble.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_open_meteo_rate_limit_skips_shadow_forecast_calls(self):
+        from weatheredge.main import _fetch_all_forecasts, init_app
+
+        class RateLimitError(Exception):
+            status = 429
+
+        state = init_app()
+        state.settings.target_cities = "NYC"
+        state.settings.shadow_twin_enabled = True
+        state.settings.shadow_twin_extended_cities = "Austin"
+        state.settings.shadow_twin_broad_enabled = True
+        state.settings.shadow_twin_broad_cities = "London"
+        state.settings.shadow_twin_broad_fetch_ensemble = False
+
+        with patch("weatheredge.main.fetch_forecast", new_callable=AsyncMock, side_effect=RateLimitError("429 Too Many Requests")) as mock_forecast, \
+             patch("weatheredge.main.fetch_ensemble", new_callable=AsyncMock, return_value={"hourly": {}}) as mock_ensemble, \
+             patch("weatheredge.main.fetch_nbm", new_callable=AsyncMock, side_effect=RateLimitError("429 Too Many Requests")) as mock_nbm, \
+             patch("weatheredge.data.noaa.fetch_noaa_forecast", new_callable=AsyncMock, return_value={"properties": {}}) as mock_noaa, \
+             patch("weatheredge.data.noaa.store_noaa_forecast"), \
+             patch("weatheredge.main.store_forecast"), \
+             patch("weatheredge.main.get_session") as mock_session:
+            mock_session.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_session.return_value.__exit__ = MagicMock(return_value=False)
+            await _fetch_all_forecasts(state)
+
+        # The first 429 arms a global Open-Meteo cooldown. NOAA remains active,
+        # but forecast/ensemble/NBM stop for the rest of the cycle.
+        assert mock_forecast.call_count == 1
+        assert mock_nbm.call_count == 0
+        assert mock_ensemble.call_count == 0
+        assert mock_noaa.call_count == 2
+
+    @pytest.mark.asyncio
     async def test_unknown_city_skipped(self):
         from weatheredge.main import _fetch_all_forecasts, init_app
         state = init_app()
         state.settings.target_cities = "UnknownCity"
+        state.settings.shadow_twin_enabled = False
 
         with patch("weatheredge.main.fetch_forecast", new_callable=AsyncMock) as mock_fetch:
             await _fetch_all_forecasts(state)
@@ -95,6 +155,7 @@ class TestFetchAllForecasts:
         from weatheredge.main import _fetch_all_forecasts, init_app
         state = init_app()
         state.settings.target_cities = "NYC"
+        state.settings.shadow_twin_enabled = False
 
         with patch("weatheredge.main.fetch_forecast", new_callable=AsyncMock, side_effect=Exception("API down")), \
              patch("weatheredge.main.fetch_ensemble", new_callable=AsyncMock, side_effect=Exception("API down")), \
@@ -740,11 +801,17 @@ class TestDBHelpers:
         mock_row.no_price = 0.45
         mock_row.volume = 1000
         mock_row.spread = 0.02
+        mock_row.best_bid = 0.54
+        mock_row.best_ask = 0.56
+        mock_row.bid_size = 100
+        mock_row.ask_size = 100
         mock_row.timestamp = datetime.now(timezone.utc)
 
         with patch("weatheredge.main.get_session") as mock_session:
             mock_db = MagicMock()
-            mock_db.query.return_value.order_by.return_value.limit.return_value.all.return_value = [mock_row]
+            mock_db.query.return_value.outerjoin.return_value.order_by.return_value.limit.return_value.all.return_value = [
+                (mock_row, "kalshi"),
+            ]
             mock_session.return_value.__enter__ = MagicMock(return_value=mock_db)
             mock_session.return_value.__exit__ = MagicMock(return_value=False)
             result = _read_latest_market_prices()

@@ -30,6 +30,9 @@ TIME_FORCE_EXIT_HOURS: float = 1.0        # Exit 3: force-close inside 1h
 MARKET_AGAINST_BUY_NO_YES_PRICE: float = 0.95
 MARKET_AGAINST_BUY_YES_PRICE: float = 0.05
 BELOW_MARKET_INTRADAY_YES_PRICE: float = 0.80
+NARROW_BUCKET_BUY_NO_YES_STOP: float = 0.72
+NARROW_BUCKET_BUY_NO_STOP_MAX_LEAD_HOURS: float = 12.0
+NARROW_BUCKET_MAX_WIDTH: float = 2.0
 
 
 class ExitManager:
@@ -161,6 +164,30 @@ class ExitManager:
             )
             return "edge_stop"
 
+        bucket_low = self._float_or_none(getattr(opp, "bucket_low", None))
+        bucket_high = self._float_or_none(getattr(opp, "bucket_high", None))
+        if (
+            MODULES.get("exit_edge_flip", True)
+            and side == "buy_no"
+            and bucket_low is not None
+            and bucket_high is not None
+            and (bucket_high - bucket_low) <= NARROW_BUCKET_MAX_WIDTH
+            and current_price >= NARROW_BUCKET_BUY_NO_YES_STOP
+            and lead_time_hours is not None
+            and lead_time_hours <= NARROW_BUCKET_BUY_NO_STOP_MAX_LEAD_HOURS
+        ):
+            log.info(
+                "EXIT edge_stop: market=%s narrow-bucket buy_no adverse reprice "
+                "(YES=%.3f >= %.2f, bucket=[%.1f,%.1f], lead=%.1fh) → selling",
+                market_id,
+                current_price,
+                NARROW_BUCKET_BUY_NO_YES_STOP,
+                bucket_low,
+                bucket_high,
+                lead_time_hours,
+            )
+            return "edge_stop"
+
         # ================================================================
         # EXIT 1: EV-Based Exit (Phase 1 primary decision rule)
         # STEP 2: moved before edge_flip. With EV at check #1, closes that
@@ -271,6 +298,15 @@ class ExitManager:
                 return "time_decay"
 
         return None
+
+    @staticmethod
+    def _float_or_none(value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _evaluate_exit_ev(self, pos: dict, current_price: float, model_prob: float) -> bool:
         """Phase 1 EV-based exit: exit only if closing has higher EV than holding.

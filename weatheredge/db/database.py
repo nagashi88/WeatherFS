@@ -110,6 +110,10 @@ def init_db(engine: Engine | None = None) -> None:
     # Migrate forecasts: add daily max/min columns so daily-low markets can use
     # true daily minima without breaking legacy temperature_forecast readers.
     _migrate_forecast_columns(target)
+    # Migrate market price snapshots with optional order-book quote columns.
+    _migrate_market_price_columns(target)
+    # Migrate shadow ledgers with entry-time liquidity audit columns.
+    _migrate_shadow_trade_columns(target)
     # Backfill regime tag on trades that pre-date the live tagger. Idempotent
     # (only updates rows where regime IS NULL), so re-runs are no-ops.
     _backfill_trade_regimes(target)
@@ -290,6 +294,50 @@ def _migrate_forecast_columns(engine: Engine) -> None:
         if "ensemble_min_members" not in existing:
             conn.execute(text("ALTER TABLE forecasts ADD COLUMN ensemble_min_members TEXT"))
             log.info("Migrated forecasts table: added 'ensemble_min_members' column")
+
+
+def _migrate_market_price_columns(engine: Engine) -> None:
+    """Add order-book quote columns to existing market_prices tables."""
+    from sqlalchemy import inspect as sa_inspect
+
+    inspector = sa_inspect(engine)
+    if "market_prices" not in inspector.get_table_names():
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("market_prices")}
+    quote_columns = {
+        "best_bid": "FLOAT",
+        "best_ask": "FLOAT",
+        "bid_size": "FLOAT",
+        "ask_size": "FLOAT",
+    }
+    with engine.begin() as conn:
+        for column, column_type in quote_columns.items():
+            if column not in existing:
+                conn.execute(text(f"ALTER TABLE market_prices ADD COLUMN {column} {column_type}"))
+                log.info("Migrated market_prices table: added '%s' column", column)
+
+
+def _migrate_shadow_trade_columns(engine: Engine) -> None:
+    """Add entry-time liquidity audit columns to shadow ledgers."""
+    from sqlalchemy import inspect as sa_inspect
+
+    inspector = sa_inspect(engine)
+    table_names = set(inspector.get_table_names())
+    for table in ("shadow_twin_trades", "shadow_policy_trades"):
+        if table not in table_names:
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        with engine.begin() as conn:
+            if "entry_volume" not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN entry_volume FLOAT"))
+                log.info("Migrated %s table: added 'entry_volume' column", table)
+            if "entry_spread" not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN entry_spread FLOAT"))
+                log.info("Migrated %s table: added 'entry_spread' column", table)
+            if "liquidity_min_volume" not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN liquidity_min_volume FLOAT"))
+                log.info("Migrated %s table: added 'liquidity_min_volume' column", table)
 
 
 @contextmanager

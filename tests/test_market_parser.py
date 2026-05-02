@@ -104,6 +104,18 @@ def test_parse_kalshi_below_title_stays_one_sided():
     assert result.direction == "below"
 
 
+def test_parse_kalshi_leading_less_than_title_is_below():
+    result = parse_kalshi_temperature_title(
+        "Will the **high temp in Denver** be <56° on Apr 29, 2026?"
+    )
+
+    assert result is not None
+    assert result.station == "KDEN"
+    assert result.date == "2026-04-29"
+    assert result.threshold == 56.0
+    assert result.direction == "below"
+
+
 # ---------------------------------------------------------------------------
 # Above / higher
 # ---------------------------------------------------------------------------
@@ -253,16 +265,15 @@ def test_unknown_city_logs_warning(caplog):
 @pytest.mark.parametrize("city", [
     "Cape Town", "Lagos", "Helsinki", "Amsterdam", "Jeddah",
     "Karachi", "Jakarta", "Manila", "Kuala Lumpur", "Guangzhou",
-    "Busan", "Panama City",
+    "Busan", "Panama City", "Qingdao",
 ])
-def test_known_untradable_cities_log_debug_not_warning(caplog, city):
-    """Cities we know about but cannot trade (no RMSE/timezone/HRRR) should
-    NOT spam the WARNING channel — they're a known-skip, not a real alert."""
+def test_promoted_broad_cities_parse_without_warning(caplog, city):
+    """Promoted broad-shadow cities should parse and stay out of alert logs."""
     with caplog.at_level(logging.DEBUG, logger="weatheredge.data.market_parser"):
         result = parse_polymarket_title(
             f"Will the highest temperature in {city} be 50°F or above on April 4?"
         )
-    assert result is None
+    assert result is not None
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert not warnings, f"Expected no WARNING for {city}, got: {[r.message for r in warnings]}"
 
@@ -416,14 +427,21 @@ def test_parse_negative_celsius_bucket():
     result = parse_polymarket_title(
         "Will the highest temperature in Helsinki be between -10--5°C on January 15?"
     )
-    # Helsinki is in KNOWN_UNTRADABLE_CITIES so this won't parse to a city,
-    # but Amsterdam is also untradable. Use a tradable city instead:
-    result = parse_polymarket_title(
-        "Will the highest temperature in NYC be between -10--5°C on January 15?"
-    )
     assert result is not None
     assert result.threshold_low == -10.0
     assert result.threshold_high == -5.0
+    assert result.unit == "C"
+
+
+def test_parse_rome_celsius_market():
+    result = parse_polymarket_title(
+        "Highest temperature in Rome on April 29? - Will the highest temperature in Rome be 25°C or higher on April 29?"
+    )
+    assert result is not None
+    assert result.city == "rome"
+    assert result.station == "LIRF"
+    assert result.threshold == 25.0
+    assert result.direction == "above"
     assert result.unit == "C"
 
 

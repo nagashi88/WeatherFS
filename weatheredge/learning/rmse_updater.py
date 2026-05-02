@@ -135,9 +135,11 @@ class RMSEUpdater:
         log.info("RMSE %s/%s: %.3f (from %d samples)", station, model, rmse, len(rows))
         return rmse
 
-    def update_all_rmse(self, days: int = 30):
+    def update_all_rmse(self, days: int = 30, stations: set[str] | None = None):
         """Recalculate RMSE for all station/model combos and update bias_correction.STATION_RMSE."""
         for station, models in bias_correction.STATION_RMSE.items():
+            if stations is not None and station not in stations:
+                continue
             for model_name in models:
                 rows = self._load_pairs(station, model_name, days)
                 if not rows:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -363,6 +364,10 @@ def _make_mock_market(market_id, title, yes_price=0.5):
     m.title = title
     m.yes = MagicMock()
     m.yes.price = yes_price
+    m.yes.outcome_id = None
+    m.no = MagicMock()
+    m.no.price = 1.0 - yes_price
+    m.no.outcome_id = None
     m.volume_24h = 100.0
     m.liquidity = 500.0
     m.resolution_date = None
@@ -412,12 +417,155 @@ async def test_scan_polymarket_matches_target_city_from_market_title_alias(scann
 
     assert len(results) == 1
     assert results[0]["resolution_source"]["station"] == "KNYC"
+    assert results[0]["yes_price"] == pytest.approx(0.5)
+    assert results[0]["no_price"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_scan_polymarket_attaches_real_orderbook_spread(scanner):
+    """Polymarket spread should come from the CLOB order book, not YES+NO prices."""
+    scanner.settings.target_cities = "NYC"
+    scanner.settings.polymarket_orderbook_min_volume = 2000.0
+    scanner.settings.polymarket_orderbook_max_markets_per_scan = 10
+
+    mock_market = _make_mock_market(
+        "0xnyc_orderbook_market",
+        "Will the temperature in New York on April 3 be 70F or above?",
+        yes_price=0.41,
+    )
+    mock_market.yes.outcome_id = "yes-token-1"
+    mock_market.volume_24h = 5000.0
+    mock_event = _make_mock_event("evt-nyc", "Daily weather contracts", [mock_market])
+    order_book = SimpleNamespace(
+        bids=[SimpleNamespace(price=0.38, size=200.0), SimpleNamespace(price=0.40, size=120.0)],
+        asks=[SimpleNamespace(price=0.45, size=500.0), SimpleNamespace(price=0.42, size=80.0)],
+    )
+
+    with patch("weatheredge.data.market.pmxt.Polymarket") as MockPoly:
+        instance = MockPoly.return_value
+        instance.fetch_events.return_value = [mock_event]
+        instance.fetch_order_book.return_value = order_book
+        results = await scanner.scan_polymarket()
+
+    assert len(results) == 1
+    assert results[0]["best_bid"] == pytest.approx(0.40)
+    assert results[0]["best_ask"] == pytest.approx(0.42)
+    assert results[0]["bid_size"] == pytest.approx(120.0)
+    assert results[0]["ask_size"] == pytest.approx(80.0)
+    assert results[0]["spread"] == pytest.approx(0.02)
+    instance.fetch_order_book.assert_called_once_with("yes-token-1")
+
+
+@pytest.mark.asyncio
+async def test_scan_polymarket_leaves_spread_missing_without_two_sided_book(scanner):
+    """One-sided books can be logged, but they are not liquid entry candidates."""
+    scanner.settings.target_cities = "NYC"
+
+    mock_market = _make_mock_market(
+        "0xnyc_one_sided_market",
+        "Will the temperature in New York on April 3 be 70F or above?",
+        yes_price=0.01,
+    )
+    mock_market.yes.outcome_id = "yes-token-2"
+    mock_market.volume_24h = 5000.0
+    mock_event = _make_mock_event("evt-nyc", "Daily weather contracts", [mock_market])
+    order_book = SimpleNamespace(
+        bids=[],
+        asks=[SimpleNamespace(price=0.02, size=100.0)],
+    )
+
+    with patch("weatheredge.data.market.pmxt.Polymarket") as MockPoly:
+        instance = MockPoly.return_value
+        instance.fetch_events.return_value = [mock_event]
+        instance.fetch_order_book.return_value = order_book
+        results = await scanner.scan_polymarket()
+
+    assert len(results) == 1
+    assert results[0]["best_ask"] == pytest.approx(0.02)
+    assert results[0].get("best_bid") is None
+    assert results[0].get("spread") is None
+
+
+@pytest.mark.asyncio
+async def test_scan_polymarket_fetches_adaptive_volume_orderbook_for_shadow(scanner):
+    """Shadow-only adaptive liquidity needs real spreads below the main volume floor."""
+    scanner.settings.target_cities = "NYC"
+    scanner.settings.polymarket_orderbook_min_volume = 2000.0
+    scanner.settings.shadow_twin_enabled = True
+    scanner.settings.shadow_twin_adaptive_liquidity_enabled = True
+    scanner.settings.shadow_twin_adaptive_liquidity_min_volume = 250.0
+
+    mock_market = _make_mock_market(
+        "0xnyc_adaptive_market",
+        "Will the temperature in New York on April 3 be 70F or above?",
+        yes_price=0.41,
+    )
+    mock_market.yes.outcome_id = "adaptive-token"
+    mock_market.volume_24h = 300.0
+    mock_event = _make_mock_event("evt-nyc", "Daily weather contracts", [mock_market])
+    order_book = SimpleNamespace(
+        bids=[SimpleNamespace(price=0.40, size=120.0)],
+        asks=[SimpleNamespace(price=0.42, size=80.0)],
+    )
+
+    with patch("weatheredge.data.market.pmxt.Polymarket") as MockPoly:
+        instance = MockPoly.return_value
+        instance.fetch_events.return_value = [mock_event]
+        instance.fetch_order_book.return_value = order_book
+        results = await scanner.scan_polymarket()
+
+    assert len(results) == 1
+    assert results[0]["spread"] == pytest.approx(0.02)
+    instance.fetch_order_book.assert_called_once_with("adaptive-token")
+
+
+@pytest.mark.asyncio
+async def test_scan_polymarket_prioritizes_main_volume_orderbooks(scanner):
+    """Limited orderbook budget should cover main-liquidity candidates first."""
+    scanner.settings.target_cities = "NYC"
+    scanner.settings.polymarket_orderbook_min_volume = 2000.0
+    scanner.settings.polymarket_orderbook_max_markets_per_scan = 1
+    scanner.settings.shadow_twin_enabled = True
+    scanner.settings.shadow_twin_adaptive_liquidity_enabled = True
+    scanner.settings.shadow_twin_adaptive_liquidity_min_volume = 250.0
+
+    low_volume = _make_mock_market(
+        "0xnyc_low_volume_market",
+        "Will the temperature in New York on April 3 be 69F or above?",
+        yes_price=0.41,
+    )
+    low_volume.yes.outcome_id = "low-token"
+    low_volume.volume_24h = 300.0
+    main_volume = _make_mock_market(
+        "0xnyc_main_volume_market",
+        "Will the temperature in New York on April 3 be 70F or above?",
+        yes_price=0.41,
+    )
+    main_volume.yes.outcome_id = "main-token"
+    main_volume.volume_24h = 5000.0
+    mock_event = _make_mock_event("evt-nyc", "Daily weather contracts", [low_volume, main_volume])
+    order_book = SimpleNamespace(
+        bids=[SimpleNamespace(price=0.40, size=120.0)],
+        asks=[SimpleNamespace(price=0.42, size=80.0)],
+    )
+
+    with patch("weatheredge.data.market.pmxt.Polymarket") as MockPoly:
+        instance = MockPoly.return_value
+        instance.fetch_events.return_value = [mock_event]
+        instance.fetch_order_book.return_value = order_book
+        results = await scanner.scan_polymarket()
+
+    by_id = {row["ticker"]: row for row in results}
+    assert by_id["0xnyc_main_volume_market"]["spread"] == pytest.approx(0.02)
+    assert by_id["0xnyc_low_volume_market"].get("spread") is None
+    instance.fetch_order_book.assert_called_once_with("main-token")
 
 
 @pytest.mark.asyncio
 async def test_scan_polymarket_skips_markets_outside_target_stations(scanner):
     """Known markets outside configured target stations should be skipped."""
     scanner.settings.target_cities = "NYC"
+    scanner.settings.shadow_twin_enabled = False
 
     mock_market = _make_mock_market("london_temp", "London daily high temperature")
     mock_event = _make_mock_event("evt-london", "NYC weather", [mock_market])
@@ -485,6 +633,8 @@ async def test_scan_kalshi_returns_known_markets(scanner):
     assert results[0]["ticker"] == "KXHIGHNY"
     assert results[0]["platform"] == "kalshi"
     assert results[0]["resolution_source"]["station"] == "KNYC"
+    assert results[0]["yes_price"] == pytest.approx(0.40)
+    assert results[0]["no_price"] == pytest.approx(0.60)
 
 
 @pytest.mark.asyncio

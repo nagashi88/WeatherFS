@@ -20,6 +20,11 @@ EXPECTED_TABLES = {
     "forecasts",
     "signals",
     "trades",
+    "shadow_twin_trades",
+    "shadow_policy_trades",
+    "shadow_basket_trades",
+    "shadow_basket_legs",
+    "phase1_shadow_rejections",
     "daily_performance",
     "calibration",
     "calibration_records",
@@ -79,6 +84,33 @@ def test_all_tables_created(engine):
         f"Missing tables: {EXPECTED_TABLES - actual_tables}; "
         f"Extra tables: {actual_tables - EXPECTED_TABLES}"
     )
+
+
+def test_init_db_migrates_legacy_market_prices_orderbook_columns():
+    """Existing DBs need orderbook columns before the next price insert."""
+    eng = make_engine("sqlite:///:memory:")
+    try:
+        with eng.begin() as conn:
+            conn.execute(text(
+                """
+                CREATE TABLE market_prices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market_id TEXT,
+                    timestamp DATETIME NOT NULL,
+                    yes_price FLOAT,
+                    no_price FLOAT,
+                    volume FLOAT,
+                    spread FLOAT
+                )
+                """
+            ))
+
+        init_db(engine=eng)
+
+        columns = {col["name"] for col in inspect(eng).get_columns("market_prices")}
+        assert {"best_bid", "best_ask", "bid_size", "ask_size"} <= columns
+    finally:
+        eng.dispose()
 
 
 # ---------------------------------------------------------------------------

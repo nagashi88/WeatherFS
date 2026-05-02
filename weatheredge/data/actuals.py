@@ -20,6 +20,15 @@ log = logging.getLogger(__name__)
 
 _ARCHIVE_BASE_URL = "https://archive-api.open-meteo.com/v1/archive"
 _RETRY_DELAYS = (1, 4, 16)
+_REQUEST_TIMEOUT_SECONDS = 12
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    if status == 429:
+        return True
+    message = str(exc).lower()
+    return "429" in message or "too many requests" in message
 
 
 async def _get_with_retry(
@@ -32,12 +41,16 @@ async def _get_with_retry(
 
     for attempt in range(len(_RETRY_DELAYS)):
         try:
-            async with session.get(url, params=params) as resp:
+            timeout = aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT_SECONDS)
+            async with session.get(url, params=params, timeout=timeout) as resp:
                 resp.raise_for_status()
                 payload: dict[str, Any] = await resp.json()
                 return payload
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+            if _is_rate_limit_error(exc):
+                log.warning("Actuals request to %s hit rate limit: %s — not retrying", url, exc)
+                raise
             if attempt < len(_RETRY_DELAYS) - 1:
                 await asyncio.sleep(_RETRY_DELAYS[attempt + 1])
 

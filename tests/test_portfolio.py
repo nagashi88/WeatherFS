@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1169,8 +1169,9 @@ def test_qualitative_caution_haircut_reduces_fragile_entry_size():
     ]
     opp = make_opportunity("MKT-FRAGILE")
     opp.net_edge_no = 0.25
-    opp.bucket_low = 66.0
-    opp.bucket_high = 67.0
+    opp.market_type = "daily_low"
+    opp.bucket_low = None
+    opp.bucket_high = None
 
     orders = pm.aggregate_signals(
         signals_by_market={"MKT-FRAGILE": signals},
@@ -1184,6 +1185,236 @@ def test_qualitative_caution_haircut_reduces_fragile_entry_size():
     assert len(orders) == 1
     assert orders[0].side == "buy_no"
     assert orders[0].amount == pytest.approx(50.0)
+
+
+def test_single_agent_narrow_bucket_buy_no_is_blocked_before_risk():
+    """Baseline alone must not execute fragile narrow-bucket NO entries."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    opp = make_opportunity("MKT-BASELINE-BUCKET-NO")
+    opp.market_price = 0.40
+    opp.model_probability = 0.12
+    opp.net_edge_no = 0.20
+    opp.bucket_low = 60.0
+    opp.bucket_high = 61.0
+    signals = [
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Baseline"),
+    ]
+
+    orders = pm.aggregate_signals(
+        signals_by_market={opp.market_id: signals},
+        opportunities={opp.market_id: opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+
+
+def test_phase1_same_day_narrow_bucket_buy_no_is_shadow_only():
+    """Even two aligned agents should not execute Phase-1 same-day narrow bucket NO."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    recorder = MagicMock(return_value=True)
+    pm = PortfolioManager(make_settings(), rm, phase1_shadow_recorder=recorder)
+
+    opp = make_opportunity("MKT-SAME-DAY-BUCKET-NO")
+    opp.market_price = 0.40
+    opp.model_probability = 0.12
+    opp.net_edge_no = 0.20
+    opp.bucket_low = 60.0
+    opp.bucket_high = 61.0
+    opp.is_target_date_today_local = True
+    signals = [
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Baseline"),
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Conservative"),
+    ]
+
+    with patch("weatheredge.agents.portfolio_manager._is_phase1_active", return_value=True):
+        orders = pm.aggregate_signals(
+            signals_by_market={opp.market_id: signals},
+            opportunities={opp.market_id: opp},
+            bankroll=1000.0,
+            open_positions=[],
+            daily_pnl=0.0,
+            total_pnl=0.0,
+        )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+    recorder.assert_called_once()
+    _, kwargs = recorder.call_args
+    assert kwargs["reason"] == "phase1_same_day_narrow_bucket_buy_no"
+    assert kwargs["majority_side"] == "buy_no"
+
+
+def test_guard_opposition_blocks_narrow_bucket_buy_no():
+    """Do not let bucket NO execute when a guard explicitly votes YES."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    opp = make_opportunity("MKT-GUARD-OPPOSES")
+    opp.market_price = 0.44
+    opp.model_probability = 0.11
+    opp.net_edge_no = 0.30
+    opp.bucket_low = 60.0
+    opp.bucket_high = 61.0
+    signals = [
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Baseline"),
+        Signal(market_id=opp.market_id, side="buy_no", confidence=0.8, agent_name="Conservative"),
+        Signal(market_id=opp.market_id, side="buy_yes", confidence=0.5, agent_name="Qualitative"),
+    ]
+
+    orders = pm.aggregate_signals(
+        signals_by_market={opp.market_id: signals},
+        opportunities={opp.market_id: opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+
+
+def test_forecast_inside_bucket_blocks_buy_no_before_risk():
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    opp = make_opportunity("MKT-FORECAST-INSIDE")
+    opp.market_price = 0.40
+    opp.model_probability = 0.12
+    opp.net_edge_no = 0.20
+    opp.bucket_low = 84.0
+    opp.bucket_high = 85.0
+    opp.forecast_temp = 84.1
+    opp.forecast_inside_bucket = True
+    signals = [
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Baseline"),
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Conservative"),
+    ]
+
+    with patch("weatheredge.agents.portfolio_manager._is_phase1_active", return_value=False):
+        orders = pm.aggregate_signals(
+            signals_by_market={opp.market_id: signals},
+            opportunities={opp.market_id: opp},
+            bankroll=1000.0,
+            open_positions=[],
+            daily_pnl=0.0,
+            total_pnl=0.0,
+        )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+
+
+def test_forecast_near_bucket_blocks_buy_no_before_risk():
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    opp = make_opportunity("MKT-FORECAST-NEAR")
+    opp.market_price = 0.44
+    opp.model_probability = 0.11
+    opp.net_edge_no = 0.30
+    opp.bucket_low = 60.0
+    opp.bucket_high = 61.0
+    opp.forecast_temp = 59.74
+    opp.forecast_near_bucket = True
+    signals = [
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Baseline"),
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Conservative"),
+    ]
+
+    with patch("weatheredge.agents.portfolio_manager._is_phase1_active", return_value=False):
+        orders = pm.aggregate_signals(
+            signals_by_market={opp.market_id: signals},
+            opportunities={opp.market_id: opp},
+            bankroll=1000.0,
+            open_positions=[],
+            daily_pnl=0.0,
+            total_pnl=0.0,
+        )
+
+    assert orders == []
+    rm.pre_trade_check.assert_not_called()
+
+
+def test_qualitative_no_trade_haircuts_fragile_bucket_buy_no():
+    """Qualitative abstention is non-confirmation, not neutral, on fragile buckets."""
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    opp = make_opportunity("MKT-QUAL-NOT-CONFIRMING")
+    opp.market_price = 0.40
+    opp.model_probability = 0.12
+    opp.net_edge_no = 0.20
+    opp.bucket_low = 60.0
+    opp.bucket_high = 61.0
+    signals = [
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Baseline"),
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="SellNO"),
+        Signal(market_id=opp.market_id, side="no_trade", confidence=0.0, agent_name="Conservative"),
+        Signal(market_id=opp.market_id, side="no_trade", confidence=0.0, agent_name="Qualitative"),
+    ]
+
+    orders = pm.aggregate_signals(
+        signals_by_market={opp.market_id: signals},
+        opportunities={opp.market_id: opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].amount == pytest.approx(50.0)
+
+
+def test_qualitative_agreement_does_not_haircut_fragile_bucket_buy_no():
+    rm = MagicMock()
+    rm.pre_trade_check.return_value = {"blocked": False}
+    rm.calculate_position_size.return_value = 100.0
+    pm = make_pm(rm)
+
+    opp = make_opportunity("MKT-QUAL-CONFIRMS")
+    opp.market_price = 0.40
+    opp.model_probability = 0.12
+    opp.net_edge_no = 0.20
+    opp.bucket_low = 60.0
+    opp.bucket_high = 61.0
+    signals = [
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Baseline"),
+        Signal(market_id=opp.market_id, side="no_trade", confidence=0.0, agent_name="Conservative"),
+        Signal(market_id=opp.market_id, side="buy_no", confidence=1.0, agent_name="Qualitative"),
+    ]
+
+    orders = pm.aggregate_signals(
+        signals_by_market={opp.market_id: signals},
+        opportunities={opp.market_id: opp},
+        bankroll=1000.0,
+        open_positions=[],
+        daily_pnl=0.0,
+        total_pnl=0.0,
+    )
+
+    assert len(orders) == 1
+    assert orders[0].amount == pytest.approx(100.0)
 
 
 def test_qualitative_caution_does_not_haircut_non_fragile_buy_no():

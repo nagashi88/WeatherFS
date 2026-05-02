@@ -38,6 +38,7 @@ def make_opp(
     market_price: float = 0.60,
     bucket_invalidated_for_yes: bool = False,
     bucket_metar_high: float | None = None,
+    bucket_low: float | None = None,
     bucket_high: float | None = None,
     direction: str = "above",
     market_type: str = "daily_high",
@@ -50,6 +51,7 @@ def make_opp(
     opp.market_price = market_price
     opp.bucket_invalidated_for_yes = bucket_invalidated_for_yes
     opp.bucket_metar_high = bucket_metar_high
+    opp.bucket_low = bucket_low
     opp.bucket_high = bucket_high
     opp.direction = direction
     opp.market_type = market_type
@@ -178,6 +180,105 @@ def test_below_market_intraday_stop_waits_when_observed_high_breached_threshold(
             reason = mgr._check_position(pos, {"BELOW-MKT": opp}, {})
     finally:
         cfg.MODULES["exit_pnl_stoploss"] = original
+
+    assert reason is None
+
+
+def test_narrow_bucket_buy_no_exits_early_on_adverse_yes_reprice(mgr):
+    import weatheredge.config as cfg
+
+    pos = make_pos(
+        market_id="BUCKET-NO",
+        side="buy_no",
+        price=0.40,
+        amount=10.0,
+        cost=6.0,
+        edge_at_entry=0.20,
+    )
+    pos["station"] = "KNYC"
+    pos["market_date"] = "2099-01-01"
+    opp = make_opp(
+        model_probability=0.30,
+        market_price=0.73,
+        bucket_low=60.0,
+        bucket_high=61.0,
+    )
+
+    original_ev = cfg.MODULES.get("exit_ev_based", False)
+    cfg.MODULES["exit_ev_based"] = False
+    try:
+        with patch("weatheredge.execution.exit_manager.hours_until_market_close", return_value=8.0):
+            reason = mgr._check_position(pos, {"BUCKET-NO": opp}, {})
+    finally:
+        cfg.MODULES["exit_ev_based"] = original_ev
+
+    assert reason == "edge_stop"
+
+
+def test_narrow_bucket_buy_no_early_exit_ignores_wide_bucket(mgr):
+    import weatheredge.config as cfg
+
+    pos = make_pos(
+        market_id="WIDE-BUCKET-NO",
+        side="buy_no",
+        price=0.40,
+        amount=10.0,
+        cost=6.0,
+        edge_at_entry=0.20,
+    )
+    pos["station"] = "KNYC"
+    pos["market_date"] = "2099-01-01"
+    opp = make_opp(
+        model_probability=0.30,
+        market_price=0.73,
+        bucket_low=60.0,
+        bucket_high=66.0,
+    )
+
+    original_ev = cfg.MODULES.get("exit_ev_based", False)
+    original_pnl = cfg.MODULES.get("exit_pnl_stoploss", False)
+    cfg.MODULES["exit_ev_based"] = False
+    cfg.MODULES["exit_pnl_stoploss"] = False
+    try:
+        with patch("weatheredge.execution.exit_manager.hours_until_market_close", return_value=8.0):
+            reason = mgr._check_position(pos, {"WIDE-BUCKET-NO": opp}, {})
+    finally:
+        cfg.MODULES["exit_ev_based"] = original_ev
+        cfg.MODULES["exit_pnl_stoploss"] = original_pnl
+
+    assert reason is None
+
+
+def test_narrow_bucket_buy_no_early_exit_ignores_long_lead(mgr):
+    import weatheredge.config as cfg
+
+    pos = make_pos(
+        market_id="LONG-LEAD-BUCKET-NO",
+        side="buy_no",
+        price=0.40,
+        amount=10.0,
+        cost=6.0,
+        edge_at_entry=0.20,
+    )
+    pos["station"] = "KNYC"
+    pos["market_date"] = "2099-01-01"
+    opp = make_opp(
+        model_probability=0.30,
+        market_price=0.73,
+        bucket_low=60.0,
+        bucket_high=61.0,
+    )
+
+    original_ev = cfg.MODULES.get("exit_ev_based", False)
+    original_pnl = cfg.MODULES.get("exit_pnl_stoploss", False)
+    cfg.MODULES["exit_ev_based"] = False
+    cfg.MODULES["exit_pnl_stoploss"] = False
+    try:
+        with patch("weatheredge.execution.exit_manager.hours_until_market_close", return_value=18.0):
+            reason = mgr._check_position(pos, {"LONG-LEAD-BUCKET-NO": opp}, {})
+    finally:
+        cfg.MODULES["exit_ev_based"] = original_ev
+        cfg.MODULES["exit_pnl_stoploss"] = original_pnl
 
     assert reason is None
 

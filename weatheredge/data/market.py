@@ -49,7 +49,7 @@ def _kalshi_bucket_bounds_from_ticker(market_id: str) -> tuple[float, float] | N
 
 def _title_is_one_sided_below(title: object) -> bool:
     raw = str(title or "").lower()
-    return bool(re.search(r'\bor\s+(?:below|lower)\b|\bbelow\b|\blower\b', raw))
+    return bool(re.search(r'<\s*-?\d|\bor\s+(?:below|lower)\b|\bbelow\b|\blower\b|\bless\s+than\b|\bunder\b', raw))
 
 # ---------------------------------------------------------------------------
 # Resolution source mapping — PRD Section 3.2.2
@@ -124,7 +124,70 @@ _STATION_TO_CITY: dict[str, str] = {
     "EGLC": "london",
     "KAUS": "austin",
     "KSEA": "seattle",
+    "KATL": "atlanta",
+    "KDFW": "dallas",
+    "KPHX": "phoenix",
+    "KIAH": "houston",
+    "KSFO": "san francisco",
+    "KBOS": "boston",
+    "RJTT": "tokyo",
+    "UUEE": "moscow",
+    "LIML": "milan",
+    "LIRF": "rome",
+    "LEMD": "madrid",
+    "LTFM": "istanbul",
+    "WSSS": "singapore",
+    "EDDM": "munich",
+    "RCTP": "taipei",
+    "LFPG": "paris",
+    "CYYZ": "toronto",
+    "ZSPD": "shanghai",
+    "ZBAA": "beijing",
+    "NZWN": "wellington",
+    "EPWA": "warsaw",
+    "LLBG": "tel aviv",
+    "ZUUU": "chengdu",
+    "ZUCK": "chongqing",
+    "ZHHH": "wuhan",
+    "ZGSZ": "shenzhen",
+    "VILK": "lucknow",
+    "SBGR": "sao paulo",
+    "VHHH": "hong kong",
+    "MMMX": "mexico city",
+    "FACT": "cape town",
+    "DNMM": "lagos",
+    "EFHK": "helsinki",
+    "EHAM": "amsterdam",
+    "OEJN": "jeddah",
+    "OPKC": "karachi",
+    "WIII": "jakarta",
+    "RPLL": "manila",
+    "WMKK": "kuala lumpur",
+    "ZGGG": "guangzhou",
+    "RKPK": "busan",
+    "MPTO": "panama city",
+    "ZSQD": "qingdao",
 }
+
+
+def _outcome_price(market: object, side: str) -> object | None:
+    outcome = getattr(market, side, None)
+    return getattr(outcome, "price", None) if outcome is not None else None
+
+
+def _outcome_id(market: object, side: str) -> str | None:
+    outcome = getattr(market, side, None)
+    value = getattr(outcome, "outcome_id", None) if outcome is not None else None
+    return str(value) if value else None
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class MarketScanner:
@@ -146,13 +209,13 @@ class MarketScanner:
             if not raw:
                 continue
             upper = raw.upper()
-            # Allow direct station-code configuration.
-            if len(upper) == 4 and upper[0].isalpha():
-                stations.add(upper)
-                continue
             station = CITY_TO_STATION.get(raw.lower())
             if station:
                 stations.add(station)
+                continue
+            # Allow direct station-code configuration.
+            if len(upper) == 4 and upper[0].isalpha():
+                stations.add(upper)
         return stations
 
     # -----------------------------------------------------------------------
@@ -293,8 +356,21 @@ class MarketScanner:
             return []
 
         results: list[dict] = []
-        configured_cities = [c.strip() for c in self.settings.cities_list if c.strip()]
+        orderbook_candidates: list[tuple[dict, object, float]] = []
+        configured_cities = [c.strip() for c in self.settings.tracked_cities_list if c.strip()]
         target_stations = self._target_stations(configured_cities)
+        orderbook_budget = int(getattr(self.settings, "polymarket_orderbook_max_markets_per_scan", 120))
+        orderbook_min_volume = float(getattr(self.settings, "polymarket_orderbook_min_volume", 2000.0))
+        adaptive_orderbook_min_volume = orderbook_min_volume
+        if (
+            bool(getattr(self.settings, "shadow_twin_enabled", False))
+            and bool(getattr(self.settings, "shadow_twin_adaptive_liquidity_enabled", False))
+        ):
+            adaptive_orderbook_min_volume = min(
+                orderbook_min_volume,
+                float(getattr(self.settings, "shadow_twin_adaptive_liquidity_min_volume", orderbook_min_volume)),
+            )
+        orderbook_enabled = bool(getattr(self.settings, "polymarket_orderbook_quotes_enabled", True))
         if configured_cities and not target_stations:
             log.warning(
                 "No target stations resolved from target_cities=%s — skipping Polymarket scan",
@@ -309,7 +385,8 @@ class MarketScanner:
                     "title": market.title,
                     "event_id": event.id,
                     "event_title": event.title,
-                    "yes_price": market.yes.price if market.yes else None,
+                    "yes_price": _outcome_price(market, "yes"),
+                    "no_price": _outcome_price(market, "no"),
                     "volume_24h": market.volume_24h,
                     "liquidity": market.liquidity,
                     "resolution_date": market.resolution_date,
@@ -320,9 +397,70 @@ class MarketScanner:
                     station = resolution_source.get("station") if isinstance(resolution_source, dict) else None
                     if target_stations and station not in target_stations:
                         continue
+                    volume = _float_or_none(processed.get("volume_24h"))
+                    if (
+                        orderbook_enabled
+                        and volume is not None
+                        and volume >= adaptive_orderbook_min_volume
+                    ):
+                        orderbook_candidates.append((processed, market, volume))
                     results.append(processed)
 
+        if orderbook_enabled and orderbook_budget > 0 and orderbook_candidates:
+            main_volume_candidates = [
+                item for item in orderbook_candidates if item[2] >= orderbook_min_volume
+            ]
+            adaptive_volume_candidates = [
+                item for item in orderbook_candidates if item[2] < orderbook_min_volume
+            ]
+            main_volume_candidates.sort(key=lambda item: item[2], reverse=True)
+            adaptive_volume_candidates.sort(key=lambda item: item[2], reverse=True)
+            for processed, market, _volume in main_volume_candidates + adaptive_volume_candidates:
+                if orderbook_budget <= 0:
+                    break
+                yes_outcome_id = _outcome_id(market, "yes")
+                if not yes_outcome_id:
+                    continue
+                orderbook_budget -= 1
+                self._attach_orderbook_quote(client, processed, yes_outcome_id)
+
         return results
+
+    def _attach_orderbook_quote(
+        self,
+        client: object,
+        market_data: dict,
+        yes_outcome_id: str,
+    ) -> None:
+        """Attach real YES-side order-book quote data when Polymarket exposes it."""
+        try:
+            book = client.fetch_order_book(yes_outcome_id)
+        except Exception as exc:
+            log.debug("Polymarket orderbook fetch failed for %s: %s", yes_outcome_id, exc)
+            return
+
+        bid_levels = [
+            (price, _float_or_none(getattr(level, "size", None)))
+            for level in getattr(book, "bids", [])
+            if (price := _float_or_none(getattr(level, "price", None))) is not None
+        ]
+        ask_levels = [
+            (price, _float_or_none(getattr(level, "size", None)))
+            for level in getattr(book, "asks", [])
+            if (price := _float_or_none(getattr(level, "price", None))) is not None
+        ]
+        best_bid_level = max(bid_levels, key=lambda level: level[0]) if bid_levels else None
+        best_ask_level = min(ask_levels, key=lambda level: level[0]) if ask_levels else None
+        best_bid = best_bid_level[0] if best_bid_level else None
+        best_ask = best_ask_level[0] if best_ask_level else None
+        if best_bid_level is not None:
+            market_data["best_bid"] = best_bid_level[0]
+            market_data["bid_size"] = best_bid_level[1]
+        if best_ask_level is not None:
+            market_data["best_ask"] = best_ask_level[0]
+            market_data["ask_size"] = best_ask_level[1]
+        if best_bid is not None and best_ask is not None and best_ask >= best_bid:
+            market_data["spread"] = best_ask - best_bid
 
     # -----------------------------------------------------------------------
     # Kalshi scan
@@ -371,7 +509,8 @@ class MarketScanner:
                     "title": market.title,
                     "event_id": event.id,
                     "event_title": event.title,
-                    "yes_price": market.yes.price if market.yes else None,
+                    "yes_price": _outcome_price(market, "yes"),
+                    "no_price": _outcome_price(market, "no"),
                     "volume_24h": market.volume_24h,
                     "liquidity": market.liquidity,
                     "resolution_date": market.resolution_date,
@@ -463,7 +602,8 @@ class MarketScanner:
             ticker_or_market
         )
         ticker_bucket_bounds = None
-        if not isinstance(parsed, ParsedMarket) and not _title_is_one_sided_below(market_data.get("title")):
+        title_is_below = _title_is_one_sided_below(market_data.get("title"))
+        if not isinstance(parsed, ParsedMarket) and not title_is_below:
             ticker_bucket_bounds = _kalshi_bucket_bounds_from_ticker(ticker_or_market)
         if station is None:
             station = ticker_station
@@ -475,6 +615,8 @@ class MarketScanner:
             direction = "above"
         elif ticker_threshold is not None and threshold is None and threshold_low is None and threshold_high is None:
             threshold = ticker_threshold
+            if title_is_below:
+                direction = "below"
         if direction is None:
             direction = ticker_direction
 

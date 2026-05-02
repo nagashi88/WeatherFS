@@ -183,6 +183,8 @@ CITY_TO_STATION: dict[str, str] = {
     "moscow": "UUEE",
     # Milan
     "milan": "LIML",
+    # Rome
+    "rome": "LIRF", "roma": "LIRF",
     # Madrid
     "madrid": "LEMD",
     # Istanbul
@@ -223,6 +225,20 @@ CITY_TO_STATION: dict[str, str] = {
     "hong kong": "VHHH",
     # Mexico City (multi-word)
     "mexico city": "MMMX",
+    # Additional Polymarket weather cities promoted for broad shadow coverage
+    "cape town": "FACT",
+    "lagos": "DNMM",
+    "helsinki": "EFHK",
+    "amsterdam": "EHAM",
+    "jeddah": "OEJN",
+    "karachi": "OPKC",
+    "jakarta": "WIII",
+    "manila": "RPLL",
+    "kuala lumpur": "WMKK",
+    "guangzhou": "ZGGG",
+    "busan": "RKPK",
+    "panama city": "MPTO",
+    "qingdao": "ZSQD",
 }
 
 # Stations in US (HRRR coverage)
@@ -232,15 +248,9 @@ US_STATIONS: set[str] = {
 }
 
 # Cities that appear in Polymarket weather universe but for which we have no
-# edge infrastructure (no STATION_RMSE, no METAR timezone, no HRRR coverage).
-# Suppress UNKNOWN_CITY_HIGH_PRIORITY warning for these — they're known-skip,
-# not real "unmapped" surprises. Promote to CITY_TO_STATION + add an RMSE row
-# in bias_correction.STATION_RMSE before removing from this list.
-KNOWN_UNTRADABLE_CITIES: set[str] = {
-    "cape town", "lagos", "helsinki", "amsterdam", "jeddah",
-    "karachi", "jakarta", "manila", "kuala lumpur", "guangzhou",
-    "busan", "panama city",
-}
+# edge infrastructure. Keep this empty unless a city must be intentionally
+# ignored instead of promoted into the broad shadow universe.
+KNOWN_UNTRADABLE_CITIES: set[str] = set()
 
 # Month names that the "in {City}" extraction regex falsely matches from
 # fragments like "...on April 4". Filter to avoid log spam.
@@ -358,6 +368,18 @@ def parse_kalshi_temperature_title(title: str, current_year: int | None = None) 
             market_type=market_type,
             threshold=float(above_match.group(1)),
             direction="above",
+            source="parsed_from_kalshi_title",
+        )
+
+    leading_below_match = re.search(r'(?:<|below|lower than|less than|under)\s*(-?\d+(?:\.\d+)?)\s*°?', title_lower)
+    if leading_below_match:
+        return ParsedMarket(
+            city=city,
+            station=station,
+            date=date_str,
+            market_type=market_type,
+            threshold=float(leading_below_match.group(1)),
+            direction="below",
             source="parsed_from_kalshi_title",
         )
 

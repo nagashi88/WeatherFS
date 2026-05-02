@@ -21,6 +21,7 @@ import pytest
 
 import weatheredge.config as cfg
 import weatheredge.main as main_module
+from weatheredge.agents.base import MarketOpportunity
 from weatheredge.main import (
     AppState,
     _handle_shutdown,
@@ -39,6 +40,7 @@ def _make_app_state() -> AppState:
     state.paper_trader = MagicMock()
     state.paper_trader.bankroll = 1000.0
     state.paper_trader.open_positions = []
+    state.paper_trader.open_orders = []
     state.paper_trader.daily_pnl = {}
     state.paper_trader.trade_history = []
     state.paper_trader.cancel_expired_orders.return_value = 0
@@ -78,6 +80,18 @@ def _make_app_state() -> AppState:
 def _patch_state(state: AppState):
     """Context manager: temporarily replace the module-level _state."""
     return patch.object(main_module, "_state", state)
+
+
+def _liquid_price(yes_price=0.5, *, timestamp=None, volume=3000.0, spread=0.02):
+    price = {
+        "yes_price": yes_price,
+        "no_price": 1.0 - yes_price,
+        "volume": volume,
+        "spread": spread,
+    }
+    if timestamp is not None:
+        price["timestamp"] = timestamp
+    return price
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +387,85 @@ class TestGetMarketPriceDataAgeMinutes:
             assert main_module._get_market_price_data_age_minutes() is None
 
 
+class TestReadLatestMarketPrices:
+    def test_masks_polymarket_spread_without_orderbook_provenance(self):
+        """Legacy Polymarket YES+NO spreads must not pass the liquidity gate."""
+        from weatheredge.db.database import get_session as db_get_session
+        from weatheredge.db.database import init_db, make_engine
+        from weatheredge.db.models import Market, MarketPrice
+
+        engine = make_engine("sqlite:///:memory:")
+        init_db(engine=engine)
+        now = datetime.now(timezone.utc)
+        try:
+            with db_get_session(engine=engine) as session:
+                session.add_all([
+                    Market(
+                        id="pm-fake",
+                        platform="polymarket",
+                        city="NYC",
+                        station="KNYC",
+                        date="2026-04-30",
+                        market_type="daily_high",
+                    ),
+                    Market(
+                        id="pm-real",
+                        platform="polymarket",
+                        city="NYC",
+                        station="KNYC",
+                        date="2026-04-30",
+                        market_type="daily_high",
+                    ),
+                    Market(
+                        id="KXHIGHNY-26APR30-T70",
+                        platform="kalshi",
+                        city="NYC",
+                        station="KNYC",
+                        date="2026-04-30",
+                        market_type="daily_high",
+                    ),
+                    MarketPrice(
+                        market_id="pm-fake",
+                        timestamp=now,
+                        yes_price=0.42,
+                        no_price=0.58,
+                        volume=5000.0,
+                        spread=0.0,
+                    ),
+                    MarketPrice(
+                        market_id="pm-real",
+                        timestamp=now,
+                        yes_price=0.42,
+                        no_price=0.58,
+                        volume=5000.0,
+                        spread=0.02,
+                        best_bid=0.41,
+                        best_ask=0.43,
+                    ),
+                    MarketPrice(
+                        market_id="KXHIGHNY-26APR30-T70",
+                        timestamp=now,
+                        yes_price=0.42,
+                        no_price=0.60,
+                        volume=5000.0,
+                        spread=0.02,
+                    ),
+                ])
+
+            with patch.object(
+                main_module,
+                "get_session",
+                side_effect=lambda: db_get_session(engine=engine),
+            ):
+                prices = main_module._read_latest_market_prices()
+
+            assert prices["pm-fake"]["spread"] is None
+            assert prices["pm-real"]["spread"] == pytest.approx(0.02)
+            assert prices["KXHIGHNY-26APR30-T70"]["spread"] == pytest.approx(0.02)
+        finally:
+            engine.dispose()
+
+
 class TestDecisionLoopPerMarketFreshness:
     """STEP 3 per-market freshness gate. The global gate checks the newest
     row across ALL markets, so an illiquid market's stale row slips through
@@ -391,8 +484,8 @@ class TestDecisionLoopPerMarketFreshness:
         fresh_ts = datetime.now(timezone.utc) - timedelta(minutes=1)
 
         market_prices = {
-            "KXHIGHNY-STALE": {"yes_price": 0.5, "timestamp": stale_ts},
-            "KXHIGHNY-FRESH": {"yes_price": 0.6, "timestamp": fresh_ts},
+            "KXHIGHNY-STALE": _liquid_price(0.5, timestamp=stale_ts),
+            "KXHIGHNY-FRESH": _liquid_price(0.6, timestamp=fresh_ts),
         }
 
         build_calls: list[str] = []
@@ -422,7 +515,7 @@ class TestDecisionLoopPerMarketFreshness:
         state.rules_qualitative_engine = MagicMock()
         state.rules_qualitative_engine.analyze.return_value = MagicMock(side="no_trade")
 
-        market_prices = {"KXHIGHNY": {"yes_price": 0.5}}  # no 'timestamp'
+        market_prices = {"KXHIGHNY": _liquid_price(0.5)}  # no 'timestamp'
         build_calls: list[str] = []
 
         def _spy_build(market_id, price_data, forecasts):
@@ -442,6 +535,44 @@ class TestDecisionLoopPerMarketFreshness:
 
         assert build_calls == ["KXHIGHNY"]
 
+    def test_missing_liquidity_inputs_skip_entry_build(self, caplog):
+        """If volume/spread cannot be checked, the liquidity gate must be conservative."""
+        caplog.set_level("DEBUG", logger="weatheredge.main")
+        state = _make_app_state()
+        state.rules_qualitative_engine = MagicMock()
+        state.rules_qualitative_engine.analyze.return_value = MagicMock(side="no_trade")
+
+        fresh_ts = datetime.now(timezone.utc) - timedelta(minutes=1)
+        market_prices = {
+            "KXHIGHNY": {
+                "yes_price": 0.5,
+                "no_price": 0.5,
+                "volume": 3000.0,
+                "spread": None,
+                "timestamp": fresh_ts,
+            }
+        }
+        build_calls: list[str] = []
+
+        def _spy_build(market_id, price_data, forecasts):
+            build_calls.append(market_id)
+            return None
+
+        with _patch_state(state):
+            with patch.object(main_module, "_get_weather_data_age_minutes", return_value=5):
+                with patch.object(main_module, "_get_market_price_data_age_minutes", return_value=5):
+                    with patch.object(main_module, "_read_latest_forecasts", return_value={}):
+                        with patch.object(
+                            main_module,
+                            "_read_latest_market_prices",
+                            return_value=market_prices,
+                        ):
+                            with patch.object(main_module, "_build_opportunity", side_effect=_spy_build):
+                                run_decision_loop()
+
+        assert build_calls == []
+        assert "liquidity_missing=1" in caplog.text
+
     def test_naive_timestamp_is_treated_as_utc(self):
         """Legacy DB rows are stored timezone-naive. The gate must coerce
         to UTC the same way _get_market_price_data_age_minutes does, so a
@@ -455,7 +586,7 @@ class TestDecisionLoopPerMarketFreshness:
             datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes + 10)
         ).replace(tzinfo=None)
 
-        market_prices = {"KXHIGHNY": {"yes_price": 0.5, "timestamp": stale_naive_ts}}
+        market_prices = {"KXHIGHNY": _liquid_price(0.5, timestamp=stale_naive_ts)}
         build_calls: list[str] = []
 
         def _spy_build(market_id, price_data, forecasts):
@@ -474,6 +605,74 @@ class TestDecisionLoopPerMarketFreshness:
                                 run_decision_loop()
 
         assert build_calls == []
+
+    def test_low_volume_adaptive_market_is_shadow_only(self, caplog):
+        """Adaptive liquidity can build a low-volume opportunity without feeding main trading."""
+        caplog.set_level("INFO", logger="weatheredge.main")
+        state = _make_app_state()
+        state.settings.shadow_twin_adaptive_liquidity_enabled = True
+        state.rules_qualitative_engine = MagicMock()
+        state.rules_qualitative_engine.analyze.return_value = MagicMock(side="no_trade")
+
+        fresh_ts = datetime.now(timezone.utc) - timedelta(minutes=1)
+        market_id = "KXHIGHNY-LOWVOL"
+        market_prices = {
+            market_id: {
+                "yes_price": 0.40,
+                "no_price": 0.60,
+                "volume": 300.0,
+                "spread": 0.02,
+                "timestamp": fresh_ts,
+            }
+        }
+        opp = MarketOpportunity(
+            market_id=market_id,
+            platform="kalshi",
+            city="NYC",
+            station="KNYC",
+            threshold=70.0,
+            direction="above",
+            market_price=0.40,
+            model_probability=0.10,
+            net_edge=-0.30,
+            net_edge_no=0.20,
+            bucket_low=70.0,
+            bucket_high=71.0,
+            raw_model_prob=0.04,
+            volume=300.0,
+            spread=0.02,
+            forecast_timestamp=fresh_ts,
+            market_price_timestamp=fresh_ts,
+        )
+
+        with _patch_state(state):
+            with patch.object(main_module, "_get_weather_data_age_minutes", return_value=5):
+                with patch.object(main_module, "_get_market_price_data_age_minutes", return_value=5):
+                    with patch.object(main_module, "_read_latest_forecasts", return_value={}):
+                        with patch.object(main_module, "_read_latest_market_prices", return_value=market_prices):
+                            with patch.object(main_module, "_build_opportunity", return_value=opp):
+                                with patch.object(main_module, "record_shadow_twins", return_value={"floor_no_core": 0, "floor_no_expanded": 0}) as normal_shadow:
+                                    with patch.object(
+                                        main_module,
+                                        "record_adaptive_liquidity_shadow_twins",
+                                        return_value={
+                                            "floor_no_core_adaptive_liquidity": 1,
+                                            "floor_no_expanded_adaptive_liquidity": 1,
+                                        },
+                                    ) as adaptive_shadow:
+                                        with patch.object(main_module, "update_shadow_policy_exits", return_value=0):
+                                            run_decision_loop()
+
+        normal_shadow.assert_called_once()
+        assert normal_shadow.call_args.args[0] == {}
+        adaptive_shadow.assert_called_once()
+        adaptive_opps = adaptive_shadow.call_args.args[0]
+        assert list(adaptive_opps) == [market_id]
+        state.paper_trader.place_order.assert_not_called()
+        assert state.portfolio_manager.aggregate_signals.call_args.kwargs["opportunities"] == {}
+        assert "run_decision_loop gate_counts:" in caplog.text
+        assert "low_volume=1" in caplog.text
+        assert "adaptive_only_built=1" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +728,7 @@ class TestDecisionLoopMarkets:
             market_id: {
                 "yes_price": 0.35,  # model prob ~0.95 at 85°F → large edge
                 "no_price": 0.65,
-                "volume": 1000.0,
+                "volume": 3000.0,
                 "spread": 0.02,
             }
         }
@@ -586,7 +785,7 @@ class TestDecisionLoopMarkets:
             }
         }
         market_prices = {
-            market_id: {"yes_price": 0.35, "no_price": 0.65, "volume": 1000.0, "spread": 0.02}
+            market_id: {"yes_price": 0.35, "no_price": 0.65, "volume": 3000.0, "spread": 0.02}
         }
 
         state.risk_manager.calculate_position_size.return_value = 50.0
@@ -617,7 +816,7 @@ class TestDecisionLoopMarkets:
         fresh_age = 10
 
         market_prices = {
-            "UNKNOWN_MARKET_XYZ": {"yes_price": 0.50, "no_price": 0.50}
+            "UNKNOWN_MARKET_XYZ": _liquid_price(0.50)
         }
 
         with _patch_state(state):
@@ -770,7 +969,7 @@ class TestWeightUpdateTriggeredAtInterval:
             market_id: {
                 "yes_price": 0.35,
                 "no_price": 0.65,
-                "volume": 1000.0,
+                "volume": 3000.0,
                 "spread": 0.02,
             }
         }
@@ -831,7 +1030,7 @@ class TestWeightUpdateTriggeredAtInterval:
             market_id: {
                 "yes_price": 0.35,
                 "no_price": 0.65,
-                "volume": 1000.0,
+                "volume": 3000.0,
                 "spread": 0.02,
             }
         }
@@ -1021,6 +1220,8 @@ class TestSchedulerJobRegistration:
         job = next(j for j in registered_jobs if j["id"] == "market_scan")
         assert job["trigger"] == "interval"
         assert job["minutes"] == 5
+        assert job["max_instances"] == 1
+        assert job["coalesce"] is True
 
     def test_forecast_poll_registered(self, registered_jobs):
         ids = [j["id"] for j in registered_jobs]
@@ -1037,6 +1238,7 @@ class TestSchedulerJobRegistration:
         assert job["minutes"] == 5
         assert job["max_instances"] == 1
         assert job["coalesce"] is True
+        assert isinstance(job["next_run_time"], datetime)
 
     def test_resolution_check_registered(self, registered_jobs):
         ids = [j["id"] for j in registered_jobs]
@@ -1159,7 +1361,7 @@ class TestDecisionLoopDataFlow:
                 ):
                     with patch.object(
                         main_module, "_read_latest_market_prices", return_value={
-                            "KXHIGHNY": {"yes_price": 0.35, "no_price": 0.65, "volume": 1000.0, "spread": 0.02}
+                            "KXHIGHNY": {"yes_price": 0.35, "no_price": 0.65, "volume": 3000.0, "spread": 0.02}
                         }
                     ):
                         with patch.object(main_module, "_build_opportunity", return_value=MagicMock(
@@ -1241,6 +1443,28 @@ class TestDecisionLoopDataFlow:
             assert call.kwargs.get("source") != "market_fill", (
                 "pending order must not trigger market_fill drift entry"
             )
+
+    def test_existing_pending_limits_checked_when_new_limits_disabled(self):
+        """Disabling new limit orders must not orphan already-pending limits."""
+        state = _make_app_state()
+        state.paper_trader.open_orders = [{"market_id": "KXHIGHNY", "status": "pending"}]
+        fresh_age = 10
+
+        original_modules = dict(cfg.MODULES)
+        try:
+            cfg.MODULES["limit_orders"] = False
+            with _patch_state(state):
+                with patch.object(main_module, "_get_weather_data_age_minutes", return_value=fresh_age):
+                    with patch.object(main_module, "_get_market_price_data_age_minutes", return_value=1):
+                        with patch.object(main_module, "_read_latest_forecasts", return_value={}):
+                            with patch.object(main_module, "_read_latest_market_prices", return_value={}):
+                                run_decision_loop()
+        finally:
+            cfg.MODULES.clear()
+            cfg.MODULES.update(original_modules)
+
+        state.paper_trader.check_limit_fills.assert_called_once_with({})
+        state.paper_trader.cancel_expired_orders.assert_called_once()
 
     def test_order_rejection_logged_no_crash(self):
         """When paper_trader rejects an order, loop continues without crashing."""
@@ -1868,6 +2092,84 @@ class TestFetchMarketData:
                 mock_asyncio.run.side_effect = Exception("network error")
                 main_module.fetch_market_data()  # must not raise
 
+    def test_polymarket_complementary_no_price_does_not_fake_zero_spread(self):
+        state = _make_app_state()
+        state.market_scanner = MagicMock()
+        session_ctx = MagicMock()
+        session = MagicMock()
+        session_ctx.__enter__.return_value = session
+        session_ctx.__exit__.return_value = False
+        markets = [
+            {
+                "market_id": "pm-1",
+                "platform": "polymarket",
+                "yes_price": 0.42,
+                "no_price": 0.58,
+                "volume_24h": 5000.0,
+            }
+        ]
+
+        with _patch_state(state):
+            with patch.object(main_module, "_scan_all_markets", new=AsyncMock(return_value=markets)):
+                with patch.object(main_module, "get_session", return_value=session_ctx):
+                    main_module.fetch_market_data()
+
+        payload = state.market_scanner.store_market_price.call_args.args[2]
+        assert payload["no_price"] == pytest.approx(0.58)
+        assert payload["spread"] is None
+
+    def test_polymarket_rounded_no_price_does_not_fake_tiny_spread(self):
+        state = _make_app_state()
+        state.market_scanner = MagicMock()
+        session_ctx = MagicMock()
+        session = MagicMock()
+        session_ctx.__enter__.return_value = session
+        session_ctx.__exit__.return_value = False
+        markets = [
+            {
+                "market_id": "pm-1",
+                "platform": "polymarket",
+                "yes_price": 0.421,
+                "no_price": 0.58,
+                "volume_24h": 5000.0,
+            }
+        ]
+
+        with _patch_state(state):
+            with patch.object(main_module, "_scan_all_markets", new=AsyncMock(return_value=markets)):
+                with patch.object(main_module, "get_session", return_value=session_ctx):
+                    main_module.fetch_market_data()
+
+        payload = state.market_scanner.store_market_price.call_args.args[2]
+        assert payload["no_price"] == pytest.approx(0.58)
+        assert payload["spread"] is None
+
+    def test_kalshi_yes_no_prices_still_derive_spread(self):
+        state = _make_app_state()
+        state.market_scanner = MagicMock()
+        session_ctx = MagicMock()
+        session = MagicMock()
+        session_ctx.__enter__.return_value = session
+        session_ctx.__exit__.return_value = False
+        markets = [
+            {
+                "market_id": "kalshi-1",
+                "platform": "kalshi",
+                "yes_price": 0.42,
+                "no_price": 0.60,
+                "volume_24h": 5000.0,
+            }
+        ]
+
+        with _patch_state(state):
+            with patch.object(main_module, "_scan_all_markets", new=AsyncMock(return_value=markets)):
+                with patch.object(main_module, "get_session", return_value=session_ctx):
+                    main_module.fetch_market_data()
+
+        payload = state.market_scanner.store_market_price.call_args.args[2]
+        assert payload["no_price"] == pytest.approx(0.60)
+        assert payload["spread"] == pytest.approx(0.02)
+
 
 class TestFetchForecastData:
     """Tests for fetch_forecast_data() scheduler job."""
@@ -2184,7 +2486,7 @@ class TestQualitativeSignalInPortfolio:
                 ):
                     with patch.object(
                         main_module, "_read_latest_market_prices",
-                        return_value={market_id: {"yes_price": 0.35, "no_price": 0.65}},
+                        return_value={market_id: _liquid_price(0.35)},
                     ):
                         with patch.object(
                             main_module, "_build_opportunity", return_value=real_opp
@@ -2281,8 +2583,8 @@ class TestAggressiveSignalRouting:
                         main_module,
                         "_read_latest_market_prices",
                         return_value={
-                            market_a: {"yes_price": 0.55},
-                            market_b: {"yes_price": 0.50},
+                            market_a: _liquid_price(0.55),
+                            market_b: _liquid_price(0.50),
                         },
                     ):
                         with patch.object(
@@ -2352,6 +2654,7 @@ class TestDecisionLoopOpportunityCoverage:
         opp = MagicMock()
         opp.platform = platform
         opp.city = "NYC"
+        opp.station = "KNYC"
         opp.threshold = 70.0
         opp.market_price = 0.5
         opp.net_edge = net_edge
@@ -2363,7 +2666,7 @@ class TestDecisionLoopOpportunityCoverage:
                 with patch.object(main_module, "_read_latest_forecasts", return_value={}):
                     with patch.object(
                         main_module, "_read_latest_market_prices",
-                        return_value={market_id: {"yes_price": 0.5}},
+                        return_value={market_id: _liquid_price(0.5)},
                     ):
                         with patch.object(main_module, "_build_opportunity", return_value=mock_opp):
                             run_decision_loop()
@@ -2401,7 +2704,7 @@ class TestDecisionLoopOpportunityCoverage:
                 with patch.object(main_module, "_read_latest_forecasts", return_value={}):
                     with patch.object(
                         main_module, "_read_latest_market_prices",
-                        return_value={"KXHIGHNY": {"yes_price": 0.5}},
+                        return_value={"KXHIGHNY": _liquid_price(0.5)},
                     ):
                         with patch.object(main_module, "_build_opportunity", return_value=self._mock_opp()):
                             with patch.object(
@@ -2427,7 +2730,7 @@ class TestDecisionLoopOpportunityCoverage:
                 with patch.object(main_module, "_read_latest_forecasts", return_value={}):
                     with patch.object(
                         main_module, "_read_latest_market_prices",
-                        return_value={market_id: {"yes_price": 0.5}},
+                        return_value={market_id: _liquid_price(0.5)},
                     ):
                         with patch.object(main_module, "_build_opportunity", return_value=self._mock_opp()):
                             with patch.object(main_module, "mean_reversion_strategy") as mock_mr:
@@ -2451,7 +2754,7 @@ class TestDecisionLoopOpportunityCoverage:
                 with patch.object(main_module, "_read_latest_forecasts", return_value={}):
                     with patch.object(
                         main_module, "_read_latest_market_prices",
-                        return_value={market_id: {"yes_price": 0.5}},
+                        return_value={market_id: _liquid_price(0.5)},
                     ):
                         with patch.object(main_module, "_build_opportunity", return_value=self._mock_opp()):
                             with patch.object(
@@ -2659,6 +2962,96 @@ class TestWeatherDataAgeAndForecasts:
         assert target_date in result["KNYC"]
         assert result["KNYC"][target_date]["ensemble_members"] is None
 
+    def test_read_latest_forecasts_ignores_null_latest_model_row(self):
+        """A malformed newer row must not hide an older usable row for the same model."""
+        target_date = "2099-12-31"
+        newer_null = MagicMock()
+        newer_null.station = "KNYC"
+        newer_null.target_date = target_date
+        newer_null.model = "ecmwf"
+        newer_null.temperature_forecast = None
+        newer_null.temperature_max_forecast = None
+        newer_null.temperature_min_forecast = None
+        newer_null.ensemble_members = None
+        newer_null.ensemble_min_members = None
+        newer_null.forecast_timestamp = datetime(2026, 4, 30, 10, 10, tzinfo=timezone.utc)
+
+        older_good = MagicMock()
+        older_good.station = "KNYC"
+        older_good.target_date = target_date
+        older_good.model = "ecmwf"
+        older_good.temperature_forecast = 75.0
+        older_good.temperature_max_forecast = None
+        older_good.temperature_min_forecast = None
+        older_good.ensemble_members = None
+        older_good.ensemble_min_members = None
+        older_good.forecast_timestamp = datetime(2026, 4, 30, 10, 0, tzinfo=timezone.utc)
+
+        mock_ctx = MagicMock()
+        mock_session = MagicMock()
+        mock_ctx.__enter__ = MagicMock(return_value=mock_session)
+        mock_ctx.__exit__ = MagicMock(return_value=False)
+        mock_session.query.return_value.filter.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [
+            newer_null,
+            older_good,
+        ]
+
+        with patch("weatheredge.main.get_session", return_value=mock_ctx):
+            result = main_module._read_latest_forecasts()
+
+        entry = result["KNYC"][target_date]
+        assert entry["ecmwf_temp"] == 75.0
+        assert entry["ecmwf_temp_ts"] == older_good.forecast_timestamp
+        assert entry["forecast_timestamp"] == older_good.forecast_timestamp
+
+    def test_read_latest_forecasts_noaa_rows_do_not_crowd_out_daily_models(self):
+        """NOAA hourly rows can exceed the safety LIMIT; daily rows must win ordering."""
+        from weatheredge.db.database import get_session as db_get_session
+        from weatheredge.db.database import init_db, make_engine
+        from weatheredge.db.models import Forecast
+
+        engine = make_engine("sqlite:///:memory:")
+        init_db(engine=engine)
+        target_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        noaa_ts = datetime.now(timezone.utc)
+        daily_ts = noaa_ts - timedelta(minutes=1)
+        try:
+            with db_get_session(engine=engine) as session:
+                session.add(Forecast(
+                    station="KNYC",
+                    target_date=target_date,
+                    model="forecast",
+                    forecast_timestamp=daily_ts,
+                    lead_time_hours=24,
+                    temperature_max_forecast=72.0,
+                    temperature_forecast=72.0,
+                ))
+                session.add_all([
+                    Forecast(
+                        station="KNYC",
+                        target_date=target_date,
+                        model="noaa_nws",
+                        forecast_timestamp=noaa_ts,
+                        lead_time_hours=hour,
+                        temperature_forecast=60.0,
+                    )
+                    for hour in range(5001)
+                ])
+
+            with patch.object(
+                main_module,
+                "get_session",
+                side_effect=lambda: db_get_session(engine=engine),
+            ):
+                result = main_module._read_latest_forecasts()
+
+            assert result["KNYC"][target_date]["temperature_forecast"] == pytest.approx(72.0)
+            assert main_module._as_utc_aware(
+                result["KNYC"][target_date]["temperature_forecast_ts"]
+            ) == daily_ts
+        finally:
+            engine.dispose()
+
 
 # ---------------------------------------------------------------------------
 # Coverage gaps: _build_opportunity edge paths
@@ -2731,6 +3124,26 @@ class TestBuildOpportunityEdgePaths:
         assert opp.bucket_low == pytest.approx(75.0)
         assert opp.bucket_high == pytest.approx(77.0)
         assert opp.direction == "above"
+
+    def test_kalshi_t_prefix_less_than_title_sets_below_direction(self):
+        state = self._make_state()
+        _kalshi_date = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%b%d").upper()
+        market_id = f"KXHIGHDEN-{_kalshi_date}-T56"
+        state.market_metadata[market_id] = {
+            "resolution_source": {"station": "KDEN", "type": "daily_high"},
+            "platform": "kalshi",
+            "title": "Will the **high temp in Denver** be <56° on Apr 29, 2026?",
+            "parsed": None,
+        }
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.50}, self._base_forecasts("KDEN"),
+            )
+
+        assert opp is not None
+        assert opp.threshold == pytest.approx(56.0)
+        assert opp.direction == "below"
 
     def test_zero_fahrenheit_forecast_not_dropped_as_falsy(self):
         """0.0°F is a valid forecast and must not be treated as missing data."""
@@ -2916,6 +3329,7 @@ class TestBuildOpportunityEdgePaths:
         state = self._make_state()
         forecasts = self._base_forecasts("KNYC")
         ts = datetime.now(timezone.utc) - timedelta(minutes=3)
+        forecasts["KNYC"]["forecast_timestamp"] = ts - timedelta(minutes=1)
 
         with _patch_state(state):
             opp = main_module._build_opportunity(
@@ -2924,6 +3338,66 @@ class TestBuildOpportunityEdgePaths:
 
         assert opp is not None
         assert opp.market_price_timestamp == ts
+
+    def test_forecast_newer_than_market_price_returns_none(self):
+        """Causal gate: do not build an entry from post-price forecast data."""
+        state = self._make_state()
+        price_ts = datetime(2026, 4, 30, 10, 0, tzinfo=timezone.utc)
+        forecasts = self._base_forecasts("KNYC")
+        forecasts["KNYC"]["forecast_timestamp"] = price_ts + timedelta(minutes=5)
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.5, "timestamp": price_ts}, forecasts
+            )
+
+        assert opp is None
+
+    def test_forecast_older_than_market_price_builds_opportunity(self):
+        """Causal gate allows forecast data that predates the traded price."""
+        state = self._make_state()
+        price_ts = datetime(2026, 4, 30, 10, 5, tzinfo=timezone.utc)
+        forecasts = self._base_forecasts("KNYC")
+        forecasts["KNYC"]["forecast_timestamp"] = price_ts - timedelta(minutes=5)
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.5, "timestamp": price_ts}, forecasts
+            )
+
+        assert opp is not None
+        assert opp.forecast_timestamp == forecasts["KNYC"]["forecast_timestamp"]
+        assert opp.market_price_timestamp == price_ts
+
+    def test_daily_high_causal_gate_uses_high_forecast_source_timestamp(self, monkeypatch):
+        """Newer min-only data must not false-block a daily-high opportunity."""
+        monkeypatch.setitem(cfg.MODULES, "temporal_guard", True)
+        state = self._make_state()
+        high_ts = datetime(2026, 4, 30, 10, 0, tzinfo=timezone.utc)
+        min_ts = datetime(2026, 4, 30, 10, 10, tzinfo=timezone.utc)
+        price_ts = datetime(2026, 4, 30, 10, 5, tzinfo=timezone.utc)
+        forecasts = {
+            "KNYC": {
+                "temperature_forecast": 75.0,
+                "temperature_forecast_ts": high_ts,
+                "temperature_min_forecast": 60.0,
+                "temperature_min_forecast_ts": min_ts,
+                "ecmwf_temp": None,
+                "hrrr_temp": None,
+                "nbm_temp": None,
+                "ensemble_members": None,
+                "model": "gfs",
+                "forecast_timestamp": min_ts,
+            }
+        }
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.5, "timestamp": price_ts}, forecasts
+            )
+
+        assert opp is not None
+        assert opp.forecast_timestamp == high_ts
 
     def test_market_price_timestamp_none_when_missing(self):
         """STEP 3: missing timestamp leaves the field None — legacy
@@ -2938,6 +3412,20 @@ class TestBuildOpportunityEdgePaths:
 
         assert opp is not None
         assert opp.market_price_timestamp is None
+
+    def test_missing_market_price_timestamp_blocked_when_temporal_guard_enabled(self, monkeypatch):
+        """Production temporal guard requires complete causal timestamps for entries."""
+        monkeypatch.setitem(cfg.MODULES, "temporal_guard", True)
+        state = self._make_state()
+        forecasts = self._base_forecasts("KNYC")
+        forecasts["KNYC"]["forecast_timestamp"] = datetime.now(timezone.utc)
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                "KXHIGHNY", {"yes_price": 0.5}, forecasts
+            )
+
+        assert opp is None
 
     def test_celsius_market_converts_threshold_to_fahrenheit(self):
         """CCG-bughunt2 Codex F2: parsed.unit='C' must convert threshold to °F.
@@ -3634,7 +4122,7 @@ class TestBucketMetarOverride:
         return state
 
     @staticmethod
-    def _bucket_market_metadata(market_id, station, date, low, high):
+    def _bucket_market_metadata(market_id, station, date, low, high, platform="polymarket"):
         mock_parsed = MagicMock()
         mock_parsed.threshold = (low + high) / 2.0
         mock_parsed.direction = "above"
@@ -3644,7 +4132,7 @@ class TestBucketMetarOverride:
         mock_parsed.threshold_high = high
         return {
             "resolution_source": {"station": station, "type": "daily_high"},
-            "platform": "polymarket",
+            "platform": platform,
             "parsed": mock_parsed,
         }
 
@@ -3732,19 +4220,12 @@ class TestBucketMetarOverride:
             f"METAR-exceeds-bucket should cap prob to <=0.05, got {opp.model_probability}"
         )
 
-    def test_metar_at_bucket_high_boundary_resolves_as_no(self):
-        """metar_high == bucket_high must invalidate YES (settlement uses `actual < high`).
-
-        Regression for Finding-new-4 (HIGH): prior code used
-        `bucket_low <= metar_high <= bucket_high` for the in-range YES-boost,
-        but settlement resolves `low <= actual < high` (upper-exclusive). A
-        metar_high exactly at bucket_high would boost YES to 0.85 while
-        settlement resolved NO — systematic YES-bias on the boundary.
-        """
+    def test_non_polymarket_metar_at_bucket_high_boundary_resolves_as_no(self):
+        """metar_high == bucket_high invalidates raw half-open buckets."""
         state = self._make_state_with_tracker(daily_high_f=87.0, market_date=self.TODAY)
         market_id = "bucket_boundary"
         state.market_metadata[market_id] = self._bucket_market_metadata(
-            market_id, "KNYC", self.TODAY, low=86.0, high=87.0,
+            market_id, "KNYC", self.TODAY, low=86.0, high=87.0, platform="kalshi",
         )
 
         with _patch_state(state), patch.object(main_module, "station_local_today_str", return_value=self.TODAY):
@@ -3761,6 +4242,25 @@ class TestBucketMetarOverride:
             "metar_high == bucket_high must set bucket_invalidated_for_yes "
             "so ExitManager can close buy_yes positions."
         )
+
+    def test_polymarket_metar_at_display_high_boundary_remains_in_bucket(self):
+        """Polymarket integer bucket 86-87 includes a displayed 87°F outcome."""
+        state = self._make_state_with_tracker(daily_high_f=87.0, market_date=self.TODAY)
+        market_id = "polymarket_bucket_boundary"
+        state.market_metadata[market_id] = self._bucket_market_metadata(
+            market_id, "KNYC", self.TODAY, low=86.0, high=87.0, platform="polymarket",
+        )
+
+        with _patch_state(state), \
+             patch.object(main_module, "station_local_today_str", return_value=self.TODAY), \
+             patch.object(main_module, "hours_until_market_close", return_value=1.0):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.50}, self._forecasts("KNYC", 86.5),
+            )
+
+        assert opp is not None
+        assert opp.model_probability >= 0.85
+        assert not getattr(opp, "bucket_invalidated_for_yes", False)
 
     def test_metar_below_bucket_does_not_override(self):
         """Observed daily_high below bucket_low → temp could still rise → no override."""
@@ -3818,6 +4318,25 @@ class TestBucketMetarOverride:
 
         assert opp is not None
         assert opp.model_probability < 0.20  # floor — no METAR data to override
+
+    def test_bucket_opportunity_flags_forecast_inside_integer_bucket(self):
+        state = self._make_state_with_tracker(daily_high_f=None, market_date=self.TODAY)
+        market_id = "bucket_forecast_inside"
+        state.market_metadata[market_id] = self._bucket_market_metadata(
+            market_id, "KMIA", self.TODAY, low=84.0, high=85.0, platform="polymarket",
+        )
+
+        with _patch_state(state):
+            opp = main_module._build_opportunity(
+                market_id, {"yes_price": 0.375}, self._forecasts("KMIA", 84.1),
+            )
+
+        assert opp is not None
+        assert opp.bucket_low_int == 84
+        assert opp.bucket_high_int == 85
+        assert opp.is_narrow_bucket
+        assert opp.forecast_inside_bucket
+        assert opp.forecast_near_bucket
 
 
 class TestNarrowBucketDynamicSigma:
@@ -4074,7 +4593,7 @@ class TestBucketPhantomEdgeGuard:
         return state
 
     @staticmethod
-    def _bucket_meta(market_id, low, high, date):
+    def _bucket_meta(market_id, low, high, date, platform="polymarket"):
         mock_parsed = MagicMock()
         mock_parsed.threshold = (low + high) / 2.0
         mock_parsed.direction = "above"
@@ -4084,7 +4603,7 @@ class TestBucketPhantomEdgeGuard:
         mock_parsed.threshold_high = high
         return {
             "resolution_source": {"station": "KNYC", "type": "daily_high"},
-            "platform": "polymarket",
+            "platform": platform,
             "parsed": mock_parsed,
         }
 
@@ -4232,7 +4751,7 @@ class TestBucketPhantomEdgeGuard:
         market_id = "bucket_boundary"
         bucket_low, bucket_high = 86.0, 87.0
         state.market_metadata[market_id] = self._bucket_meta(
-            market_id, low=bucket_low, high=bucket_high, date=self.TODAY,
+            market_id, low=bucket_low, high=bucket_high, date=self.TODAY, platform="kalshi",
         )
 
         # 20 members: 15 strictly inside, 5 exactly at bucket_high (boundary).

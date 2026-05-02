@@ -43,6 +43,15 @@ ENSEMBLE_VARS = [
 # Retry policy per Addendum Gap 12: 3 attempts, backoff 1s / 4s / 16s
 _RETRY_COUNT = 3
 _RETRY_DELAYS = [1, 4, 16]
+_REQUEST_TIMEOUT_SECONDS = 15
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    if status == 429:
+        return True
+    message = str(exc).lower()
+    return "429" in message or "too many requests" in message
 
 
 async def _get_with_retry(
@@ -67,12 +76,16 @@ async def _get_with_retry(
     last_exc: Exception | None = None
     for attempt in range(_RETRY_COUNT):
         try:
-            async with session.get(url, params=params) as resp:
+            timeout = aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT_SECONDS)
+            async with session.get(url, params=params, timeout=timeout) as resp:
                 resp.raise_for_status()
                 data: dict[str, Any] = await resp.json()
                 return data
         except Exception as exc:
             last_exc = exc
+            if _is_rate_limit_error(exc):
+                log.warning("Request to %s hit rate limit: %s — not retrying", url, exc)
+                raise
             if attempt < _RETRY_COUNT - 1:
                 delay = _RETRY_DELAYS[attempt]
                 log.warning(

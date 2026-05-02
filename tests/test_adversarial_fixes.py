@@ -447,6 +447,28 @@ class TestResolutionPipeline:
 
         assert outcome == "yes"
 
+    def test_determine_market_outcome_polymarket_bucket_display_high_is_yes(self, resolution_engine):
+        """Polymarket displayed bucket 60-61°F includes the 61°F outcome."""
+        with get_session(resolution_engine) as session:
+            session.add(Market(
+                id="MKT-POLY-BUCKET-BOUNDARY", platform="polymarket", city="New York",
+                station="KNYC", date="2026-03-01", market_type="daily_high",
+                threshold_low=60.0, threshold_high=61.0,
+            ))
+            session.add(Forecast(
+                station="KNYC", target_date="2026-03-01", model="gfs",
+                forecast_timestamp=datetime(2026, 2, 28, tzinfo=timezone.utc),
+                lead_time_hours=24, temperature_forecast=60.0, actual_temp=61.0,
+            ))
+
+        from weatheredge.main import _determine_market_outcome
+        state = MagicMock()
+
+        with patch("weatheredge.main.get_session", lambda: get_session(resolution_engine)):
+            outcome = _determine_market_outcome(state, "MKT-POLY-BUCKET-BOUNDARY")
+
+        assert outcome == "yes"
+
     def test_run_resolution_check_resolves_trades(self, resolution_engine):
         """Full integration: run_resolution_check resolves open trades for past markets."""
         # Seed market, forecast, and open trade

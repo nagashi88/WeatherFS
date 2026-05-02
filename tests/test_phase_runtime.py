@@ -115,6 +115,13 @@ def test_runtime_order_mode_override_market(monkeypatch):
         cfg.MODULES.update(original_modules)
 
 
+def test_phase1_uses_market_orders_by_default():
+    """Phase 1 should not re-enable passive limits unless explicitly overridden."""
+    from weatheredge.phase_config import get_phase_modules
+
+    assert get_phase_modules("phase_1")["limit_orders"] is False
+
+
 def test_phase2_effective_thresholds_burst_on():
     from weatheredge.main import AppState, _phase2_effective_thresholds
     from weatheredge.config import BURST_EDGE_DISCOUNT, BURST_MIN_EDGE_FLOOR
@@ -494,7 +501,40 @@ def test_dashboard_start_has_process_scan_fallback():
     assert '["ps", "-axo", "pid=,command="]' in source
 
 
-def _phase1_gate_trade(i: int, created_at: datetime, pnl: float = 1.0):
+def test_dashboard_phase_gate_uses_decision_grade_reset():
+    """Dashboard gate progress must show post-reset evidence, not legacy phase history."""
+    from pathlib import Path
+
+    source = Path("weatheredge/dashboard/control_panel.py").read_text()
+
+    assert "DECISION_GRADE_CUTOFF" in source
+    assert "phase_decision_grade_entries" in source
+    assert "decision-grade paper entries since reset" in source
+
+
+def test_dashboard_shadow_view_separates_evidence_tiers():
+    """Shadow P&L must separate clean decision-grade rows from legacy/null-spread history."""
+    from pathlib import Path
+
+    source = Path("weatheredge/dashboard/control_panel.py").read_text()
+
+    assert "Evidence tiers" in source
+    assert "post_temporal_fix_clean" in source
+    assert "decision_grade_clean" in source
+    assert "decision_grade_real_spread" in source
+    assert "floor_no_broad" in source
+    assert "broad_city" in source
+    assert "entry_spread IS NOT NULL" in source
+    assert "entry_volume IS NOT NULL" in source
+    assert "selected_evidence" in source
+
+
+def _phase1_gate_trade(
+    i: int,
+    created_at: datetime,
+    pnl: float = 1.0,
+    order_type: str = "market",
+):
     from weatheredge.db.models import Trade
 
     return Trade(
@@ -514,6 +554,7 @@ def _phase1_gate_trade(i: int, created_at: datetime, pnl: float = 1.0):
         pnl=pnl,
         resolved_at=created_at + timedelta(hours=1),
         created_at=created_at,
+        order_type=order_type,
     )
 
 
@@ -524,6 +565,7 @@ def test_phase1_gate_ignores_pre_activation_trade_history(monkeypatch):
 
     init_db()
     activated = datetime(2026, 4, 23, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setenv("WEATHEREDGE_DECISION_GRADE_CUTOFF", "2026-04-29T08:36:23Z")
     monkeypatch.setattr(
         "weatheredge.phase_config.get_phase_activated_at",
         lambda: activated.isoformat(),
@@ -543,13 +585,14 @@ def test_phase1_gate_passes_on_clean_post_activation_trades(monkeypatch):
 
     init_db()
     activated = datetime(2026, 4, 23, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setenv("WEATHEREDGE_DECISION_GRADE_CUTOFF", "2026-04-29T08:36:23Z")
     monkeypatch.setattr(
         "weatheredge.phase_config.get_phase_activated_at",
         lambda: activated.isoformat(),
     )
 
     with get_session() as session:
-        created_at = activated.replace(tzinfo=None) + timedelta(minutes=1)
+        created_at = datetime(2026, 4, 29, 8, 37)
         for i in range(40):
             session.add(_phase1_gate_trade(i, created_at))
 
@@ -563,13 +606,14 @@ def test_phase1_gate_fails_on_post_activation_leakage(monkeypatch):
 
     init_db()
     activated = datetime(2026, 4, 23, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setenv("WEATHEREDGE_DECISION_GRADE_CUTOFF", "2026-04-29T08:36:23Z")
     monkeypatch.setattr(
         "weatheredge.phase_config.get_phase_activated_at",
         lambda: activated.isoformat(),
     )
 
     with get_session() as session:
-        created_at = activated.replace(tzinfo=None) + timedelta(minutes=1)
+        created_at = datetime(2026, 4, 29, 8, 37)
         for i in range(40):
             session.add(_phase1_gate_trade(i, created_at))
         session.add(
@@ -579,5 +623,45 @@ def test_phase1_gate_fails_on_post_activation_leakage(monkeypatch):
                 violated_at=created_at,
             )
         )
+
+    assert main_module.check_phase1_gate() is False
+
+
+def test_phase1_gate_ignores_pre_decision_grade_history(monkeypatch):
+    """Post-activation but pre-reset closed trades must not count toward Phase 1."""
+    from weatheredge import main as main_module
+    from weatheredge.db.database import get_session, init_db
+
+    init_db()
+    monkeypatch.setattr(
+        "weatheredge.phase_config.get_phase_activated_at",
+        lambda: "2026-04-23T12:00:00+00:00",
+    )
+    monkeypatch.setenv("WEATHEREDGE_DECISION_GRADE_CUTOFF", "2026-04-29T08:36:23Z")
+
+    with get_session() as session:
+        created_at = datetime(2026, 4, 28, 12, 0)
+        for i in range(40):
+            session.add(_phase1_gate_trade(i, created_at))
+
+    assert main_module.check_phase1_gate() is False
+
+
+def test_phase1_gate_ignores_limit_order_history_after_reset(monkeypatch):
+    """Decision-grade gate counts current market-mode evidence, not limit fills."""
+    from weatheredge import main as main_module
+    from weatheredge.db.database import get_session, init_db
+
+    init_db()
+    monkeypatch.setattr(
+        "weatheredge.phase_config.get_phase_activated_at",
+        lambda: "2026-04-23T12:00:00+00:00",
+    )
+    monkeypatch.setenv("WEATHEREDGE_DECISION_GRADE_CUTOFF", "2026-04-29T08:36:23Z")
+
+    with get_session() as session:
+        created_at = datetime(2026, 4, 29, 8, 37)
+        for i in range(40):
+            session.add(_phase1_gate_trade(i, created_at, order_type="limit"))
 
     assert main_module.check_phase1_gate() is False

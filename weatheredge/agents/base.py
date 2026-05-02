@@ -57,12 +57,19 @@ class MarketOpportunity:
     lead_time_days: int = 1
     bucket_low: float | None = None  # For bucket markets
     bucket_high: float | None = None
+    bucket_low_int: int | None = None
+    bucket_high_int: int | None = None
+    is_narrow_bucket: bool = False
+    is_target_date_today_local: bool = False
+    forecast_inside_bucket: bool = False
+    forecast_near_bucket: bool = False
     gaussian_prob: float | None = None  # For model agreement check
     ensemble_prob: float | None = None
     blended_prob: float | None = None
     timesfm_prob: float | None = None  # TimesFM quantile-based probability
     timesfm_error_adj: float | None = None  # TimesFM NWP error correction (degrees)
     volume: float | None = None  # Market volume for slippage modeling (US-205)
+    spread: float | None = None  # Current market spread for liquidity audits
     raw_model_prob: float | None = None  # Pre-clamp blended (audit only, not used for decisions)
     # Structural invalidation: daily_high already exceeded bucket_high via observed METAR.
     # YES resolution physically impossible — exit_manager uses this to force close buy_yes.
@@ -80,3 +87,8 @@ class MarketOpportunity:
     # Forecast row timestamp used for this decision. Execution must prove this
     # timestamp is not newer than the market price snapshot being traded.
     forecast_timestamp: datetime | None = None
+    no_market_price: float | None = None  # Displayed/executable NO quote when available
+    best_bid: float | None = None  # YES-side best bid when order-book logging is available
+    best_ask: float | None = None  # YES-side best ask when order-book logging is available
+    bid_size: float | None = None
+    ask_size: float | None = None

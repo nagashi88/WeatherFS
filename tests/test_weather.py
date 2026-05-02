@@ -347,6 +347,36 @@ async def test_retry_http_error_retries():
     assert mock_session.get.call_count == 2
 
 
+@pytest.mark.asyncio
+async def test_retry_429_does_not_retry():
+    """HTTP 429 should arm caller-side cooldowns, not consume more attempts."""
+    import aiohttp
+
+    error_response = AsyncMock()
+    error_response.raise_for_status = MagicMock(
+        side_effect=aiohttp.ClientResponseError(
+            request_info=MagicMock(),
+            history=(),
+            status=429,
+            message="Too Many Requests",
+        )
+    )
+
+    error_ctx = AsyncMock()
+    error_ctx.__aenter__ = AsyncMock(return_value=error_response)
+    error_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = MagicMock()
+    mock_session.get = MagicMock(return_value=error_ctx)
+
+    with patch("weatheredge.data.weather.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with pytest.raises(aiohttp.ClientResponseError):
+            await fetch_forecast(40.71, -74.01, mock_session)
+
+    mock_sleep.assert_not_called()
+    mock_session.get.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # store_forecast tests
 # ---------------------------------------------------------------------------
